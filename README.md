@@ -85,6 +85,10 @@ The agent **must run in the logged-in user's session with administrator rights**
 
 The guest needs the virtio-win drivers (`viogpudo`, `vioser`). Run the agent with `RUST_LOG=info` to see what it does.
 
+## Input
+
+All mouse buttons (left, middle, right, back, forward) and the scroll wheel (both axes) are forwarded. While the viewer has focus it also holds the keyboard on X11, so Super (Windows key), Alt+Tab and similar desktop shortcuts go to Windows. **Ctrl+Alt+G** gives the keyboard back to the desktop and takes it again. On Wayland the viewer asks the compositor to inhibit its shortcuts instead (GNOME: Super+Esc restores them).
+
 ## License
 
 GPL-3.0-or-later; see [LICENSE](LICENSE).

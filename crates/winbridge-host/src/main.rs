@@ -6,6 +6,7 @@
 //! VirtIO-serial communication channel for Windows 11 guest synchronization.
 
 mod dbus_display;
+mod kbgrab;
 mod keymap;
 mod serial_client;
 mod ui;

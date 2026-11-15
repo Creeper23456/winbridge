@@ -118,6 +118,8 @@ impl ViewerWindow {
 
         // Mouse click gesture
         let click_gesture = GestureClick::new();
+        // 0 = listen to every button (default is the primary button only).
+        click_gesture.set_button(0);
         let dbus_for_click = dbus_conn.clone();
         click_gesture.connect_pressed(move |gesture, _n_press, _x, _y| {
             let btn = gesture.current_button();
@@ -125,6 +127,8 @@ impl ViewerWindow {
                 1 => 0, // Left
                 2 => 1, // Middle
                 3 => 2, // Right
+                8 => 5, // Side (back)
+                9 => 6, // Extra (forward)
                 _ => return,
             };
 
@@ -143,6 +147,8 @@ impl ViewerWindow {
                 1 => 0, // Left
                 2 => 1, // Middle
                 3 => 2, // Right
+                8 => 5,
+                9 => 6,
                 _ => return,
             };
 
@@ -155,10 +161,66 @@ impl ViewerWindow {
         });
         drawing_area.add_controller(click_gesture);
 
+        // Scroll wheel / touchpad: QEMU models the wheel as button 3 (up) / 4 (down) and
+        // 7 / 8 (left / right) presses, one press+release per notch.
+        let scroll_ctrl = gtk4::EventControllerScroll::new(
+            gtk4::EventControllerScrollFlags::BOTH_AXES,
+        );
+        let dbus_for_scroll = dbus_conn.clone();
+        let scroll_acc = Rc::new(Cell::new((0.0f64, 0.0f64)));
+        scroll_ctrl.connect_scroll(move |_ctrl, dx, dy| {
+            let (mut ax, mut ay) = scroll_acc.get();
+            ax += dx;
+            ay += dy;
+            let mut buttons: Vec<u32> = Vec::new();
+            while ay <= -1.0 {
+                buttons.push(3);
+                ay += 1.0;
+            }
+            while ay >= 1.0 {
+                buttons.push(4);
+                ay -= 1.0;
+            }
+            while ax <= -1.0 {
+                buttons.push(7);
+                ax += 1.0;
+            }
+            while ax >= 1.0 {
+                buttons.push(8);
+                ax -= 1.0;
+            }
+            scroll_acc.set((ax, ay));
+            if !buttons.is_empty() {
+                if let Some(conn) = dbus_for_scroll.lock().unwrap().as_ref() {
+                    let mouse = conn.mouse.clone();
+                    tokio::spawn(async move {
+                        for b in buttons {
+                            let _ = mouse.press(b).await;
+                            let _ = mouse.release(b).await;
+                        }
+                    });
+                }
+            }
+            glib::Propagation::Stop
+        });
+        drawing_area.add_controller(scroll_ctrl);
+
         // Keyboard controller
         let key_ctrl = EventControllerKey::new();
+        let grab_wanted = Rc::new(Cell::new(true));
         let dbus_for_key_press = dbus_conn.clone();
-        key_ctrl.connect_key_pressed(move |_ctrl, keyval, keycode, _state| {
+        let window_for_grab = window.clone();
+        let grab_wanted_for_key = grab_wanted.clone();
+        key_ctrl.connect_key_pressed(move |_ctrl, keyval, keycode, state| {
+            // Ctrl+Alt+G: hand the keyboard back to the desktop (or take it again).
+            let ctrl_alt = state.contains(gdk::ModifierType::CONTROL_MASK)
+                && state.contains(gdk::ModifierType::ALT_MASK);
+            if ctrl_alt && (keyval == gdk::Key::g || keyval == gdk::Key::G) {
+                let on = !grab_wanted_for_key.get();
+                grab_wanted_for_key.set(on);
+                crate::kbgrab::set(&window_for_grab, on && window_for_grab.is_active());
+                return glib::Propagation::Stop;
+            }
             if let Some(qemu_key) = gdk_to_qemu_keycode(keycode, keyval) {
                 if let Some(conn) = dbus_for_key_press.lock().unwrap().as_ref() {
                     let kbd = conn.keyboard.clone();
@@ -167,7 +229,7 @@ impl ViewerWindow {
                     });
                 }
             }
-            glib::Propagation::Proceed
+            glib::Propagation::Stop
         });
 
         let dbus_for_key_release = dbus_conn.clone();
@@ -181,7 +243,24 @@ impl ViewerWindow {
                 }
             }
         });
+        // Capture phase: the guest gets every key before any GTK widget can consume it.
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         window.add_controller(key_ctrl);
+
+        // Keep the desktop's own shortcuts (Super, Alt+Tab, ...) away from the viewer while it has
+        // focus so they reach Windows. Wayland: ask the compositor to inhibit them (GNOME keeps
+        // Super+Esc as the escape hatch). X11: hold an active keyboard grab while focused.
+        window.connect_map(|w| {
+            if let Some(toplevel) = w
+                .surface()
+                .and_then(|s| s.downcast::<gdk::Toplevel>().ok())
+            {
+                toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+            }
+        });
+        window.connect_is_active_notify(move |w| {
+            crate::kbgrab::set(w, w.is_active() && grab_wanted.get());
+        });
 
         // Guest sync (size + DPI). Window size and scale changes are debounced into one request.
         // The guest runs at the canvas' physical pixel size with Windows scaling set to the Linux

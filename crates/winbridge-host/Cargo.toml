@@ -10,6 +10,8 @@ description = "Linux GTK4 viewer and bridge host for Windows 11 QEMU guest"
 [dependencies]
 winbridge-proto = { path = "../winbridge-proto", features = ["tokio"] }
 gtk4 = { version = "0.11", features = ["v4_18"] }
+gdk4-x11 = { version = "0.11", features = ["v4_18", "xlib"] }
+x11-dl = "2"
 zbus = { version = "5.5", features = ["p2p", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
