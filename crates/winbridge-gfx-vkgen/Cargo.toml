@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "winbridge-gfx-vkgen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generates the WinBridge Vulkan serializers and ICD shims from vk.xml"
+
+[dependencies]
+roxmltree = "0.21"

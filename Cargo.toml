@@ -4,6 +4,12 @@ members = [
     "crates/winbridge-proto",
     "crates/winbridge-host",
     "crates/winbridge-agent",
+    "crates/winbridge-gfx-proto",
+    "crates/winbridge-gfx-vk",
+    "crates/winbridge-gfx-vkgen",
+    "crates/winbridge-gfx",
+    "crates/winbridge-gfx-icd",
+    "crates/winbridge-gfx-probe",
 ]
 
 [workspace.package]

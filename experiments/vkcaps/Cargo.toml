@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "vkcaps"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Host Vulkan capability probe for the WinBridge DXVK forwarding spike"
+
+[dependencies]
+ash = "0.38.0"
+
+# Standalone: keep out of the root WinBridge workspace.
+[workspace]

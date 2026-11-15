@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "winbridge-gfx-probe"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vulkan loader probe for the WinBridge GPU forwarding path: lists devices, runs the DXVK requirement checks and a mapped-buffer checksum round trip"
+
+[[bin]]
+name = "winbridge-gfx-probe"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+winbridge-gfx-vk = { path = "../winbridge-gfx-vk" }
+
+[dev-dependencies]
+winbridge-gfx = { path = "../winbridge-gfx" }
+winbridge-gfx-proto = { path = "../winbridge-gfx-proto" }
+winbridge-gfx-vk = { path = "../winbridge-gfx-vk", features = ["host"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
