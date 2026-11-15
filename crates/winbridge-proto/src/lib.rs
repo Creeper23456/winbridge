@@ -223,6 +223,29 @@ pub enum Message {
         clip_id: u32,
         entries: Vec<ManifestEntry>,
     },
+    /// Host -> agent, over the serial channel, after the normal handshake: the host created a
+    /// shared-memory region (`docs/IVSHMEM-TRANSPORT.md`) and offers to move the control and bulk
+    /// lanes onto it. `shm_version` is the region layout version, `region_len` the length of the
+    /// BAR the guest must see. The host keeps using the serial channel until `ShmReady` arrives.
+    ShmOffer {
+        shm_version: u32,
+        region_len: u64,
+    },
+    /// Agent -> host: answer to `ShmOffer`. `ok` is true only when the guest mapped the device
+    /// (cached), hardened its access control and attached the region header successfully; on false
+    /// `reason` is a short human-readable cause and the serial channel stays in use.
+    ShmReady {
+        ok: bool,
+        reason: String,
+    },
+    /// Either side -> other, over the serial channel: wake the peer's ring consumer (one per
+    /// wake-up; the consumer published its sleeping flag). Carries no data.
+    ShmKick,
+    /// Either side -> other, over the serial channel, as the last message before leaving
+    /// the rings (shutdown, error): both sides return to the serial transport. `reason` is for logs.
+    ShmFallback {
+        reason: String,
+    },
 }
 
 /// Errors occurring during protocol framing or serialization.

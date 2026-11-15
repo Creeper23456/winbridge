@@ -10,6 +10,7 @@ members = [
     "crates/winbridge-gfx",
     "crates/winbridge-gfx-icd",
     "crates/winbridge-gfx-probe",
+    "crates/winbridge-shm",
 ]
 
 [workspace.package]

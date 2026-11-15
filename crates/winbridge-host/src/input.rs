@@ -32,6 +32,17 @@ pub enum InputOp {
     Key { code: u32, down: bool },
 }
 
+/// Value to send in `SetAbsPosition` so the guest cursor lands on guest pixel `px` of an axis
+/// `extent` pixels wide. Inferred (not read from QEMU source), then measured on the real VM:
+/// QEMU maps the position into the tablet's 0..0x7fff range with `px * 0x7fff / extent` and the
+/// guest's tablet driver floors when scaling back, so a pixel reads one lower than sent. Sending
+/// `px + 1` compensates. QEMU rejects `px >= extent` ("Invalid mouse position"), so the value is
+/// capped at `extent - 1`: pixels `0..=extent-2` are exact, and the last pixel (`extent - 1`)
+/// reads `extent - 2`. The last column and row are unreachable through QEMU's absolute pointer.
+pub fn abs_wire_value(px: u32, extent: u32) -> u32 {
+    (px + 1).min(extent.saturating_sub(1))
+}
+
 /// Pending events above this count trigger dropping of superseded motion events.
 const BACKLOG_LIMIT: usize = 1024;
 
@@ -188,6 +199,38 @@ async fn send(shared: &Shared, mouse: &MouseProxy<'static>, keyboard: &KeyboardP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inferred model of QEMU's tablet scaling plus the guest's floor when reading it back.
+    fn guest_reads(sent: u64, extent: u64) -> u64 {
+        (sent * 32767 / extent) * extent / 32768
+    }
+
+    #[test]
+    fn model_matches_the_measured_points() {
+        // (extent, sent, measured guest position) from the GetCursorPos measurements.
+        for (extent, sent, read) in [(1340, 1338, 1337), (1340, 1339, 1338), (1340, 1339, 1338), (677, 676, 675)] {
+            assert_eq!(guest_reads(sent, extent), read, "extent {extent} sent {sent}");
+        }
+        for (sent, read) in [(0, 0), (1, 0), (2, 1), (3, 2)] {
+            assert_eq!(guest_reads(sent, 1340), read);
+        }
+    }
+
+    #[test]
+    fn wire_value_is_exact_except_for_the_last_pixel() {
+        for extent in [677u32, 1280, 1340, 1920, 2560, 3840] {
+            for p in 0..extent - 1 {
+                let sent = abs_wire_value(p, extent);
+                assert!(sent < extent, "QEMU rejects values >= extent");
+                assert_eq!(guest_reads(sent as u64, extent as u64), p as u64, "extent {extent} pixel {p}");
+            }
+            let last = abs_wire_value(extent - 1, extent);
+            assert_eq!(last, extent - 1);
+            assert_eq!(guest_reads(last as u64, extent as u64), extent as u64 - 2, "last pixel reads one lower");
+            assert_eq!(abs_wire_value(0, extent), 1);
+            assert_eq!(abs_wire_value(extent + 5, extent), extent - 1, "out of range is clamped");
+        }
+    }
 
     fn drain(q: &mut InputQueue) -> Vec<InputOp> {
         std::iter::from_fn(|| q.pop()).collect()

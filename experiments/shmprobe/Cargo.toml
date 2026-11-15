@@ -1,0 +1,32 @@
+[package]
+name = "shmprobe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+description = "Measures the ivshmem Windows driver and the winbridge-shm ring over it (cache modes, ordering, single mapping)"
+
+[dependencies]
+winbridge-shm = { path = "../../crates/winbridge-shm" }
+
+[target.'cfg(unix)'.dependencies]
+memmap2 = "0.9"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+# Standalone: not a member of the repository workspace.
+[workspace]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

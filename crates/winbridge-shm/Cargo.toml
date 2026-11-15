@@ -1,0 +1,15 @@
+[package]
+name = "winbridge-shm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared-memory (ivshmem) lane transport core for WinBridge"
+
+# No runtime dependencies: the core only needs `core`/`std` and builds for
+# x86_64-pc-windows-msvc with the static CRT.
+
+# Host-only test helpers: map /dev/shm or temp files in place of the BAR.
+[target.'cfg(unix)'.dev-dependencies]
+memmap2 = "0.9"

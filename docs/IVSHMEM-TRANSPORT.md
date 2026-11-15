@@ -2,7 +2,9 @@
 
 # WinBridge Shared-Memory Transport (ivshmem) Design
 
-Status (2026-11-15): **design only, nothing is implemented.** Decided by the user the same day. Order of work: (1) vkcube and the DXVK triangle on the current virtio-serial path (`docs/GFX-DESIGN.md` M2/M3), (2) this transport, (3) the Venus port to Windows. Statements marked **[UNVERIFIED]** are recalled from memory or inferred and must be measured or checked before they are relied on. Sizes are starting values, not measurements.
+Status (2026-11-16): **design plus a measured feasibility probe; the transport itself is not implemented.** `crates/winbridge-shm` (ring, lanes, scheduler, hostile-peer hardening; host-only tests) exists, and `experiments/shmprobe/RESULTS.md` holds the Windows driver and BAR measurements from a disposable build VM. Order of work: (1) vkcube and the DXVK triangle on the current virtio-serial path (`docs/GFX-DESIGN.md` M2/M3; M2 is done), (2) this transport, (3) the Venus port to Windows. Statements marked **[UNVERIFIED]** are not settled by a measurement yet; everything marked (measured) comes from `experiments/shmprobe/RESULTS.md`. Sizes are starting values.
+
+**Direction (user decision, 2026-11-16):** the measurements show the shared-memory path is two orders of magnitude faster than virtio-serial (6.6/7.7 GB/s end to end, 0.2 us ping-pong), so shared memory becomes the primary transport for control and bulk traffic as well as graphics, once the end-to-end test in the build VM confirms it with real agent code. virtio-serial remains only the handshake, the wake-up (kick) and the fallback. Shared memory stays opt-in (`shm = true`) until that test and a deployment to the user's guest have passed.
 
 ## 1. Why
 
@@ -24,10 +26,10 @@ Two `ivshmem-plain` devices, split by trust domain, plus the existing virtio-ser
 | Device | Opened by | Carries | BAR2 |
 |---|---|---|---|
 | `wb-ctl` | the elevated guest agent only | control, clipboard, drag-and-drop, file/clipboard bulk | 256 MiB |
-| `wb-gfx` | Vulkan clients (unprivileged processes, via the ICD) and the agent | Vulkan commands, returned frames, resource pool | 256 MiB |
+| `wb-gfx` | the elevated guest broker only (Vulkan clients reach it through the broker, section 8a) | Vulkan commands, returned frames, resource pool | 256 MiB |
 | virtio-serial `org.winbridge.0` | the agent | handshake and version negotiation, wake-up kick, fallback when shared memory is unavailable | - |
 
-Why two devices: `\\.\Global\org.winbridge.0` needs administrator rights today, which is what stops an unprivileged guest process from feeding fake host messages to the elevated agent. Shared memory has no such barrier: any process that can open the device can write the rings. Graphics clients are ordinary user processes and need access, so graphics gets its own device; the control rings live on a device only an administrator can open. A guest-local attacker with access to `wb-gfx` can then corrupt graphics data but cannot reach the agent's control path.
+Why two devices: `\\.\Global\org.winbridge.0` needs administrator rights today, which is what stops an unprivileged guest process from feeding fake host messages to the elevated agent. The driver allows **only one mapping per device** (section 8), so in the guest both devices end up opened by the elevated agent/broker anyway and the old argument "graphics clients need their own, user-accessible device" no longer applies. The remaining reasons for two devices are independent failure and capacity domains and simpler per-lane sizing; a single larger device (for example 512 MiB) is the simpler alternative and is an **open decision** (section 11).
 
 QEMU side (sketch, per device; sizes as above):
 
@@ -36,7 +38,7 @@ QEMU side (sketch, per device; sizes as above):
 -device ivshmem-plain,memdev=wb-ctl
 ```
 
-The backing files are created by the launcher with mode 0600 for the VM's user. `ivshmem-plain` is PCI 1af4:1110 with the memory in BAR2 **[UNVERIFIED: recalled]**. shm pages are committed on first touch, so a large BAR costs host RAM only for the part actually used.
+The backing files are created by the launcher with mode 0600 for the VM's user. `ivshmem-plain` is PCI 1af4:1110 with the memory in BAR2 (measured: the guest sees 1AF4:1110, subsystem 1AF4:1100, "PCI standard RAM Controller"). shm pages are committed on first touch, so a large BAR costs host RAM only for the part actually used.
 
 ## 3. Lanes and scheduling
 
@@ -60,12 +62,12 @@ Rules:
 
 - SPSC ring buffers in the BAR: a 64-byte-aligned header per ring (head, tail, flags, each index written by exactly one side and padded to its own cache line), then a power-of-two data area. Records carry a length and a lane tag; existing framing (`winbridge-gfx-proto` frames, `winbridge-proto` messages) is reused as record payload, only the transport changes. The `MessageTransport` boundary from `docs/GFX-DESIGN.md` 12a is the seam; the control protocol needs the same seam (host `serial_client.rs`, agent `channel.rs`) before migration.
 - A region header page holds magic, protocol version, capabilities and the lane directory. Version and capabilities are negotiated over virtio-serial first; a peer without the driver or with a mismatching version falls back to virtio-serial. The `bincode` wire format is positional, so host and agent must still be rebuilt and deployed together.
-- Memory ordering: x86 TSO plus compiler fences is enough for ordinary memory. If the guest maps the BAR write-combining, the producer must execute `sfence` after writing record bytes and before publishing the new index; with a cached mapping this is not needed. Which one applies is chosen when the driver maps the BAR (section 8).
-- Direction asymmetry: on a write-combined or uncached mapping guest writes are fast but guest **reads are slow** (research reports anecdotes of tens of MB/s for scalar reads; **[UNVERIFIED: not measured by us]**). Everything the guest consumes at volume (returned frames, bulk file data from the host) is exposed to that. Candidate mitigations, in the order to try: (a) map the BAR **cached** (the driver reportedly takes a per-mapping cache mode: non-cached, cached, write-combined; QEMU backs the BAR with ordinary host RAM, so hardware coherency should apply **[UNVERIFIED]**); never map the same physical pages with two different cache modes at once (conflicting memory types are undefined on x86), so the cache mode is one choice per device; (b) streaming loads (`MOVNTDQA`) on a WC mapping; (c) a bounce copy into ordinary RAM in large blocks; (d) encoding that shrinks the bytes read (`experiments/codecbench`). The real numbers must be measured before any lane layout is frozen.
+- Memory ordering (measured, build VM): the cached mapping is coherent with the host in both directions. Keep `publish_fence()` (`sfence`) in the ring producer: with a cached mapping only non-temporal stores were reordered (147,815 index-before-data observations without it, none with it); scalar and `rep movsb` stores never were. On a write-combined mapping every store kind can be reordered without a fence.
+- **Cache mode: use cached (`cacheMode = 1`) for every device and both directions (measured).** Guest bandwidth in MiB/s: cached write 13,000-24,000 and read 20,000-33,000; write-combined write about 23,900 but read 81 (scalar), 328 (AVX2 plain loads), about 7,200 (`MOVNTDQA` SSE), about 15,000 (`MOVNTDQA` AVX2); non-cached 10-330 both ways. Ring end to end with 1 M verified mixed records per direction: cached 6,628 MiB/s guest to host and 7,722 MiB/s host to guest; write-combined 4,942 and **208**; non-cached about 12. So the "guest reads are slow" problem is solved by the cached mapping and there is no per-device trade-off. One mode per device: never map the same pages with two cache modes at once.
 
 ## 5. Wake-up (doorbell)
 
-`ivshmem-plain` has no interrupt. `ivshmem-doorbell` has one but needs the external `ivshmem-server` process and a driver that handles the vectors **[UNVERIFIED: whether the chosen driver does]**. Plan: adaptive polling. A consumer spins for a short, bounded time after traffic, then sleeps on a timer (order of 1 ms) and is woken by a one-byte kick over virtio-serial when a producer finds the ring empty and the consumer asleep. Busy rings therefore pay no kick; idle rings do not burn a core.
+`ivshmem-plain` has no interrupt vectors (measured: `vectors` is 0), and the doorbell path was not tested (`ivshmem-doorbell` needs the external `ivshmem-server`). Plan: adaptive polling. A consumer spins for a short, bounded time after traffic, then sleeps on a timer (order of 1 ms) and is woken by a one-byte kick over virtio-serial when a producer finds the ring empty and the consumer asleep. Measured ring ping-pong with cached mapping and spinning on both sides: p50 0.20 us, p99.9 0.40 us, max 75 us (hypervisor scheduling noise); spinning holds one core at 100% per side, while a 1 ms sleeping consumer costs about 1% of a core and a round trip of about 1.06 ms. Busy rings therefore pay no kick; idle rings must not spin.
 
 ## 6. Sizing: is 256 MiB enough?
 
@@ -78,37 +80,51 @@ Bandwidth is not the question (memory copies run at GB/s, far above the 253 MiB/
 ## 7. Security
 
 - The host treats every byte of both regions as hostile: copy a record out of the ring, then validate the copy; no pointers or host addresses inside records; all offsets and lengths bounds-checked against the lane; index values sanity-checked (an index that moves backwards or past the other side's, closes the lane); no parsing in place (no time-of-check/time-of-use).
-- `wb-ctl` is opened only by the elevated agent. The driver's default device security reportedly grants only SYSTEM and Administrators **[UNVERIFIED: read from the INF/driver, not tested]**, which is exactly what `wb-ctl` wants. The agent keeps validating paths and sizes exactly as today.
-- `wb-gfx` slices are per client; a crashing client's slice is reclaimed by the host on channel loss. Whether one unprivileged process can scribble over another client's slice depends on whether the driver maps the whole BAR to every opener **[UNVERIFIED]**; the blast radius is limited to graphics data and is mitigated by per-slice validation and the broker in the agent if needed.
+- **Device security (measured, and different from the first assumption):** the driver's default DACL on the device object gives Everyone read and write, so a standard user (only in `Users`) can open both devices and map the BAR, and because only one mapping is allowed per device, an unprivileged process could also hold the mapping and lock the agent out. The elevated agent must therefore call `SetKernelObjectSecurity` on each device interface at startup (SYSTEM and Administrators only); measured: afterwards a standard user gets access denied while SYSTEM and an elevated admin still map. The hardening does **not** survive a reboot; a per-device registry `Security` value (REG_BINARY and REG_SZ) had no effect after reboot, so the agent re-applies it every boot, before it maps. Until the DACL is applied the devices must not be trusted: the agent maps first only after hardening, and treats a failed hardening as "shared memory unavailable" (fall back to virtio-serial). The agent keeps validating paths and sizes exactly as today.
+- Per-client slices of `wb-gfx` are owned by the broker (section 8a): a crashing client's slice is reclaimed on channel loss, and unprivileged processes never map the BAR, so one client cannot scribble over another through the device. Isolation between clients rests on the broker's per-client sections and on per-slice validation by both the broker and the host.
 - A malicious guest cannot make the host exceed the region: the host maps the files it created, with fixed sizes.
 
 ## 8. Windows driver
 
-Shared memory needs a **kernel-mode driver in the guest**. The user accepted installing a third-party one; we write no driver ourselves. Everything below was gathered by a research pass over secondary sources and a web search; **my own attempt to fetch the driver's `Public.h` from GitHub failed (network error), so none of it is confirmed from the primary source yet.** Treat every item as **[UNVERIFIED]** until the driver source or a test in the build VM confirms it.
+Shared memory needs a **kernel-mode driver in the guest**. The user accepted installing a third-party one; we write no driver ourselves. Facts below marked (source) were read from the driver source in `virtio-win/kvm-guest-drivers-windows` (directory `ivshmem`, fetched through the GitHub API on 2026-11-15) or from the binaries inside the Looking Glass host installer; (research) means a secondary report that was not confirmed.
 
-What research reports:
+**Verified from source and binaries**
 
-- **Source and license:** the ivshmem driver lives in `virtio-win/kvm-guest-drivers-windows` (directory `ivshmem`), under BSD-3-Clause; Looking Glass bundles a prebuilt copy in its installer (Looking Glass itself is GPL-2.0, its own indirect-display driver is separate). BSD-3-Clause is compatible with our GPL-3.0-or-later project.
-- **User-mode interface:** device interface `GUID_DEVINTERFACE_IVSHMEM` `{df576976-569d-4672-95a0-f57e4ea0b210}`; IOCTLs to request the peer id, the BAR2 size, to map BAR2 into the caller (`IOCTL_IVSHMEM_REQUEST_MMAP`, with a cache mode parameter: non-cached, cached, write-combined), to ring a doorbell and to register an event. Mappings are per file handle and released when the handle closes. Several `ivshmem-plain` devices should appear as several device interface instances, enumerated with SetupAPI; a client tells `wb-ctl` from `wb-gfx` by reading the region header magic and the directory's role field, not by index.
-- **Doorbell and interrupts:** `ivshmem-plain` has no interrupts; doorbell registration only works with `ivshmem-doorbell` plus the external `ivshmem-server`. The polling-plus-serial-kick plan of section 5 stands.
-- **Access control:** default security is SYSTEM and Administrators only. That suits `wb-ctl`. `wb-gfx` must be opened by unprivileged Vulkan processes, so its device security has to be widened after installation. Editing the INF would invalidate the signed catalog, so the approach to try is for the elevated agent to set the device's security descriptor after install (SetupAPI device registry property for the security descriptor), leaving the signed package untouched. If that does not work, graphics clients would have to talk to a broker in the agent (more copies; avoid if possible).
-- **Signing:** reported: the virtio-win ivshmem builds are **not WHQL signed** (test-signed or signed with Red Hat's own certificate), WHQL packages are not publicly distributed, and Looking Glass documents disabling Secure Boot in the guest firmware to load it; with Secure Boot enabled the symptom is Device Manager **Code 52** (signature invalid). Windows 11 24H2 and later feature updates may also tighten driver blocklists.
-- **HVCI / memory integrity:** reported to reject older builds; not a constraint here today (see below).
-- **Alternatives (research verdict):** no official signed virtio driver provides raw shared-memory rings on Windows: `virtio-pmem` has no Windows driver, `viofs` DAX is not supported on Windows, `viosock` is a socket with kernel transitions and copies (no advantage over the current virtio-serial for our purpose, **not measured**), ACPI NVDIMM needs a filesystem on top. So the ivshmem driver is the only candidate.
+- **Source and license (source):** BSD-3-Clause (`ivshmem/LICENSE`), compatible with our GPL-3.0-or-later project. Looking Glass's `looking-glass-host-setup.exe` (build of 2025-03-06) ships `ivshmem.sys`, `ivshmem.inf`, `ivshmem.cat`; the `.sys` identifies itself as "Red Hat IVSHMEM Driver" by Red Hat, Inc. The current virtio-win ISO (0.1.302 build in the user's VM directory) does **not** contain an `ivshmem` directory (it has `viosock`), so the package has to come from Looking Glass's installer or a build of the source.
+- **Signature (binary):** the catalog `ivshmem.cat` is signed by **"Microsoft Windows Hardware Compatibility Publisher"** (chain: Microsoft Windows Third Party Component CA 2014, Microsoft Root Certificate Authority 2010), i.e. a Microsoft (WHCP/attestation) signature, not a test certificate. This contradicts the research report that the driver is not WHQL signed. **Still to confirm on Windows**: `Get-AuthenticodeSignature` on `.cat`/`.sys` and a real install without Code 52 (the catalog inspection here was done with openssl and does not prove the hashes cover the shipped `.sys`).
+- **Interface (source, `Public.h`):** device interface `GUID_DEVINTERFACE_IVSHMEM` `{df576976-569d-4672-95a0-f57e4ea0b210}`; IOCTLs (`FILE_DEVICE_UNKNOWN`, buffered, `FILE_ANY_ACCESS`): `REQUEST_PEERID` 0x800, `REQUEST_SIZE` 0x801, `REQUEST_MMAP` 0x802, `RELEASE_MMAP` 0x803, `RING_DOORBELL` 0x804, `REGISTER_EVENT` 0x805, `REQUEST_KMAP` 0x806. `REQUEST_MMAP` takes a cache mode: `IVSHMEM_CACHE_NONCACHED` 0, `CACHED` 1, `WRITECOMBINED` 2 (`Queue.c` maps the pages with `MmMapLockedPagesSpecifyCache` using `MmNonCached`, `MmCached` or `MmWriteCombined`).
+- **One mapping per device (source, `Queue.c`):** the device context holds a single `shmemMap`; a second `REQUEST_MMAP` returns `STATUS_DEVICE_ALREADY_ATTACHED`. A commit "Allow multiple processes to map the same shared memory" was merged and then reverted on 2025-09-28. **Consequence: only one process in the guest can map each ivshmem device.** Unprivileged Vulkan clients cannot each map `wb-gfx`; see section 8a.
+- **Interrupts (source, `ivshmem.inf`):** the INF enables MSI (`MSISupported=1`), so doorbells work with `ivshmem-doorbell`; `ivshmem-plain` has no interrupt vectors, as before.
+- **Device security (measured):** the default DACL is **not** restricted; see section 7. The agent hardens it at runtime.
 
-Measured on the user's LTSC guest (2026-11-15, read-only query): `Confirm-SecureBootUEFI` fails with "variable is currently undefined" (0xC0000100), i.e. Secure Boot is **not active** in this QEMU/OVMF setup; VBS/HVCI is off (`Win32_DeviceGuard` VBS status 0); test-signing is not enabled (`bcdedit` shows no `testsigning`). So the Secure Boot blocker does not apply today, but a driver still needs a signature that chains to a trusted root; a test-signed or self-signed package would still fail with Code 52 unless test-signing were turned on, which we do not want. The same Windows installation also boots on bare metal (possibly with Secure Boot), where the driver is never started because the device does not exist [INFERENCE].
+**Research only (unverified)**
 
-What must be checked before committing to it:
+- Looking Glass documents disabling Secure Boot for the driver. Measured: the package installs and passes the cached pattern test in a build VM with Secure Boot ON (secure OVMF with Microsoft keys, `Confirm-SecureBootUEFI = True`) as well as with Secure Boot not active, so that advice does not apply to this package. HVCI was not tested.
+- The first expectation that guest reads are slow is confirmed only for the write-combined and non-cached mappings (see section 4); the cached mapping reads at 20,000-33,000 MiB/s.
+- No official signed virtio driver offers raw shared-memory rings on Windows (`virtio-pmem` has no Windows driver, `viofs` DAX is Linux-only); `viosock` ships in the ISO and is signed, but it is a socket with kernel transitions and copies and was not measured.
 
-1. **The signature of the exact package we would ship**: inspect the `.cat`/`.sys` signer (`signtool verify /kp`, `Get-AuthenticodeSignature`), install it in a build VM configured like the LTSC guest (same OVMF build, Secure Boot state, test-signing off) and confirm Device Manager shows no Code 52. Record the result; if it fails, the options are a package signed by Microsoft (attestation signing needs an EV certificate and a Partner Center account, a significant commitment) or enabling test-signing (rejected).
-2. **HVCI / memory integrity** compatibility if the user ever enables it.
-3. **Cache modes**: which modes the mapping IOCTL accepts and the real read speeds (section 4).
-4. **Device security**: whether the agent can widen the ACL for `wb-gfx` without breaking the signature; whether a second device is a second driver instance.
-5. **Redistribution**: BSD-3-Clause allows redistribution with notice; ship the driver package as a separate, explicit step of the agent (an `--install-ivshmem` style command, never silent, with uninstall, never replacing a driver the user installed). The user already removed `virtio-win.iso` from the VM, so the package must be supplied another way.
-6. **EDR and Windows Update:** drivers that expose physical-memory mappings to user mode are flagged by some security products; feature updates may replace or block the driver. The agent must detect a missing or failed driver at runtime.
-7. **Failure mode:** if the driver is missing, signature-rejected, or the device is absent, the agent reports it honestly in status and everything runs over virtio-serial exactly as today.
+**Measured on the user's LTSC guest** (2026-11-15, read-only query): `Confirm-SecureBootUEFI` fails with "variable is currently undefined" (0xC0000100), i.e. Secure Boot is not active in this QEMU/OVMF setup; VBS/HVCI is off (`Win32_DeviceGuard` VBS status 0); test-signing is not enabled. The same Windows installation also boots on bare metal, where the driver would never start because the device does not exist [INFERENCE].
 
-This is a change of the earlier "no kernel driver" decision for the GPU path; it is limited to a third-party, signed, transport-only driver.
+What must still be checked before committing to it:
+
+1. ~~Install and signature test on a build VM~~ Done (measured): `Get-AuthenticodeSignature` reports Valid for `ivshmem.cat` and `ivshmem.sys` (WHQL, "Microsoft Windows Hardware Compatibility Publisher"; the certificate expired in 2023 but the signature is timestamped); `pnputil /add-driver ivshmem.inf /install` succeeded on every boot and both devices showed Status OK, ProblemCode 0, in a VM that matches the LTSC guest (Secure Boot not active, VBS 0, test-signing off) and with Secure Boot ON.
+2. **HVCI / memory integrity** compatibility if the user ever enables it: not tested.
+3. ~~Cache modes~~ Done (measured, section 4): cached for every device.
+4. **Redistribution**: BSD-3-Clause allows redistribution with notice; ship the package as a separate, explicit agent step (an `--install-ivshmem` style command, never silent, with uninstall, never replacing a driver the user installed), taken from a pinned, hash-checked release. The user removed `virtio-win.iso`, and it has no ivshmem anyway.
+5. **EDR and Windows Update:** drivers that expose physical-memory mappings to user mode are flagged by some security products; feature updates may replace or block the driver. The agent must detect a missing or failed driver at runtime.
+6. **Failure mode:** if the driver is missing, rejected, or the device is absent, the agent reports it honestly in status and everything runs over virtio-serial exactly as today.
+
+This is a change of the earlier "no kernel driver" decision for the GPU path; it is limited to a third-party, Microsoft-signed (per the catalog), transport-only driver.
+
+## 8a. Consequence of the single mapping: the guest broker
+
+Because each device can be mapped by one process only, **the elevated agent (or a broker process it owns) is the only guest component that touches the BARs.** Vulkan clients in unprivileged processes talk to the broker over ordinary guest memory: per-client named shared-memory sections plus events or pipes, with ACLs restricting each section to its client and the broker. The broker multiplexes the clients onto the lanes. This changes the earlier picture:
+
+- **Trust split by device is no longer needed for access control.** Both devices are opened only by the elevated broker, **after the agent has hardened each device's DACL at startup (section 7; the default is open to Everyone)**, so unprivileged processes never see the BARs. Whether to keep two devices (independent failure and capacity domains, simpler per-lane sizing) or use one larger device is an open decision; one device of 512 MiB is the simpler alternative.
+- **One extra guest-side memcpy** (client section to BAR, and BAR to client section for returned frames) in cached ordinary RAM, which is fast; zero-copy is therefore end to end only between broker and host. `VK_EXT_external_memory_host` import still works on the host side from the BAR.
+- **The broker replaces the single-handle graphics-port broker** already identified in `docs/GFX-DESIGN.md` risk 10 and must never run on the agent's control reader loop: separate threads, bounded queues, and a hard rule that a stuck client cannot stall control traffic.
+- The broker is a guest-side attack surface: it parses client input, so it validates client sections the same way the host validates the BAR.
+
 
 ## 9. Verification plan
 
@@ -128,8 +144,9 @@ Do these on the disposable build VM, never on the user's LTSC VM, before any lan
 
 ## 11. Open questions
 
-- Per-handle mapping and ACLs of the chosen driver (7, 8.4).
-- Real BAR read speed in the guest and the best mitigation (4).
+- Two devices or one larger device now that only the broker maps them (2, 8a).
+- HVCI / memory integrity compatibility (8); the doorbell path (`ivshmem-doorbell`, not needed while polling plus kick works).
+- Whether the DACL hardening can be applied early enough on every boot (before any unprivileged process maps the device), and what the agent does between boot and hardening (7).
 - Whether 256 MiB for `wb-gfx` holds once DXVK runs (6).
 - Whether to relax the guest-input lock during transfers once lanes exist (3).
 - Polling cost on a 4-vCPU guest and the right spin/sleep thresholds (5).

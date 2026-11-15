@@ -117,6 +117,12 @@ pub struct ViewerWindow {
     relative_button: ToggleButton,
     /// A one-off header message, e.g. why game mode switched itself off.
     notice: RefCell<Option<String>>,
+    /// Clears [`Self::notice`] after a few seconds.
+    notice_timer: RefCell<Option<glib::SourceId>>,
+    /// The agent answered the last keepalive check; a silence followed by an answer re-syncs.
+    agent_heard: Cell<bool>,
+    /// Re-sends the canvas resolution and DPI to the guest (through the resize debounce).
+    resync: RefCell<Option<Rc<dyn Fn()>>>,
     /// `Mouse.IsAbsolute` as read from QEMU when game mode was last switched on.
     is_absolute: Cell<Option<bool>>,
     /// The agent does not answer the keepalive (or the channel is down): the header says how to
@@ -170,6 +176,10 @@ impl ViewerWindow {
 
         let header = HeaderBar::new();
         let status_label = Label::new(Some("Connecting to QEMU Display & VirtIO-Serial..."));
+        // Header text must never widen the window (and with it the guest resolution).
+        status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        status_label.set_max_width_chars(90);
+        status_label.set_single_line_mode(true);
         header.set_title_widget(Some(&status_label));
         header.pack_end(&crate::devices::devices_button(&window, config.qmp_socket.clone(), config.usb_bus.clone()));
         let relative_button = ToggleButton::with_label("Game mode");
@@ -230,6 +240,9 @@ impl ViewerWindow {
             input: input.clone(),
             relative_button: relative_button.clone(),
             notice: RefCell::new(None),
+            notice_timer: RefCell::new(None),
+            agent_heard: Cell::new(true),
+            resync: RefCell::new(None),
             is_absolute: Cell::new(None),
             agent_unresponsive: Cell::new(false),
             ping_seq: Cell::new(0),
@@ -302,34 +315,58 @@ impl ViewerWindow {
         }
         drawing_area.add_controller(motion_ctrl);
 
-        // One click gesture per button: a single gesture follows one button at a time and would
-        // lose the press and release of a second button held together with the first.
-        for (gdk_button, qemu_button) in [(1u32, 0u32), (2, 1), (3, 2), (8, 5), (9, 6)] {
-            let gesture = if gdk_button == 1 { click_gesture.clone() } else { GestureClick::new() };
-            gesture.set_button(gdk_button);
-            {
-                let input = input.clone();
-                let track = track.clone();
-                gesture.connect_pressed(move |_g, _n_press, x, y| {
-                    if input.button(qemu_button, true, x, y) && qemu_button == 0 {
-                        track.left_down.set(true);
-                        track.probe.borrow_mut().reset();
-                    }
-                });
-            }
-            {
-                let input = input.clone();
-                let track = track.clone();
-                gesture.connect_released(move |_g, _n_press, x, y| {
-                    input.button(qemu_button, false, x, y);
-                    if qemu_button == 0 {
-                        track.left_down.set(false);
-                        track.probe.borrow_mut().reset();
-                    }
-                });
-            }
-            drawing_area.add_controller(gesture);
+        // Raw button events, tracked by the router's own held-button set. GTK gestures follow one
+        // button at a time: pressing a second button ended the first button's gesture and its
+        // release was never reported, leaving the guest button stuck down.
+        let button_ctrl = gtk4::EventControllerLegacy::new();
+        {
+            let input = input.clone();
+            let track = track.clone();
+            let area = drawing_area.clone();
+            button_ctrl.connect_event(move |_ctrl, event| {
+                let down = match event.event_type() {
+                    gdk::EventType::ButtonPress => true,
+                    gdk::EventType::ButtonRelease => false,
+                    _ => return glib::Propagation::Proceed,
+                };
+                let Some(button_event) = event.downcast_ref::<gdk::ButtonEvent>() else {
+                    return glib::Propagation::Proceed;
+                };
+                let qemu_button = match button_event.button() {
+                    1 => 0, // Left
+                    2 => 1, // Middle
+                    3 => 2, // Right
+                    8 => 5, // Side (back)
+                    9 => 6, // Extra (forward)
+                    _ => return glib::Propagation::Proceed,
+                };
+                // Event positions are surface coordinates; convert to canvas coordinates.
+                let Some((ex, ey)) = event.position() else {
+                    return glib::Propagation::Proceed;
+                };
+                let Some(native) = area.native() else {
+                    return glib::Propagation::Proceed;
+                };
+                let (tx, ty) = native.surface_transform();
+                let Some(p) = native
+                    .upcast_ref::<gtk4::Widget>()
+                    .compute_point(&area, &gtk4::graphene::Point::new((ex - tx) as f32, (ey - ty) as f32))
+                else {
+                    return glib::Propagation::Proceed;
+                };
+                let forwarded = input.button(qemu_button, down, p.x() as f64, p.y() as f64);
+                if qemu_button == 0 && (forwarded || !down) {
+                    track.left_down.set(down);
+                    track.probe.borrow_mut().reset();
+                }
+                glib::Propagation::Proceed
+            });
         }
+        drawing_area.add_controller(button_ctrl);
+        // The left-button gesture only exists so a guest drag can deny its sequence before
+        // `Drag::begin` (see `on_guest_drag_offer`); it forwards nothing.
+        click_gesture.set_button(1);
+        drawing_area.add_controller(click_gesture.clone());
 
         // Scroll wheel / touchpad.
         let scroll_ctrl = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
@@ -449,6 +486,12 @@ impl ViewerWindow {
             let request_sync = request_sync.clone();
             move |area, width, height| request_sync(width, height, area.scale_factor())
         });
+        *viewer.resync.borrow_mut() = Some(Rc::new({
+            let request_sync = request_sync.clone();
+            let area = drawing_area.clone();
+            let window = window.clone();
+            move || request_sync(area.width(), area.height(), window.scale_factor())
+        }));
 
         window.connect_scale_factor_notify({
             let request_sync = request_sync.clone();
@@ -1040,7 +1083,7 @@ impl ViewerWindow {
 
     /// Game mode toggled in the header.
     fn on_relative_toggled(self: &Rc<Self>, on: bool) {
-        self.notice.borrow_mut().take();
+        self.clear_notice();
         self.input.set_relative_enabled(on);
         if on {
             // Informational: QEMU refuses RelMotion while its active pointing device is absolute.
@@ -1065,7 +1108,7 @@ impl ViewerWindow {
 
     /// QEMU refused relative motion: the guest has no relative pointing device (or its active
     /// pointer is the absolute tablet). Game mode switches itself off and says why.
-    fn check_relative_rejected(&self) {
+    fn check_relative_rejected(self: &Rc<Self>) {
         let rejected = self
             .dbus_conn
             .lock()
@@ -1079,11 +1122,33 @@ impl ViewerWindow {
         warn!("QEMU refused RelMotion (IsAbsolute = {}): switching game mode off", absolute);
         // Toggling clears the notice, so set it afterwards.
         self.relative_button.set_active(false);
-        *self.notice.borrow_mut() = Some(format!(
+        self.set_notice(format!(
             "Game mode off: QEMU refused relative motion (IsAbsolute = {}); the guest needs a relative pointing device such as -device usb-mouse",
             absolute
         ));
         self.refresh_status();
+    }
+
+    /// Shows a short header message (the full text is in the tooltip) for a few seconds.
+    fn set_notice(self: &Rc<Self>, text: String) {
+        self.clear_notice();
+        *self.notice.borrow_mut() = Some(text);
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(Duration::from_secs(8), move || {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.notice_timer.borrow_mut().take();
+                viewer.notice.borrow_mut().take();
+                viewer.refresh_status();
+            }
+        });
+        *self.notice_timer.borrow_mut() = Some(id);
+    }
+
+    fn clear_notice(&self) {
+        if let Some(id) = self.notice_timer.borrow_mut().take() {
+            id.remove();
+        }
+        self.notice.borrow_mut().take();
     }
 
     /// Pings the agent and records whether it still answers.
@@ -1108,6 +1173,21 @@ impl ViewerWindow {
                 if unresponsive { "unresponsive: showing the mouse release hint" } else { "answers again" }
             );
             self.refresh_status();
+        }
+        // The agent was silent and answers again (typically it started after the viewer sent its
+        // resolution): send the canvas resolution and DPI once more and refresh the title.
+        let heard = self.serial.is_connected() && self.serial.silent_for() <= AGENT_SILENCE_LIMIT;
+        if heard {
+            if !self.agent_heard.replace(true) {
+                info!("Guest agent is answering again: re-syncing resolution and DPI");
+                let resync = self.resync.borrow().clone();
+                if let Some(resync) = resync {
+                    resync();
+                }
+                self.serial.send_message(Message::QueryStatus);
+            }
+        } else {
+            self.agent_heard.set(false);
         }
     }
 
@@ -1182,9 +1262,9 @@ impl ViewerWindow {
             (false, Some(g)) => format!("Waiting for QEMU display - Agent connected - {}", g),
             (false, None) => "Connecting to QEMU Display & VirtIO-Serial...".to_string(),
         };
-        if let Some(notice) = self.notice.borrow().as_deref() {
-            text.push_str(" - ");
-            text.push_str(notice);
+        let notice = self.notice.borrow().clone();
+        if notice.is_some() {
+            text.push_str(" - Game mode off (hover for details)");
         }
         // The release shortcuts are only mentioned when they are needed: in game mode (the pointer
         // is confined) and while the agent does not answer (the guest may be hung).
@@ -1196,6 +1276,10 @@ impl ViewerWindow {
             text.push_str(" - Ctrl+Alt+G or Right Ctrl: release mouse");
         }
         self.status_label.set_text(&text);
+        match notice {
+            Some(notice) => self.status_label.set_tooltip_text(Some(&format!("{}\n{}", text, notice))),
+            None => self.status_label.set_tooltip_text(Some(&text)),
+        }
     }
 }
 

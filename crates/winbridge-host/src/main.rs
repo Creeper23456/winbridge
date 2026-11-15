@@ -5,6 +5,7 @@
 //! Linux GTK4 viewer and bridge host connecting to QEMU's D-Bus display and
 //! VirtIO-serial communication channel for Windows 11 guest synchronization.
 
+mod buttons;
 mod capture;
 mod clipboard;
 mod config;

@@ -22,10 +22,83 @@ use gtk4::{ApplicationWindow, DrawingArea};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use crate::buttons::HeldButtons;
 use tracing::info;
 
-/// Bit of the left button (QEMU button 0) in the held-button mask.
-const LEFT: u16 = 1;
+use crate::input::abs_wire_value;
+/// Widget coordinates come out of GTK's single-precision transforms and can sit a hair below the
+/// integer pixel they stand for (97.99999 for 98); this much is added before flooring.
+const EDGE_EPSILON: f64 = 0.01;
+
+/// Guest pixel for a widget coordinate: the widget spans `0..widget` and the guest `0..guest`
+/// pixels, so the last widget pixel maps to `guest - 1` and anything outside is clamped.
+fn map_axis(pos: f64, widget: f64, guest: f64) -> u32 {
+    (pos * guest / widget + EDGE_EPSILON).floor().clamp(0.0, (guest - 1.0).max(0.0)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_axis;
+
+    #[test]
+    fn every_pixel_maps_to_itself_at_scale_one_even_a_hair_below() {
+        // Regression: y = 98 on a 677 px canvas went out as 97 (and 11, 22, 31 ... with plain
+        // double arithmetic), landing the guest cursor one pixel high.
+        for extent in [677u32, 1280, 1340, 1920, 2560, 3840] {
+            for p in 0..extent {
+                let exact = p as f64;
+                let below = f32::from_bits((p as f32).to_bits().saturating_sub(1)) as f64;
+                let e = extent as f64;
+                assert_eq!(map_axis(exact, e, e), p, "extent {extent} pixel {p}");
+                assert_eq!(map_axis(below, e, e), p, "extent {extent} pixel {p} (f32 just below)");
+                assert_eq!(map_axis(exact + 0.5, e, e), p, "pixel centre");
+            }
+        }
+        assert_eq!(map_axis(98.0, 677.0, 677.0), 98);
+        assert_eq!(map_axis(94.0, 677.0, 677.0), 94);
+        assert_eq!(map_axis(249.0, 677.0, 677.0), 249);
+        assert_eq!(map_axis(499.0, 677.0, 677.0), 499);
+    }
+
+    #[test]
+    fn last_pixel_is_reachable_at_scale_one() {
+        let (w, g) = (1280.0, 1280.0);
+        assert_eq!(map_axis(0.0, w, g), 0);
+        assert_eq!(map_axis(1.0, w, g), 1);
+        assert_eq!(map_axis(w - 2.0, w, g), 1278);
+        assert_eq!(map_axis(w - 1.0, w, g), 1279);
+        assert_eq!(map_axis(w - 0.5, w, g), 1279);
+        assert_eq!(map_axis(w, w, g), 1279, "one outside is clamped");
+        assert_eq!(map_axis(-1.0, w, g), 0);
+    }
+
+    #[test]
+    fn fractional_scales_reach_the_last_guest_pixel() {
+        // Guest = canvas * scale (rounded), as the resize sync sets it.
+        for (w, scale) in [(1280.0, 1.25), (1280.0, 1.5), (677.0, 1.5), (677.0, 1.25)] {
+            let g = (w * scale as f64).round();
+            assert_eq!(map_axis(0.0, w, g), 0);
+            assert_eq!(map_axis(w - 1.0, w, g), (g * (w - 1.0) / w).floor() as u32);
+            assert_eq!(map_axis(w - 0.01, w, g), g as u32 - 1);
+            assert_eq!(map_axis(w, w, g), g as u32 - 1);
+            // Monotonic: no guest pixel is skipped backwards.
+            let mut last = 0;
+            for i in 0..w as u32 {
+                let m = map_axis(i as f64, w, g);
+                assert!(m >= last);
+                last = m;
+            }
+        }
+    }
+}
+
+/// Runs `f` on the held-button set kept in a `Cell`.
+fn held<R>(cell: &Cell<HeldButtons>, f: impl FnOnce(&mut HeldButtons) -> R) -> R {
+    let mut buttons = cell.get();
+    let result = f(&mut buttons);
+    cell.set(buttons);
+    result
+}
 
 pub struct InputRouter {
     dbus: Arc<Mutex<Option<DbusDisplayConnection>>>,
@@ -40,8 +113,8 @@ pub struct InputRouter {
     released: Cell<bool>,
     keys: RefCell<KeyFilter>,
     key_out: RefCell<Vec<KeyOut>>,
-    /// QEMU buttons the guest holds down because of us (bit = QEMU button number).
-    buttons: Cell<u16>,
+    /// QEMU buttons the guest holds down because of us.
+    buttons: Cell<HeldButtons>,
     rel: RefCell<RelativeTracker>,
     /// Last pointer position over the canvas, in widget coordinates.
     pos: Cell<Option<(f64, f64)>>,
@@ -72,7 +145,7 @@ impl InputRouter {
             released: Cell::new(false),
             keys: RefCell::new(KeyFilter::default()),
             key_out: RefCell::new(Vec::new()),
-            buttons: Cell::new(0),
+            buttons: Cell::new(HeldButtons::default()),
             rel: RefCell::new(RelativeTracker::default()),
             pos: Cell::new(None),
             cursor_key: Cell::new(None),
@@ -106,6 +179,13 @@ impl InputRouter {
         }
     }
 
+    /// Guest pixel to the value `SetAbsPosition` takes, see [`abs_wire_value`]. The only place
+    /// positions are converted for the wire.
+    fn wire_pos(&self, px: u32, py: u32) -> (u32, u32) {
+        let fb = self.fb.lock().unwrap();
+        (abs_wire_value(px, fb.width), abs_wire_value(py, fb.height))
+    }
+
     /// Guest pixel under a widget position, clamped to the screen.
     pub fn guest_pos(&self, x: f64, y: f64) -> Option<(u32, u32)> {
         let (w, h) = (self.area.width() as f64, self.area.height() as f64);
@@ -117,8 +197,8 @@ impl InputRouter {
             (fb.width as f64, fb.height as f64)
         };
         Some((
-            ((x / w) * gw).clamp(0.0, gw - 1.0) as u32,
-            ((y / h) * gh).clamp(0.0, gh - 1.0) as u32,
+            map_axis(x, w, gw),
+            map_axis(y, h, gh),
         ))
     }
 
@@ -160,7 +240,8 @@ impl InputRouter {
                 } else if let Some((x, y)) = self.pos.get() {
                     // Put the guest pointer under the Linux pointer before any click.
                     if let Some((gx, gy)) = self.guest_pos(x, y) {
-                        self.send(&[InputOp::Abs(gx, gy)]);
+                        let (wx, wy) = self.wire_pos(gx, gy);
+                        self.send(&[InputOp::Abs(wx, wy)]);
                     }
                 }
             }
@@ -180,13 +261,10 @@ impl InputRouter {
 
     /// Releases buttons (and optionally keys) the guest holds because of us.
     fn release_held(&self, keep_left: bool, keys: bool) {
-        let mask = self.buttons.get();
-        let keep = if keep_left { LEFT } else { 0 };
-        let mut ops: Vec<InputOp> = (0..u16::BITS)
-            .filter(|b| mask & (1 << b) != 0 && keep & (1 << b) == 0)
-            .map(|b| InputOp::Button { button: b, down: false })
+        let mut ops: Vec<InputOp> = held(&self.buttons, |b| b.drain(keep_left))
+            .into_iter()
+            .map(|button| InputOp::Button { button, down: false })
             .collect();
-        self.buttons.set(mask & keep);
         if keys {
             ops.extend(
                 self.keys
@@ -257,14 +335,15 @@ impl InputRouter {
             }
             // A held left button keeps the guest informed outside the canvas as well (clamped).
             Capture::Absolute => self.send_abs(x, y),
-            Capture::Off if self.buttons.get() & LEFT != 0 => self.send_abs(x, y),
+            Capture::Off if self.buttons.get().left_held() => self.send_abs(x, y),
             Capture::Off => None,
         }
     }
 
     fn send_abs(&self, x: f64, y: f64) -> Option<(u32, u32)> {
         let (gx, gy) = self.guest_pos(x, y)?;
-        self.send(&[InputOp::Abs(gx, gy)]);
+        let (wx, wy) = self.wire_pos(gx, gy);
+        self.send(&[InputOp::Abs(wx, wy)]);
         Some((gx, gy))
     }
 
@@ -290,10 +369,9 @@ impl InputRouter {
     /// A mouse button changed (QEMU button number). Returns whether it was forwarded to the
     /// guest. The press that takes back a manual release is swallowed, and so is its release.
     pub fn button(&self, button: u32, down: bool, x: f64, y: f64) -> bool {
-        if button >= u16::BITS {
+        if button >= 16 {
             return false;
         }
-        let bit = 1u16 << button;
         let relative = self.applied.get() == Capture::Relative;
         if down {
             // A click that gives the window focus may arrive before the focus notification.
@@ -310,17 +388,21 @@ impl InputRouter {
             if self.applied.get() == Capture::Off {
                 return false;
             }
-            self.buttons.set(self.buttons.get() | bit);
-        } else {
-            if self.buttons.get() & bit == 0 {
+            if !held(&self.buttons, |b| b.press(button)) {
                 return false;
             }
-            self.buttons.set(self.buttons.get() & !bit);
+        } else {
+            if !held(&self.buttons, |b| b.release(button)) {
+                return false;
+            }
         }
         // The button carries no position: send the exact one of this GTK event ahead of it.
         let pos = if relative { None } else { self.guest_pos(x, y) };
         match pos {
-            Some((gx, gy)) => self.send(&[InputOp::Abs(gx, gy), InputOp::Button { button, down }]),
+            Some((gx, gy)) => {
+                let (wx, wy) = self.wire_pos(gx, gy);
+                self.send(&[InputOp::Abs(wx, wy), InputOp::Button { button, down }])
+            }
             None => self.send(&[InputOp::Button { button, down }]),
         }
         true
@@ -329,9 +411,7 @@ impl InputRouter {
     /// Releases a button the guest holds although GTK will not report its release (a GTK drag
     /// took the pointer).
     pub fn force_release_button(&self, button: u32) {
-        let bit = 1u16 << button;
-        if self.buttons.get() & bit != 0 {
-            self.buttons.set(self.buttons.get() & !bit);
+        if held(&self.buttons, |b| b.release(button)) {
             self.send(&[InputOp::Button { button, down: false }]);
         }
     }
@@ -376,7 +456,8 @@ impl InputRouter {
         if self.state.borrow().relative_enabled() {
             return;
         }
-        self.send(&[InputOp::AbsExact(nudge.0, nudge.1), InputOp::AbsExact(to.0, to.1)]);
+        let (n, t) = (self.wire_pos(nudge.0, nudge.1), self.wire_pos(to.0, to.1));
+        self.send(&[InputOp::AbsExact(n.0, n.1), InputOp::AbsExact(t.0, t.1)]);
     }
 
     // ---- keyboard ---------------------------------------------------------------------------
