@@ -21,7 +21,7 @@ WinBridge is an open-source bridge between a Linux GTK4 viewer window and a Wind
 |  +-----------v---------------------v--------------------------+-----------------+  |
 |  |                              QEMU / KVM                                      |  |
 |  |                                                                              |  |
-|  |   -display dbus,p2p=yes / addr=...                                           |  |
+|  |   -display dbus,addr=unix:path=...  (a D-Bus bus, not p2p)                   |  |
 |  |   -device virtio-gpu-pci                                                     |  |
 |  |   -device virtio-serial-pci                                                  |  |
 |  |   -device virtserialport,chardev=winbridge0,name=org.winbridge.0             |  |

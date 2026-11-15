@@ -21,10 +21,18 @@ cargo test -p winbridge-proto
 ```
 
 ### Windows Guest Agent
-Build inside the Windows build VM (`/mnt/VM/Windows11Build`) targeting `x86_64-pc-windows-msvc`:
+Build on Windows (or in a Windows build VM) for `x86_64-pc-windows-msvc`:
 ```bash
 cargo build --release -p winbridge-agent
 ```
+From Linux you can type-check it with `cargo check --target x86_64-pc-windows-msvc -p winbridge-agent`
+(`rustup target add x86_64-pc-windows-msvc` first). It is linked with the static CRT (`.cargo/config.toml`).
+
+## Things that bit us
+- The agent needs administrator rights and the user's session: `\\.\Global\org.winbridge.0` cannot be opened by a limited token, and the agent then retries silently.
+- The serial handle must stay overlapped (`FILE_FLAG_OVERLAPPED`); a synchronous handle blocks writes while a read is pending.
+- Never write registry DPI values after a CCD DPI change; read the effective DPI back instead.
+- zbus maps `set_ui_info` to `SetUiInfo`; QEMU's method is `SetUIInfo` (`#[zbus(name = "SetUIInfo")]`).
 
 ## Safety and Privacy Rules
 - Never commit private host paths, proxy credentials, personal tokens, or machine hostnames.
