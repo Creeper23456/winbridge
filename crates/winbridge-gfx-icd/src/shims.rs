@@ -128,6 +128,15 @@ pub unsafe extern "system" fn shim_vk_cmd_bind_descriptor_sets(
     })
     .unwrap_or(())
 }
+pub unsafe extern "system" fn shim_vk_cmd_bind_descriptor_sets2(
+    command_buffer: vk::CommandBuffer,
+    p_bind_descriptor_sets_info: *const vk::BindDescriptorSetsInfoKHR,
+) -> () {
+    crate::with_link(|l| {
+        gv::vk_cmd_bind_descriptor_sets2(l, command_buffer, p_bind_descriptor_sets_info)
+    })
+    .unwrap_or(())
+}
 pub unsafe extern "system" fn shim_vk_cmd_bind_index_buffer(
     command_buffer: vk::CommandBuffer,
     buffer: vk::Buffer,
@@ -136,6 +145,18 @@ pub unsafe extern "system" fn shim_vk_cmd_bind_index_buffer(
 ) -> () {
     crate::with_link(|l| {
         gv::vk_cmd_bind_index_buffer(l, command_buffer, buffer, offset, index_type)
+    })
+    .unwrap_or(())
+}
+pub unsafe extern "system" fn shim_vk_cmd_bind_index_buffer2(
+    command_buffer: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    index_type: vk::IndexType,
+) -> () {
+    crate::with_link(|l| {
+        gv::vk_cmd_bind_index_buffer2(l, command_buffer, buffer, offset, size, index_type)
     })
     .unwrap_or(())
 }
@@ -694,6 +715,13 @@ pub unsafe extern "system" fn shim_vk_cmd_push_constants(
     })
     .unwrap_or(())
 }
+pub unsafe extern "system" fn shim_vk_cmd_push_constants2(
+    command_buffer: vk::CommandBuffer,
+    p_push_constants_info: *const vk::PushConstantsInfoKHR,
+) -> () {
+    crate::with_link(|l| gv::vk_cmd_push_constants2(l, command_buffer, p_push_constants_info))
+        .unwrap_or(())
+}
 pub unsafe extern "system" fn shim_vk_cmd_reset_event(
     command_buffer: vk::CommandBuffer,
     event: vk::Event,
@@ -748,6 +776,13 @@ pub unsafe extern "system" fn shim_vk_cmd_resolve_image2(
     p_resolve_image_info: *const vk::ResolveImageInfo2,
 ) -> () {
     crate::with_link(|l| gv::vk_cmd_resolve_image2(l, command_buffer, p_resolve_image_info))
+        .unwrap_or(())
+}
+pub unsafe extern "system" fn shim_vk_cmd_set_blend_constants(
+    command_buffer: vk::CommandBuffer,
+    blend_constants: *const f32,
+) -> () {
+    crate::with_link(|l| gv::vk_cmd_set_blend_constants(l, command_buffer, blend_constants))
         .unwrap_or(())
 }
 pub unsafe extern "system" fn shim_vk_cmd_set_cull_mode(
@@ -1541,6 +1576,12 @@ pub unsafe extern "system" fn shim_vk_free_descriptor_sets(
     })
     .unwrap_or(vk::Result::ERROR_DEVICE_LOST)
 }
+pub unsafe extern "system" fn shim_vk_get_buffer_device_address(
+    device: vk::Device,
+    p_info: *const vk::BufferDeviceAddressInfo,
+) -> u64 {
+    crate::with_link(|l| gv::vk_get_buffer_device_address(l, device, p_info)).unwrap_or(0)
+}
 pub unsafe extern "system" fn shim_vk_get_buffer_memory_requirements(
     device: vk::Device,
     buffer: vk::Buffer,
@@ -1560,6 +1601,12 @@ pub unsafe extern "system" fn shim_vk_get_buffer_memory_requirements2(
         gv::vk_get_buffer_memory_requirements2(l, device, p_info, p_memory_requirements)
     })
     .unwrap_or(())
+}
+pub unsafe extern "system" fn shim_vk_get_buffer_opaque_capture_address(
+    device: vk::Device,
+    p_info: *const vk::BufferDeviceAddressInfo,
+) -> u64 {
+    crate::with_link(|l| gv::vk_get_buffer_opaque_capture_address(l, device, p_info)).unwrap_or(0)
 }
 pub unsafe extern "system" fn shim_vk_get_descriptor_set_layout_support(
     device: vk::Device,
@@ -1636,6 +1683,13 @@ pub unsafe extern "system" fn shim_vk_get_device_memory_commitment(
         gv::vk_get_device_memory_commitment(l, device, memory, p_committed_memory_in_bytes)
     })
     .unwrap_or(())
+}
+pub unsafe extern "system" fn shim_vk_get_device_memory_opaque_capture_address(
+    device: vk::Device,
+    p_info: *const vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> u64 {
+    crate::with_link(|l| gv::vk_get_device_memory_opaque_capture_address(l, device, p_info))
+        .unwrap_or(0)
 }
 pub unsafe extern "system" fn shim_vk_get_device_queue2(
     device: vk::Device,
@@ -2136,8 +2190,22 @@ pub fn lookup(name: &[u8]) -> Option<(*const (), Level)> {
         b"vkCmdBindDescriptorSets" => {
             Some((shim_vk_cmd_bind_descriptor_sets as *const (), Level::Device))
         }
+        b"vkCmdBindDescriptorSets2" => Some((
+            shim_vk_cmd_bind_descriptor_sets2 as *const (),
+            Level::Device,
+        )),
+        b"vkCmdBindDescriptorSets2KHR" => Some((
+            shim_vk_cmd_bind_descriptor_sets2 as *const (),
+            Level::Device,
+        )),
         b"vkCmdBindIndexBuffer" => {
             Some((shim_vk_cmd_bind_index_buffer as *const (), Level::Device))
+        }
+        b"vkCmdBindIndexBuffer2" => {
+            Some((shim_vk_cmd_bind_index_buffer2 as *const (), Level::Device))
+        }
+        b"vkCmdBindIndexBuffer2KHR" => {
+            Some((shim_vk_cmd_bind_index_buffer2 as *const (), Level::Device))
         }
         b"vkCmdBindPipeline" => Some((shim_vk_cmd_bind_pipeline as *const (), Level::Device)),
         b"vkCmdBindVertexBuffers" => {
@@ -2212,11 +2280,18 @@ pub fn lookup(name: &[u8]) -> Option<(*const (), Level)> {
             Some((shim_vk_cmd_pipeline_barrier2 as *const (), Level::Device))
         }
         b"vkCmdPushConstants" => Some((shim_vk_cmd_push_constants as *const (), Level::Device)),
+        b"vkCmdPushConstants2" => Some((shim_vk_cmd_push_constants2 as *const (), Level::Device)),
+        b"vkCmdPushConstants2KHR" => {
+            Some((shim_vk_cmd_push_constants2 as *const (), Level::Device))
+        }
         b"vkCmdResetEvent" => Some((shim_vk_cmd_reset_event as *const (), Level::Device)),
         b"vkCmdResetEvent2" => Some((shim_vk_cmd_reset_event2 as *const (), Level::Device)),
         b"vkCmdResetQueryPool" => Some((shim_vk_cmd_reset_query_pool as *const (), Level::Device)),
         b"vkCmdResolveImage" => Some((shim_vk_cmd_resolve_image as *const (), Level::Device)),
         b"vkCmdResolveImage2" => Some((shim_vk_cmd_resolve_image2 as *const (), Level::Device)),
+        b"vkCmdSetBlendConstants" => {
+            Some((shim_vk_cmd_set_blend_constants as *const (), Level::Device))
+        }
         b"vkCmdSetCullMode" => Some((shim_vk_cmd_set_cull_mode as *const (), Level::Device)),
         b"vkCmdSetDepthBias" => Some((shim_vk_cmd_set_depth_bias as *const (), Level::Device)),
         b"vkCmdSetDepthBiasEnable" => Some((
@@ -2423,12 +2498,20 @@ pub fn lookup(name: &[u8]) -> Option<(*const (), Level)> {
         b"vkFreeCommandBuffers" => Some((shim_vk_free_command_buffers as *const (), Level::Device)),
         b"vkFreeDescriptorSets" => Some((shim_vk_free_descriptor_sets as *const (), Level::Device)),
         b"vkFreeMemory" => Some((crate::custom::vk_free_memory as *const (), Level::Device)),
+        b"vkGetBufferDeviceAddress" => Some((
+            shim_vk_get_buffer_device_address as *const (),
+            Level::Device,
+        )),
         b"vkGetBufferMemoryRequirements" => Some((
             shim_vk_get_buffer_memory_requirements as *const (),
             Level::Device,
         )),
         b"vkGetBufferMemoryRequirements2" => Some((
             shim_vk_get_buffer_memory_requirements2 as *const (),
+            Level::Device,
+        )),
+        b"vkGetBufferOpaqueCaptureAddress" => Some((
+            shim_vk_get_buffer_opaque_capture_address as *const (),
             Level::Device,
         )),
         b"vkGetDescriptorSetLayoutSupport" => Some((
@@ -2453,6 +2536,10 @@ pub fn lookup(name: &[u8]) -> Option<(*const (), Level)> {
         )),
         b"vkGetDeviceMemoryCommitment" => Some((
             shim_vk_get_device_memory_commitment as *const (),
+            Level::Device,
+        )),
+        b"vkGetDeviceMemoryOpaqueCaptureAddress" => Some((
+            shim_vk_get_device_memory_opaque_capture_address as *const (),
             Level::Device,
         )),
         b"vkGetDeviceQueue" => Some((

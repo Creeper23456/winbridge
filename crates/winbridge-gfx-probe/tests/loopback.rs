@@ -160,7 +160,7 @@ fn loader_lists_winbridge_device_and_buffer_round_trips_on_every_host_gpu() {
             "the guest sees exactly the selected host device"
         );
         assert_eq!(field(&out, "selected_device"), format!("WinBridge: {name}"));
-        assert_eq!(field(&out, "dxvk_checks"), "71/71", "{name}");
+        assert_eq!(field(&out, "dxvk_checks"), "69/69", "{name}");
         assert_eq!(field(&out, "device_created"), "yes");
         let (w, r) = (fields(&out, "buffer_checksum_written"), fields(&out, "buffer_checksum_read_back"));
         assert!(!w.is_empty() && w == r, "{name}: {w:?} vs {r:?}");

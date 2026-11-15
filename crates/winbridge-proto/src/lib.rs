@@ -20,6 +20,8 @@ pub struct ManifestEntry {
 
 pub mod clip;
 pub mod files;
+pub mod caps;
+pub mod ring;
 
 /// Wire framing constants.
 pub const MAGIC: [u8; 4] = *b"WB01";
@@ -248,6 +250,45 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// Lane choice for the shared-memory transport (`docs/IVSHMEM-TRANSPORT.md`): true for the
+    /// messages that travel on the **bulk** lane. These are the file-data streams (clipboard and
+    /// drag-and-drop file streams), the clipboard snapshot (`ClipboardOffer`, `ClipFilesManifest`
+    /// and `ClipboardItem`, whose items may be tens of MiB and must stay ordered with each other)
+    /// and the drop stream `DropBegin` .. `DropFileFinish`. Everything else is a **control**
+    /// message. Messages of one stream always share a lane, so their order is kept; the order
+    /// between a control message and a bulk message is **not** guaranteed on the shared-memory
+    /// transport and no code may rely on it. The four `Shm*` messages never travel on a lane
+    /// (they are serial-only, see [`Message::is_shm_control`]) and are reported as not bulk.
+    pub fn is_bulk(&self) -> bool {
+        matches!(
+            self,
+            Message::ClipboardOffer { .. }
+                | Message::ClipboardItem { .. }
+                | Message::ClipFilesManifest { .. }
+                | Message::FilesBegin { .. }
+                | Message::FileEntry { .. }
+                | Message::FileChunk { .. }
+                | Message::FilesEnd { .. }
+                | Message::DropBegin { .. }
+                | Message::DropFileStart { .. }
+                | Message::DropFileChunk { .. }
+                | Message::DropFileFinish { .. }
+        )
+    }
+
+    /// True for the shared-memory negotiation messages, which always use the serial channel.
+    pub fn is_shm_control(&self) -> bool {
+        matches!(
+            self,
+            Message::ShmOffer { .. }
+                | Message::ShmReady { .. }
+                | Message::ShmKick
+                | Message::ShmFallback { .. }
+        )
+    }
+}
+
 /// Errors occurring during protocol framing or serialization.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -320,6 +361,33 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Message, ProtoError> {
 
     let msg = bincode::deserialize(&payload)?;
     Ok(msg)
+}
+
+/// Decodes one complete wire frame held in `frame` (as written by [`encode_frame`]). The frame
+/// must fill the slice exactly: a record on a shared-memory lane carries exactly one frame.
+pub fn decode_frame(frame: &[u8]) -> Result<Message, ProtoError> {
+    if frame.len() < HEADER_LEN {
+        return Err(ProtoError::UnexpectedEof);
+    }
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(&frame[0..4]);
+    if magic != MAGIC {
+        return Err(ProtoError::InvalidMagic {
+            expected: MAGIC,
+            actual: magic,
+        });
+    }
+    let payload_len = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
+    if payload_len > MAX_PAYLOAD_SIZE {
+        return Err(ProtoError::PayloadTooLarge {
+            size: payload_len,
+            max: MAX_PAYLOAD_SIZE,
+        });
+    }
+    if frame.len() != HEADER_LEN + payload_len {
+        return Err(ProtoError::UnexpectedEof);
+    }
+    Ok(bincode::deserialize(&frame[HEADER_LEN..])?)
 }
 
 #[cfg(feature = "tokio")]
@@ -481,6 +549,18 @@ mod tests {
                 success: true,
                 message: "File written successfully".to_string(),
             },
+            Message::ShmOffer {
+                shm_version: 1,
+                region_len: 256 << 20,
+            },
+            Message::ShmReady {
+                ok: false,
+                reason: "no ivshmem device".to_string(),
+            },
+            Message::ShmKick,
+            Message::ShmFallback {
+                reason: "lane corrupt".to_string(),
+            },
         ];
 
         for msg in messages {
@@ -491,6 +571,60 @@ mod tests {
             let decoded = read_frame(&mut cursor).expect("read_frame failed");
             assert_eq!(msg, decoded);
         }
+    }
+
+    #[test]
+    fn lane_choice_keeps_streams_together() {
+        let bulk = [
+            Message::FilesBegin { stream_id: 1, entries: 1, total_bytes: 1 },
+            Message::FileChunk { stream_id: 1, index: 0, offset: 0, data: vec![0] },
+            Message::ClipboardOffer { clip_id: 1, formats: vec![] },
+            Message::DropFileChunk { transfer_id: 1, offset: 0, data: vec![] },
+        ];
+        assert!(bulk.iter().all(Message::is_bulk));
+        let control = [
+            Message::Ping { seq: 1, timestamp_ms: 1 },
+            Message::QueryStatus,
+            Message::ClipFilesRequest { clip_id: 1 },
+            Message::DropResult { success: true, message: String::new() },
+            Message::ShmKick,
+        ];
+        assert!(control.iter().all(|m| !m.is_bulk()));
+    }
+
+    #[test]
+    fn decode_frame_is_exact() {
+        let frame = encode_frame(&Message::QueryStatus).unwrap();
+        assert_eq!(decode_frame(&frame).unwrap(), Message::QueryStatus);
+        let mut longer = frame.clone();
+        longer.push(0);
+        assert!(decode_frame(&longer).is_err());
+        assert!(decode_frame(&frame[..frame.len() - 1]).is_err());
+        assert!(decode_frame(&frame[..4]).is_err());
+    }
+
+    /// `bincode` is positional: existing variants keep their index, the shared-memory
+    /// negotiation messages sit at the end, and serial frames are byte-identical to before.
+    #[test]
+    fn wire_positions_are_stable() {
+        let index = |m: &Message| {
+            let f = encode_frame(m).unwrap();
+            u32::from_le_bytes([f[HEADER_LEN], f[HEADER_LEN + 1], f[HEADER_LEN + 2], f[HEADER_LEN + 3]])
+        };
+        assert_eq!(index(&Message::Ping { seq: 0, timestamp_ms: 0 }), 0);
+        assert_eq!(index(&Message::QueryStatus), 6);
+        assert_eq!(index(&Message::ClipFilesManifest { clip_id: 0, entries: vec![] }), 26);
+        assert_eq!(index(&Message::ShmOffer { shm_version: 0, region_len: 0 }), 27);
+        assert_eq!(index(&Message::ShmReady { ok: true, reason: String::new() }), 28);
+        assert_eq!(index(&Message::ShmKick), 29);
+        assert_eq!(index(&Message::ShmFallback { reason: String::new() }), 30);
+        let ping = encode_frame(&Message::Ping { seq: 1, timestamp_ms: 2 }).unwrap();
+        let mut want = b"WB01".to_vec();
+        want.extend_from_slice(&20u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&2u64.to_le_bytes());
+        assert_eq!(ping, want);
     }
 
     #[test]

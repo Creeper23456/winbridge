@@ -10,6 +10,8 @@
 #   WINBRIDGE_SOCK, WINBRIDGE_QMP_SOCK, WINBRIDGE_DBUS_ADDR (unix:path=PATH)
 # Optional: WINBRIDGE_REL_MOUSE=1 adds a relative USB mouse next to the absolute tablet, which the
 # viewer's "Game mode" (relative mouse) needs. Without it, game mode is refused by QEMU.
+# Optional: WINBRIDGE_SHM=1 adds the ivshmem shared-memory device for the optional shared-memory
+# transport (see below); WINBRIDGE_SHM_FILE changes its backing file (default /dev/shm/winbridge-ctl).
 # Runs in the foreground so the EXIT trap can stop the private bus daemon.
 
 set -euo pipefail
@@ -58,6 +60,25 @@ if [ "${WINBRIDGE_REL_MOUSE:-0}" = 1 ]; then
     REL_MOUSE=(-device usb-mouse)
 fi
 
+# Optional shared-memory transport (docs/IVSHMEM-TRANSPORT.md): WINBRIDGE_SHM=1 adds an
+# ivshmem-plain device backed by a private 256 MiB file. The file is recreated empty on every
+# start (mode 0600, this user only); the viewer maps it and refuses a file of another size, owner
+# or mode. The guest needs the ivshmem driver and the agent (agent --install-ivshmem), and the
+# viewer must run with --shm (or shm = true in config.toml); without them nothing changes and the
+# virtio-serial channel carries everything. WINBRIDGE_SHM_FILE overrides the backing file.
+SHM_DEVICE=()
+if [ "${WINBRIDGE_SHM:-0}" = 1 ]; then
+    WINBRIDGE_SHM_FILE="${WINBRIDGE_SHM_FILE:-/dev/shm/winbridge-ctl}"
+    rm -f "$WINBRIDGE_SHM_FILE"
+    (umask 077 && : > "$WINBRIDGE_SHM_FILE")
+    truncate -s 256M "$WINBRIDGE_SHM_FILE"
+    echo "Shared memory:       $WINBRIDGE_SHM_FILE (256 MiB, ivshmem-plain)"
+    SHM_DEVICE=(
+        -object memory-backend-file,id=wbctl,mem-path="$WINBRIDGE_SHM_FILE",size=256M,share=on
+        -device ivshmem-plain,memdev=wbctl
+    )
+fi
+
 # The default pc machine provides the IDE bus used by this removable CD-ROM.
 qemu-system-x86_64 \
     -enable-kvm \
@@ -72,6 +93,7 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=xhci \
     -device usb-tablet \
     "${REL_MOUSE[@]}" \
+    "${SHM_DEVICE[@]}" \
     -drive if=none,id=cd0,media=cdrom,readonly=on \
     -device ide-cd,drive=cd0,id=cdrom0 \
     -chardev socket,id=wb0,path="$WINBRIDGE_SOCK",server=on,wait=off \

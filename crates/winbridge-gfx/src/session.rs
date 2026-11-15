@@ -215,6 +215,18 @@ impl Host for Session {
         self.devices.get(&raw).map(|d| d.dev.clone()).ok_or(CodecError::BadHandle { id, kind: "VkDevice" })
     }
 
+    fn device_proc(&self, id: u64, name: &std::ffi::CStr) -> Result<vk::PFN_vkVoidFunction, CodecError> {
+        let o = self.objs.get(&id).ok_or(CodecError::BadHandle { id, kind: "VkDevice" })?;
+        let dev = match o.kind {
+            "VkDevice" => o,
+            "VkQueue" | "VkCommandBuffer" => self.objs.get(&o.parent).ok_or(CodecError::BadHandle { id, kind: "VkDevice" })?,
+            _ => return Err(CodecError::BadHandle { id, kind: "VkDevice" }),
+        };
+        let inst = self.instance_of_physical(dev.parent)?;
+        // SAFETY: `dev.raw` is a live device of `inst`; `name` is NUL-terminated.
+        Ok(unsafe { (inst.fp_v1_0().get_device_proc_addr)(vk::Device::from_raw(dev.raw), name.as_ptr()) })
+    }
+
     fn register(&mut self, id: u64, raw: u64, kind: &'static str, parent: u64) -> Result<(), CodecError> {
         if id == 0 || self.objs.contains_key(&id) {
             return Err(CodecError::Invalid("handle id is null or already in use"));

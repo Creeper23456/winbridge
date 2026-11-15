@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! DXVK 2.x requirement checks (same table as `experiments/vkcaps`, from `VP_DXVK_requirements.json`).
+//! DXVK 3.x requirement checks: `VP_DXVK_requirements.json` minus what DXVK 3.1.1 treats as
+//! optional (`VK_EXT_transform_feedback` is `ENABLE_EXT_FEATURE(..., false)` in
+//! `dxvk_device_info.cpp`; without it only D3D11 stream output is unavailable).
 
 use ash::vk;
 use std::ffi::{c_char, CStr};
@@ -12,7 +14,6 @@ pub fn dxvk_checks(
     f12: &vk::PhysicalDeviceVulkan12Features,
     f13: &vk::PhysicalDeviceVulkan13Features,
     rob2: &vk::PhysicalDeviceRobustness2FeaturesEXT,
-    xfb: &vk::PhysicalDeviceTransformFeedbackFeaturesEXT,
     m5: &vk::PhysicalDeviceMaintenance5FeaturesKHR,
     m6: &vk::PhysicalDeviceMaintenance6FeaturesKHR,
     dce: &vk::PhysicalDeviceDepthClipEnableFeaturesEXT,
@@ -28,7 +29,6 @@ pub fn dxvk_checks(
         "VK_KHR_maintenance6",
         "VK_EXT_depth_clip_enable",
         "VK_EXT_robustness2",
-        "VK_EXT_transform_feedback",
     ] {
         r.push((e, has_ext(e)));
     }
@@ -93,7 +93,6 @@ pub fn dxvk_checks(
         ("1.3 shaderTerminateInvocation", t(f13.shader_terminate_invocation)),
         ("robustness2.nullDescriptor", t(rob2.null_descriptor)),
         ("robustness2.robustBufferAccess2", t(rob2.robust_buffer_access2)),
-        ("transformFeedback", t(xfb.transform_feedback)),
         ("maintenance5", t(m5.maintenance5)),
         ("maintenance6", t(m6.maintenance6)),
         ("depthClipEnable", t(dce.depth_clip_enable)),
@@ -121,11 +120,10 @@ pub unsafe fn evaluate(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<
     let f12 = query!(vk::PhysicalDeviceVulkan12Features);
     let f13 = query!(vk::PhysicalDeviceVulkan13Features);
     let rob2 = query!(vk::PhysicalDeviceRobustness2FeaturesEXT);
-    let xfb = query!(vk::PhysicalDeviceTransformFeedbackFeaturesEXT);
     let m5 = query!(vk::PhysicalDeviceMaintenance5FeaturesKHR);
     let m6 = query!(vk::PhysicalDeviceMaintenance6FeaturesKHR);
     let dce = query!(vk::PhysicalDeviceDepthClipEnableFeaturesEXT);
     let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
     let names: Vec<String> = exts.iter().map(|x| CStr::from_ptr(x.extension_name.as_ptr() as *const c_char).to_string_lossy().into_owned()).collect();
-    dxvk_checks(&f10, &f11, &f12, &f13, &rob2, &xfb, &m5, &m6, &dce, props.api_version, &|n| names.iter().any(|x| x == n))
+    dxvk_checks(&f10, &f11, &f12, &f13, &rob2, &m5, &m6, &dce, props.api_version, &|n| names.iter().any(|x| x == n))
 }

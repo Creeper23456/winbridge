@@ -36,7 +36,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "vkCmdBeginRenderPass2",
     "vkCmdBeginRendering",
     "vkCmdBindDescriptorSets",
+    "vkCmdBindDescriptorSets2",
     "vkCmdBindIndexBuffer",
+    "vkCmdBindIndexBuffer2",
     "vkCmdBindPipeline",
     "vkCmdBindVertexBuffers",
     "vkCmdBindVertexBuffers2",
@@ -74,11 +76,13 @@ pub const COMMAND_NAMES: &[&str] = &[
     "vkCmdPipelineBarrier",
     "vkCmdPipelineBarrier2",
     "vkCmdPushConstants",
+    "vkCmdPushConstants2",
     "vkCmdResetEvent",
     "vkCmdResetEvent2",
     "vkCmdResetQueryPool",
     "vkCmdResolveImage",
     "vkCmdResolveImage2",
+    "vkCmdSetBlendConstants",
     "vkCmdSetCullMode",
     "vkCmdSetDepthBias",
     "vkCmdSetDepthBiasEnable",
@@ -169,14 +173,17 @@ pub const COMMAND_NAMES: &[&str] = &[
     "vkFreeCommandBuffers",
     "vkFreeDescriptorSets",
     "vkFreeMemory",
+    "vkGetBufferDeviceAddress",
     "vkGetBufferMemoryRequirements",
     "vkGetBufferMemoryRequirements2",
+    "vkGetBufferOpaqueCaptureAddress",
     "vkGetDescriptorSetLayoutSupport",
     "vkGetDeviceBufferMemoryRequirements",
     "vkGetDeviceGroupPeerMemoryFeatures",
     "vkGetDeviceImageMemoryRequirements",
     "vkGetDeviceImageSparseMemoryRequirements",
     "vkGetDeviceMemoryCommitment",
+    "vkGetDeviceMemoryOpaqueCaptureAddress",
     "vkGetDeviceQueue",
     "vkGetDeviceQueue2",
     "vkGetEventStatus",
@@ -461,6 +468,106 @@ pub unsafe fn dec_BindBufferMemoryInfo(
 ) -> Result<(), CodecError> {
     (*out).p_next = dec_chain_in_BindBufferMemoryInfo(d, a, s)? as _;
     dec_BindBufferMemoryInfo_body(d, a, s, out)
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::BindDescriptorSetsInfoKHR, s_type) == 0
+        && std::mem::offset_of!(vk::BindDescriptorSetsInfoKHR, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_BindDescriptorSetsInfoKHR_body(
+    e: &mut Enc,
+    v: &vk::BindDescriptorSetsInfoKHR,
+) -> Result<(), CodecError> {
+    e.pod(&v.stage_flags);
+    e.u64(v.layout.as_raw());
+    e.pod(&v.first_set);
+    e.pod(&v.descriptor_set_count);
+    {
+        let p = v.p_descriptor_sets;
+        let n = v.descriptor_set_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            for i in 0..n {
+                e.u64((*p.add(i)).as_raw());
+            }
+        }
+    }
+    e.pod(&v.dynamic_offset_count);
+    {
+        let p = v.p_dynamic_offsets;
+        let n = v.dynamic_offset_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_BindDescriptorSetsInfoKHR_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::BindDescriptorSetsInfoKHR,
+) -> Result<(), CodecError> {
+    let mut chk_p_descriptor_sets = None::<usize>;
+    let mut chk_p_dynamic_offsets = None::<usize>;
+    d.pod_into(&mut (*out).stage_flags)?;
+    (*out).layout =
+        <vk::PipelineLayout as vk::Handle>::from_raw(s.resolve(d.u64()?, "VkPipelineLayout")?);
+    d.pod_into(&mut (*out).first_set)?;
+    d.pod_into(&mut (*out).descriptor_set_count)?;
+    if d.bool()? {
+        let n = d.count(8)?;
+        let p = a.alloc::<vk::DescriptorSet>(n);
+        for i in 0..n {
+            *p.add(i) = <vk::DescriptorSet as vk::Handle>::from_raw(
+                s.resolve(d.u64()?, "VkDescriptorSet")?,
+            );
+        }
+        (*out).p_descriptor_sets = p as _;
+        chk_p_descriptor_sets = Some(n);
+    }
+    d.pod_into(&mut (*out).dynamic_offset_count)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<u32>())?;
+        let p = a.alloc::<u32>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_dynamic_offsets = p as _;
+        chk_p_dynamic_offsets = Some(n);
+    }
+    if let Some(n) = chk_p_descriptor_sets {
+        if (*out).descriptor_set_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    if let Some(n) = chk_p_dynamic_offsets {
+        if (*out).dynamic_offset_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    (*out).s_type = vk::StructureType::BIND_DESCRIPTOR_SETS_INFO_KHR;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub unsafe fn enc_BindDescriptorSetsInfoKHR(
+    e: &mut Enc,
+    v: &vk::BindDescriptorSetsInfoKHR,
+) -> Result<(), CodecError> {
+    enc_chain_in_BindDescriptorSetsInfoKHR(e, v.p_next as *const std::ffi::c_void)?;
+    enc_BindDescriptorSetsInfoKHR_body(e, v)
+}
+#[cfg(feature = "host")]
+pub unsafe fn dec_BindDescriptorSetsInfoKHR(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::BindDescriptorSetsInfoKHR,
+) -> Result<(), CodecError> {
+    (*out).p_next = dec_chain_in_BindDescriptorSetsInfoKHR(d, a, s)? as _;
+    dec_BindDescriptorSetsInfoKHR_body(d, a, s, out)
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::BindImageMemoryInfo, s_type) == 0
@@ -867,6 +974,47 @@ pub unsafe fn dec_BufferCreateInfo(
     dec_BufferCreateInfo_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::BufferDeviceAddressInfo, s_type) == 0
+        && std::mem::offset_of!(vk::BufferDeviceAddressInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_BufferDeviceAddressInfo_body(
+    e: &mut Enc,
+    v: &vk::BufferDeviceAddressInfo,
+) -> Result<(), CodecError> {
+    e.u64(v.buffer.as_raw());
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_BufferDeviceAddressInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::BufferDeviceAddressInfo,
+) -> Result<(), CodecError> {
+    (*out).buffer = <vk::Buffer as vk::Handle>::from_raw(s.resolve(d.u64()?, "VkBuffer")?);
+    (*out).s_type = vk::StructureType::BUFFER_DEVICE_ADDRESS_INFO;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub unsafe fn enc_BufferDeviceAddressInfo(
+    e: &mut Enc,
+    v: &vk::BufferDeviceAddressInfo,
+) -> Result<(), CodecError> {
+    enc_chain_in_BufferDeviceAddressInfo(e, v.p_next as *const std::ffi::c_void)?;
+    enc_BufferDeviceAddressInfo_body(e, v)
+}
+#[cfg(feature = "host")]
+pub unsafe fn dec_BufferDeviceAddressInfo(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::BufferDeviceAddressInfo,
+) -> Result<(), CodecError> {
+    (*out).p_next = dec_chain_in_BufferDeviceAddressInfo(d, a, s)? as _;
+    dec_BufferDeviceAddressInfo_body(d, a, s, out)
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::BufferImageCopy2, s_type) == 0
         && std::mem::offset_of!(vk::BufferImageCopy2, p_next) == 8
 );
@@ -1063,6 +1211,35 @@ pub unsafe fn dec_BufferMemoryRequirementsInfo2(
 ) -> Result<(), CodecError> {
     (*out).p_next = dec_chain_in_BufferMemoryRequirementsInfo2(d, a, s)? as _;
     dec_BufferMemoryRequirementsInfo2_body(d, a, s, out)
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::BufferUsageFlags2CreateInfoKHR, s_type) == 0
+        && std::mem::offset_of!(vk::BufferUsageFlags2CreateInfoKHR, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_BufferUsageFlags2CreateInfoKHR_body(
+    e: &mut Enc,
+    v: &vk::BufferUsageFlags2CreateInfoKHR,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::BufferUsageFlags2CreateInfoKHR as *const u8).add(16),
+        std::mem::size_of::<vk::BufferUsageFlags2CreateInfoKHR>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_BufferUsageFlags2CreateInfoKHR_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::BufferUsageFlags2CreateInfoKHR,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::BufferUsageFlags2CreateInfoKHR>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR;
+    Ok(())
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::BufferViewCreateInfo, s_type) == 0
@@ -2582,6 +2759,48 @@ pub unsafe fn dec_DeviceImageMemoryRequirements(
     dec_DeviceImageMemoryRequirements_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::DeviceMemoryOpaqueCaptureAddressInfo, s_type) == 0
+        && std::mem::offset_of!(vk::DeviceMemoryOpaqueCaptureAddressInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_DeviceMemoryOpaqueCaptureAddressInfo_body(
+    e: &mut Enc,
+    v: &vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> Result<(), CodecError> {
+    e.u64(v.memory.as_raw());
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_DeviceMemoryOpaqueCaptureAddressInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> Result<(), CodecError> {
+    (*out).memory =
+        <vk::DeviceMemory as vk::Handle>::from_raw(s.resolve(d.u64()?, "VkDeviceMemory")?);
+    (*out).s_type = vk::StructureType::DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub unsafe fn enc_DeviceMemoryOpaqueCaptureAddressInfo(
+    e: &mut Enc,
+    v: &vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> Result<(), CodecError> {
+    enc_chain_in_DeviceMemoryOpaqueCaptureAddressInfo(e, v.p_next as *const std::ffi::c_void)?;
+    enc_DeviceMemoryOpaqueCaptureAddressInfo_body(e, v)
+}
+#[cfg(feature = "host")]
+pub unsafe fn dec_DeviceMemoryOpaqueCaptureAddressInfo(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> Result<(), CodecError> {
+    (*out).p_next = dec_chain_in_DeviceMemoryOpaqueCaptureAddressInfo(d, a, s)? as _;
+    dec_DeviceMemoryOpaqueCaptureAddressInfo_body(d, a, s, out)
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::DeviceQueueCreateInfo, s_type) == 0
         && std::mem::offset_of!(vk::DeviceQueueCreateInfo, p_next) == 8
 );
@@ -3229,6 +3448,51 @@ pub unsafe fn dec_ImageCreateInfo(
     dec_ImageCreateInfo_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::ImageFormatListCreateInfo, s_type) == 0
+        && std::mem::offset_of!(vk::ImageFormatListCreateInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_ImageFormatListCreateInfo_body(
+    e: &mut Enc,
+    v: &vk::ImageFormatListCreateInfo,
+) -> Result<(), CodecError> {
+    e.pod(&v.view_format_count);
+    {
+        let p = v.p_view_formats;
+        let n = v.view_format_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_ImageFormatListCreateInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::ImageFormatListCreateInfo,
+) -> Result<(), CodecError> {
+    let mut chk_p_view_formats = None::<usize>;
+    d.pod_into(&mut (*out).view_format_count)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<vk::Format>())?;
+        let p = a.alloc::<vk::Format>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_view_formats = p as _;
+        chk_p_view_formats = Some(n);
+    }
+    if let Some(n) = chk_p_view_formats {
+        if (*out).view_format_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    (*out).s_type = vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO;
+    Ok(())
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::ImageMemoryBarrier, s_type) == 0
         && std::mem::offset_of!(vk::ImageMemoryBarrier, p_next) == 8
 );
@@ -3569,6 +3833,35 @@ pub unsafe fn dec_ImageViewCreateInfo(
 ) -> Result<(), CodecError> {
     (*out).p_next = dec_chain_in_ImageViewCreateInfo(d, a, s)? as _;
     dec_ImageViewCreateInfo_body(d, a, s, out)
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::ImageViewUsageCreateInfo, s_type) == 0
+        && std::mem::offset_of!(vk::ImageViewUsageCreateInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_ImageViewUsageCreateInfo_body(
+    e: &mut Enc,
+    v: &vk::ImageViewUsageCreateInfo,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::ImageViewUsageCreateInfo as *const u8).add(16),
+        std::mem::size_of::<vk::ImageViewUsageCreateInfo>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_ImageViewUsageCreateInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::ImageViewUsageCreateInfo,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::ImageViewUsageCreateInfo>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::IMAGE_VIEW_USAGE_CREATE_INFO;
+    Ok(())
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::InstanceCreateInfo, s_type) == 0
@@ -3967,6 +4260,35 @@ pub unsafe fn dec_Offset3D(
     Ok(())
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::PhysicalDeviceCustomBorderColorFeaturesEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PhysicalDeviceCustomBorderColorFeaturesEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PhysicalDeviceCustomBorderColorFeaturesEXT_body(
+    e: &mut Enc,
+    v: &vk::PhysicalDeviceCustomBorderColorFeaturesEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PhysicalDeviceCustomBorderColorFeaturesEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PhysicalDeviceCustomBorderColorFeaturesEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PhysicalDeviceCustomBorderColorFeaturesEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
+    Ok(())
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::PhysicalDeviceDepthClipEnableFeaturesEXT, s_type) == 0
         && std::mem::offset_of!(vk::PhysicalDeviceDepthClipEnableFeaturesEXT, p_next) == 8
 );
@@ -3993,6 +4315,35 @@ unsafe fn dec_PhysicalDeviceDepthClipEnableFeaturesEXT_body(
         std::mem::size_of::<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>() - 16,
     )?;
     (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT;
+    Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PhysicalDeviceExtendedDynamicState3FeaturesEXT_body(
+    e: &mut Enc,
+    v: &vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PhysicalDeviceExtendedDynamicState3FeaturesEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT;
     Ok(())
 }
 const _: () = assert!(
@@ -4286,6 +4637,64 @@ unsafe fn dec_PhysicalDeviceMaintenance6FeaturesKHR_body(
         std::mem::size_of::<vk::PhysicalDeviceMaintenance6FeaturesKHR>() - 16,
     )?;
     (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR;
+    Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PhysicalDeviceMemoryPriorityFeaturesEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PhysicalDeviceMemoryPriorityFeaturesEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PhysicalDeviceMemoryPriorityFeaturesEXT_body(
+    e: &mut Enc,
+    v: &vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PhysicalDeviceMemoryPriorityFeaturesEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PhysicalDeviceMemoryPriorityFeaturesEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+    Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PhysicalDeviceNonSeamlessCubeMapFeaturesEXT_body(
+    e: &mut Enc,
+    v: &vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PhysicalDeviceNonSeamlessCubeMapFeaturesEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT;
     Ok(())
 }
 const _: () = assert!(
@@ -4635,6 +5044,35 @@ pub unsafe fn dec_PipelineColorBlendStateCreateInfo(
     dec_PipelineColorBlendStateCreateInfo_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::PipelineCreateFlags2CreateInfoKHR, s_type) == 0
+        && std::mem::offset_of!(vk::PipelineCreateFlags2CreateInfoKHR, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PipelineCreateFlags2CreateInfoKHR_body(
+    e: &mut Enc,
+    v: &vk::PipelineCreateFlags2CreateInfoKHR,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PipelineCreateFlags2CreateInfoKHR as *const u8).add(16),
+        std::mem::size_of::<vk::PipelineCreateFlags2CreateInfoKHR>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PipelineCreateFlags2CreateInfoKHR_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PipelineCreateFlags2CreateInfoKHR,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PipelineCreateFlags2CreateInfoKHR>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR;
+    Ok(())
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::PipelineDepthStencilStateCreateInfo, s_type) == 0
         && std::mem::offset_of!(vk::PipelineDepthStencilStateCreateInfo, p_next) == 8
 );
@@ -4957,6 +5395,35 @@ pub unsafe fn dec_PipelineMultisampleStateCreateInfo(
     dec_PipelineMultisampleStateCreateInfo_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::PipelineRasterizationDepthClipStateCreateInfoEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PipelineRasterizationDepthClipStateCreateInfoEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PipelineRasterizationDepthClipStateCreateInfoEXT_body(
+    e: &mut Enc,
+    v: &vk::PipelineRasterizationDepthClipStateCreateInfoEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PipelineRasterizationDepthClipStateCreateInfoEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PipelineRasterizationDepthClipStateCreateInfoEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PipelineRasterizationDepthClipStateCreateInfoEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT;
+    Ok(())
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::PipelineRasterizationStateCreateInfo, s_type) == 0
         && std::mem::offset_of!(vk::PipelineRasterizationStateCreateInfo, p_next) == 8
 );
@@ -5002,6 +5469,86 @@ pub unsafe fn dec_PipelineRasterizationStateCreateInfo(
 ) -> Result<(), CodecError> {
     (*out).p_next = dec_chain_in_PipelineRasterizationStateCreateInfo(d, a, s)? as _;
     dec_PipelineRasterizationStateCreateInfo_body(d, a, s, out)
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PipelineRasterizationStateStreamCreateInfoEXT, s_type) == 0
+        && std::mem::offset_of!(vk::PipelineRasterizationStateStreamCreateInfoEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PipelineRasterizationStateStreamCreateInfoEXT_body(
+    e: &mut Enc,
+    v: &vk::PipelineRasterizationStateStreamCreateInfoEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::PipelineRasterizationStateStreamCreateInfoEXT as *const u8).add(16),
+        std::mem::size_of::<vk::PipelineRasterizationStateStreamCreateInfoEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PipelineRasterizationStateStreamCreateInfoEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PipelineRasterizationStateStreamCreateInfoEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::PipelineRasterizationStateStreamCreateInfoEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT;
+    Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PipelineRenderingCreateInfo, s_type) == 0
+        && std::mem::offset_of!(vk::PipelineRenderingCreateInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PipelineRenderingCreateInfo_body(
+    e: &mut Enc,
+    v: &vk::PipelineRenderingCreateInfo,
+) -> Result<(), CodecError> {
+    e.pod(&v.view_mask);
+    e.pod(&v.color_attachment_count);
+    {
+        let p = v.p_color_attachment_formats;
+        let n = v.color_attachment_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    e.pod(&v.depth_attachment_format);
+    e.pod(&v.stencil_attachment_format);
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PipelineRenderingCreateInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PipelineRenderingCreateInfo,
+) -> Result<(), CodecError> {
+    let mut chk_p_color_attachment_formats = None::<usize>;
+    d.pod_into(&mut (*out).view_mask)?;
+    d.pod_into(&mut (*out).color_attachment_count)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<vk::Format>())?;
+        let p = a.alloc::<vk::Format>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_color_attachment_formats = p as _;
+        chk_p_color_attachment_formats = Some(n);
+    }
+    d.pod_into(&mut (*out).depth_attachment_format)?;
+    d.pod_into(&mut (*out).stencil_attachment_format)?;
+    if let Some(n) = chk_p_color_attachment_formats {
+        if (*out).color_attachment_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    (*out).s_type = vk::StructureType::PIPELINE_RENDERING_CREATE_INFO;
+    Ok(())
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::PipelineShaderStageCreateInfo, s_type) == 0
@@ -5358,6 +5905,76 @@ pub unsafe fn dec_PushConstantRange(
 ) -> Result<(), CodecError> {
     d.pod_into(out)?;
     Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::PushConstantsInfoKHR, s_type) == 0
+        && std::mem::offset_of!(vk::PushConstantsInfoKHR, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_PushConstantsInfoKHR_body(
+    e: &mut Enc,
+    v: &vk::PushConstantsInfoKHR,
+) -> Result<(), CodecError> {
+    e.u64(v.layout.as_raw());
+    e.pod(&v.stage_flags);
+    e.pod(&v.offset);
+    e.pod(&v.size);
+    {
+        let p = v.p_values;
+        let n = v.size as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_PushConstantsInfoKHR_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PushConstantsInfoKHR,
+) -> Result<(), CodecError> {
+    let mut chk_p_values = None::<usize>;
+    (*out).layout =
+        <vk::PipelineLayout as vk::Handle>::from_raw(s.resolve(d.u64()?, "VkPipelineLayout")?);
+    d.pod_into(&mut (*out).stage_flags)?;
+    d.pod_into(&mut (*out).offset)?;
+    d.pod_into(&mut (*out).size)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<std::ffi::c_void>())?;
+        let p = a.alloc::<std::ffi::c_void>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_values = p as _;
+        chk_p_values = Some(n);
+    }
+    if let Some(n) = chk_p_values {
+        if (*out).size as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    (*out).s_type = vk::StructureType::PUSH_CONSTANTS_INFO_KHR;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub unsafe fn enc_PushConstantsInfoKHR(
+    e: &mut Enc,
+    v: &vk::PushConstantsInfoKHR,
+) -> Result<(), CodecError> {
+    enc_chain_in_PushConstantsInfoKHR(e, v.p_next as *const std::ffi::c_void)?;
+    enc_PushConstantsInfoKHR_body(e, v)
+}
+#[cfg(feature = "host")]
+pub unsafe fn dec_PushConstantsInfoKHR(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::PushConstantsInfoKHR,
+) -> Result<(), CodecError> {
+    (*out).p_next = dec_chain_in_PushConstantsInfoKHR(d, a, s)? as _;
+    dec_PushConstantsInfoKHR_body(d, a, s, out)
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::QueryPoolCreateInfo, s_type) == 0
@@ -6029,6 +6646,64 @@ pub unsafe fn dec_SamplerCreateInfo(
     dec_SamplerCreateInfo_body(d, a, s, out)
 }
 const _: () = assert!(
+    std::mem::offset_of!(vk::SamplerCustomBorderColorCreateInfoEXT, s_type) == 0
+        && std::mem::offset_of!(vk::SamplerCustomBorderColorCreateInfoEXT, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_SamplerCustomBorderColorCreateInfoEXT_body(
+    e: &mut Enc,
+    v: &vk::SamplerCustomBorderColorCreateInfoEXT,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::SamplerCustomBorderColorCreateInfoEXT as *const u8).add(16),
+        std::mem::size_of::<vk::SamplerCustomBorderColorCreateInfoEXT>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_SamplerCustomBorderColorCreateInfoEXT_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::SamplerCustomBorderColorCreateInfoEXT,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::SamplerCustomBorderColorCreateInfoEXT>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+    Ok(())
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::SamplerReductionModeCreateInfo, s_type) == 0
+        && std::mem::offset_of!(vk::SamplerReductionModeCreateInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_SamplerReductionModeCreateInfo_body(
+    e: &mut Enc,
+    v: &vk::SamplerReductionModeCreateInfo,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::SamplerReductionModeCreateInfo as *const u8).add(16),
+        std::mem::size_of::<vk::SamplerReductionModeCreateInfo>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_SamplerReductionModeCreateInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::SamplerReductionModeCreateInfo,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::SamplerReductionModeCreateInfo>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::SAMPLER_REDUCTION_MODE_CREATE_INFO;
+    Ok(())
+}
+const _: () = assert!(
     std::mem::offset_of!(vk::SamplerYcbcrConversionCreateInfo, s_type) == 0
         && std::mem::offset_of!(vk::SamplerYcbcrConversionCreateInfo, p_next) == 8
 );
@@ -6211,6 +6886,35 @@ pub unsafe fn dec_SemaphoreSubmitInfo(
 ) -> Result<(), CodecError> {
     (*out).p_next = dec_chain_in_SemaphoreSubmitInfo(d, a, s)? as _;
     dec_SemaphoreSubmitInfo_body(d, a, s, out)
+}
+const _: () = assert!(
+    std::mem::offset_of!(vk::SemaphoreTypeCreateInfo, s_type) == 0
+        && std::mem::offset_of!(vk::SemaphoreTypeCreateInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_SemaphoreTypeCreateInfo_body(
+    e: &mut Enc,
+    v: &vk::SemaphoreTypeCreateInfo,
+) -> Result<(), CodecError> {
+    e.pod_slice(
+        (v as *const vk::SemaphoreTypeCreateInfo as *const u8).add(16),
+        std::mem::size_of::<vk::SemaphoreTypeCreateInfo>() - 16,
+    );
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_SemaphoreTypeCreateInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::SemaphoreTypeCreateInfo,
+) -> Result<(), CodecError> {
+    d.pod_slice_into(
+        (out as *mut u8).add(16),
+        std::mem::size_of::<vk::SemaphoreTypeCreateInfo>() - 16,
+    )?;
+    (*out).s_type = vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO;
+    Ok(())
 }
 const _: () = assert!(
     std::mem::offset_of!(vk::SemaphoreWaitInfo, s_type) == 0
@@ -7357,6 +8061,75 @@ pub unsafe fn dec_SubpassEndInfo(
     (*out).p_next = dec_chain_in_SubpassEndInfo(d, a, s)? as _;
     dec_SubpassEndInfo_body(d, a, s, out)
 }
+const _: () = assert!(
+    std::mem::offset_of!(vk::TimelineSemaphoreSubmitInfo, s_type) == 0
+        && std::mem::offset_of!(vk::TimelineSemaphoreSubmitInfo, p_next) == 8
+);
+#[cfg(feature = "guest")]
+unsafe fn enc_TimelineSemaphoreSubmitInfo_body(
+    e: &mut Enc,
+    v: &vk::TimelineSemaphoreSubmitInfo,
+) -> Result<(), CodecError> {
+    e.pod(&v.wait_semaphore_value_count);
+    {
+        let p = v.p_wait_semaphore_values;
+        let n = v.wait_semaphore_value_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    e.pod(&v.signal_semaphore_value_count);
+    {
+        let p = v.p_signal_semaphore_values;
+        let n = v.signal_semaphore_value_count as usize;
+        e.bool(!p.is_null());
+        if !p.is_null() {
+            e.u32(n as u32);
+            e.pod_slice(p, n);
+        }
+    }
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_TimelineSemaphoreSubmitInfo_body(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+    out: *mut vk::TimelineSemaphoreSubmitInfo,
+) -> Result<(), CodecError> {
+    let mut chk_p_wait_semaphore_values = None::<usize>;
+    let mut chk_p_signal_semaphore_values = None::<usize>;
+    d.pod_into(&mut (*out).wait_semaphore_value_count)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<u64>())?;
+        let p = a.alloc::<u64>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_wait_semaphore_values = p as _;
+        chk_p_wait_semaphore_values = Some(n);
+    }
+    d.pod_into(&mut (*out).signal_semaphore_value_count)?;
+    if d.bool()? {
+        let n = d.count(std::mem::size_of::<u64>())?;
+        let p = a.alloc::<u64>(n);
+        d.pod_slice_into(p, n)?;
+        (*out).p_signal_semaphore_values = p as _;
+        chk_p_signal_semaphore_values = Some(n);
+    }
+    if let Some(n) = chk_p_wait_semaphore_values {
+        if (*out).wait_semaphore_value_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    if let Some(n) = chk_p_signal_semaphore_values {
+        if (*out).signal_semaphore_value_count as usize != n {
+            return Err(CodecError::Invalid("array length differs from its count"));
+        }
+    }
+    (*out).s_type = vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    Ok(())
+}
 #[cfg(feature = "guest")]
 pub unsafe fn enc_VertexInputAttributeDescription(
     e: &mut Enc,
@@ -7658,6 +8431,36 @@ unsafe fn dec_chain_in_BindBufferMemoryInfo(
     Ok(head as *const std::ffi::c_void)
 }
 #[cfg(feature = "guest")]
+unsafe fn enc_chain_in_BindDescriptorSetsInfoKHR(
+    e: &mut Enc,
+    mut p: *const std::ffi::c_void,
+) -> Result<(), CodecError> {
+    while !p.is_null() {
+        let base = p as *const vk::BaseInStructure;
+        let st = (*base).s_type;
+        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        p = (*base).p_next as *const std::ffi::c_void;
+    }
+    e.u32(CHAIN_END);
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_chain_in_BindDescriptorSetsInfoKHR(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+) -> Result<*const std::ffi::c_void, CodecError> {
+    let mut head: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut link: *mut *mut std::ffi::c_void = &mut head;
+    loop {
+        match d.u32()? {
+            CHAIN_END => break,
+            t => return Err(CodecError::BadTag(t)),
+        }
+    }
+    Ok(head as *const std::ffi::c_void)
+}
+#[cfg(feature = "guest")]
 unsafe fn enc_chain_in_BindImageMemoryInfo(
     e: &mut Enc,
     mut p: *const std::ffi::c_void,
@@ -7695,7 +8498,14 @@ unsafe fn enc_chain_in_BindSparseInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO {
+            e.u32(vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO.as_raw() as u32);
+            enc_TimelineSemaphoreSubmitInfo_body(
+                e,
+                &*(p as *const vk::TimelineSemaphoreSubmitInfo),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -7712,6 +8522,12 @@ unsafe fn dec_chain_in_BindSparseInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::TimelineSemaphoreSubmitInfo>(1);
+                dec_TimelineSemaphoreSubmitInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -7785,7 +8601,14 @@ unsafe fn enc_chain_in_BufferCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR {
+            e.u32(vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32);
+            enc_BufferUsageFlags2CreateInfoKHR_body(
+                e,
+                &*(p as *const vk::BufferUsageFlags2CreateInfoKHR),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -7793,6 +8616,42 @@ unsafe fn enc_chain_in_BufferCreateInfo(
 }
 #[cfg(feature = "host")]
 unsafe fn dec_chain_in_BufferCreateInfo(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+) -> Result<*const std::ffi::c_void, CodecError> {
+    let mut head: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut link: *mut *mut std::ffi::c_void = &mut head;
+    loop {
+        match d.u32()? {
+            CHAIN_END => break,
+            t if t == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32 => {
+                let n = a.alloc::<vk::BufferUsageFlags2CreateInfoKHR>(1);
+                dec_BufferUsageFlags2CreateInfoKHR_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t => return Err(CodecError::BadTag(t)),
+        }
+    }
+    Ok(head as *const std::ffi::c_void)
+}
+#[cfg(feature = "guest")]
+unsafe fn enc_chain_in_BufferDeviceAddressInfo(
+    e: &mut Enc,
+    mut p: *const std::ffi::c_void,
+) -> Result<(), CodecError> {
+    while !p.is_null() {
+        let base = p as *const vk::BaseInStructure;
+        let st = (*base).s_type;
+        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        p = (*base).p_next as *const std::ffi::c_void;
+    }
+    e.u32(CHAIN_END);
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_chain_in_BufferDeviceAddressInfo(
     d: &mut Dec,
     a: &mut Arena,
     s: &dyn Resolver,
@@ -7935,7 +8794,14 @@ unsafe fn enc_chain_in_BufferViewCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR {
+            e.u32(vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32);
+            enc_BufferUsageFlags2CreateInfoKHR_body(
+                e,
+                &*(p as *const vk::BufferUsageFlags2CreateInfoKHR),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -7952,6 +8818,12 @@ unsafe fn dec_chain_in_BufferViewCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32 => {
+                let n = a.alloc::<vk::BufferUsageFlags2CreateInfoKHR>(1);
+                dec_BufferUsageFlags2CreateInfoKHR_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -8115,7 +8987,14 @@ unsafe fn enc_chain_in_ComputePipelineCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR {
+            e.u32(vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32);
+            enc_PipelineCreateFlags2CreateInfoKHR_body(
+                e,
+                &*(p as *const vk::PipelineCreateFlags2CreateInfoKHR),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -8132,6 +9011,14 @@ unsafe fn dec_chain_in_ComputePipelineCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t
+                == vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32 =>
+            {
+                let n = a.alloc::<vk::PipelineCreateFlags2CreateInfoKHR>(1);
+                dec_PipelineCreateFlags2CreateInfoKHR_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -8530,6 +9417,38 @@ unsafe fn enc_chain_in_DeviceCreateInfo(
                 e,
                 &*(p as *const vk::PhysicalDeviceDepthClipEnableFeaturesEXT),
             )?;
+        } else if st == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT.as_raw() as u32,
+            );
+            enc_PhysicalDeviceCustomBorderColorFeaturesEXT_body(
+                e,
+                &*(p as *const vk::PhysicalDeviceCustomBorderColorFeaturesEXT),
+            )?;
+        } else if st == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT.as_raw()
+                    as u32,
+            );
+            enc_PhysicalDeviceNonSeamlessCubeMapFeaturesEXT_body(
+                e,
+                &*(p as *const vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT),
+            )?;
+        } else if st == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT.as_raw()
+                    as u32,
+            );
+            enc_PhysicalDeviceExtendedDynamicState3FeaturesEXT_body(
+                e,
+                &*(p as *const vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT),
+            )?;
+        } else if st == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT {
+            e.u32(vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT.as_raw() as u32);
+            enc_PhysicalDeviceMemoryPriorityFeaturesEXT_body(
+                e,
+                &*(p as *const vk::PhysicalDeviceMemoryPriorityFeaturesEXT),
+            )?;
         } else { /* not forwarded: dropped, as the specification allows for unknown structures */
         }
         p = (*base).p_next as *const std::ffi::c_void;
@@ -8616,6 +9535,42 @@ unsafe fn dec_chain_in_DeviceCreateInfo(
                 *link = n.cast();
                 link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
             }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>(1);
+                dec_PhysicalDeviceCustomBorderColorFeaturesEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>(1);
+                dec_PhysicalDeviceNonSeamlessCubeMapFeaturesEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>(1);
+                dec_PhysicalDeviceExtendedDynamicState3FeaturesEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>(1);
+                dec_PhysicalDeviceMemoryPriorityFeaturesEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -8637,6 +9592,36 @@ unsafe fn enc_chain_in_DeviceImageMemoryRequirements(
 }
 #[cfg(feature = "host")]
 unsafe fn dec_chain_in_DeviceImageMemoryRequirements(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+) -> Result<*const std::ffi::c_void, CodecError> {
+    let mut head: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut link: *mut *mut std::ffi::c_void = &mut head;
+    loop {
+        match d.u32()? {
+            CHAIN_END => break,
+            t => return Err(CodecError::BadTag(t)),
+        }
+    }
+    Ok(head as *const std::ffi::c_void)
+}
+#[cfg(feature = "guest")]
+unsafe fn enc_chain_in_DeviceMemoryOpaqueCaptureAddressInfo(
+    e: &mut Enc,
+    mut p: *const std::ffi::c_void,
+) -> Result<(), CodecError> {
+    while !p.is_null() {
+        let base = p as *const vk::BaseInStructure;
+        let st = (*base).s_type;
+        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        p = (*base).p_next as *const std::ffi::c_void;
+    }
+    e.u32(CHAIN_END);
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_chain_in_DeviceMemoryOpaqueCaptureAddressInfo(
     d: &mut Dec,
     a: &mut Arena,
     s: &dyn Resolver,
@@ -8809,7 +9794,20 @@ unsafe fn enc_chain_in_GraphicsPipelineCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::PIPELINE_RENDERING_CREATE_INFO {
+            e.u32(vk::StructureType::PIPELINE_RENDERING_CREATE_INFO.as_raw() as u32);
+            enc_PipelineRenderingCreateInfo_body(
+                e,
+                &*(p as *const vk::PipelineRenderingCreateInfo),
+            )?;
+        } else if st == vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR {
+            e.u32(vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32);
+            enc_PipelineCreateFlags2CreateInfoKHR_body(
+                e,
+                &*(p as *const vk::PipelineCreateFlags2CreateInfoKHR),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -8826,6 +9824,20 @@ unsafe fn dec_chain_in_GraphicsPipelineCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::PIPELINE_RENDERING_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::PipelineRenderingCreateInfo>(1);
+                dec_PipelineRenderingCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32 =>
+            {
+                let n = a.alloc::<vk::PipelineCreateFlags2CreateInfoKHR>(1);
+                dec_PipelineCreateFlags2CreateInfoKHR_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -8899,7 +9911,11 @@ unsafe fn enc_chain_in_ImageCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO {
+            e.u32(vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO.as_raw() as u32);
+            enc_ImageFormatListCreateInfo_body(e, &*(p as *const vk::ImageFormatListCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -8916,6 +9932,12 @@ unsafe fn dec_chain_in_ImageCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::ImageFormatListCreateInfo>(1);
+                dec_ImageFormatListCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9079,7 +10101,11 @@ unsafe fn enc_chain_in_ImageViewCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::IMAGE_VIEW_USAGE_CREATE_INFO {
+            e.u32(vk::StructureType::IMAGE_VIEW_USAGE_CREATE_INFO.as_raw() as u32);
+            enc_ImageViewUsageCreateInfo_body(e, &*(p as *const vk::ImageViewUsageCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9096,6 +10122,12 @@ unsafe fn dec_chain_in_ImageViewCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::IMAGE_VIEW_USAGE_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::ImageViewUsageCreateInfo>(1);
+                dec_ImageViewUsageCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9293,7 +10325,14 @@ unsafe fn enc_chain_in_PhysicalDeviceExternalBufferInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR {
+            e.u32(vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32);
+            enc_BufferUsageFlags2CreateInfoKHR_body(
+                e,
+                &*(p as *const vk::BufferUsageFlags2CreateInfoKHR),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9310,6 +10349,12 @@ unsafe fn dec_chain_in_PhysicalDeviceExternalBufferInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR.as_raw() as u32 => {
+                let n = a.alloc::<vk::BufferUsageFlags2CreateInfoKHR>(1);
+                dec_BufferUsageFlags2CreateInfoKHR_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9353,7 +10398,11 @@ unsafe fn enc_chain_in_PhysicalDeviceExternalSemaphoreInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO {
+            e.u32(vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO.as_raw() as u32);
+            enc_SemaphoreTypeCreateInfo_body(e, &*(p as *const vk::SemaphoreTypeCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9370,6 +10419,12 @@ unsafe fn dec_chain_in_PhysicalDeviceExternalSemaphoreInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::SemaphoreTypeCreateInfo>(1);
+                dec_SemaphoreTypeCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9383,7 +10438,11 @@ unsafe fn enc_chain_in_PhysicalDeviceImageFormatInfo2(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO {
+            e.u32(vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO.as_raw() as u32);
+            enc_ImageFormatListCreateInfo_body(e, &*(p as *const vk::ImageFormatListCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9400,6 +10459,12 @@ unsafe fn dec_chain_in_PhysicalDeviceImageFormatInfo2(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::ImageFormatListCreateInfo>(1);
+                dec_ImageFormatListCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9653,7 +10718,26 @@ unsafe fn enc_chain_in_PipelineRasterizationStateCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT {
+            e.u32(
+                vk::StructureType::PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT.as_raw()
+                    as u32,
+            );
+            enc_PipelineRasterizationDepthClipStateCreateInfoEXT_body(
+                e,
+                &*(p as *const vk::PipelineRasterizationDepthClipStateCreateInfoEXT),
+            )?;
+        } else if st == vk::StructureType::PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT {
+            e.u32(
+                vk::StructureType::PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT.as_raw()
+                    as u32,
+            );
+            enc_PipelineRasterizationStateStreamCreateInfoEXT_body(
+                e,
+                &*(p as *const vk::PipelineRasterizationStateStreamCreateInfoEXT),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9670,6 +10754,24 @@ unsafe fn dec_chain_in_PipelineRasterizationStateCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t
+                == vk::StructureType::PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT
+                    .as_raw() as u32 =>
+            {
+                let n = a.alloc::<vk::PipelineRasterizationDepthClipStateCreateInfoEXT>(1);
+                dec_PipelineRasterizationDepthClipStateCreateInfoEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PipelineRasterizationStateStreamCreateInfoEXT>(1);
+                dec_PipelineRasterizationStateStreamCreateInfoEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9683,7 +10785,11 @@ unsafe fn enc_chain_in_PipelineShaderStageCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::SHADER_MODULE_CREATE_INFO {
+            e.u32(vk::StructureType::SHADER_MODULE_CREATE_INFO.as_raw() as u32);
+            enc_ShaderModuleCreateInfo_body(e, &*(p as *const vk::ShaderModuleCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -9700,6 +10806,12 @@ unsafe fn dec_chain_in_PipelineShaderStageCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::SHADER_MODULE_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::ShaderModuleCreateInfo>(1);
+                dec_ShaderModuleCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -9811,6 +10923,36 @@ unsafe fn enc_chain_in_PrivateDataSlotCreateInfo(
 }
 #[cfg(feature = "host")]
 unsafe fn dec_chain_in_PrivateDataSlotCreateInfo(
+    d: &mut Dec,
+    a: &mut Arena,
+    s: &dyn Resolver,
+) -> Result<*const std::ffi::c_void, CodecError> {
+    let mut head: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut link: *mut *mut std::ffi::c_void = &mut head;
+    loop {
+        match d.u32()? {
+            CHAIN_END => break,
+            t => return Err(CodecError::BadTag(t)),
+        }
+    }
+    Ok(head as *const std::ffi::c_void)
+}
+#[cfg(feature = "guest")]
+unsafe fn enc_chain_in_PushConstantsInfoKHR(
+    e: &mut Enc,
+    mut p: *const std::ffi::c_void,
+) -> Result<(), CodecError> {
+    while !p.is_null() {
+        let base = p as *const vk::BaseInStructure;
+        let st = (*base).s_type;
+        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        p = (*base).p_next as *const std::ffi::c_void;
+    }
+    e.u32(CHAIN_END);
+    Ok(())
+}
+#[cfg(feature = "host")]
+unsafe fn dec_chain_in_PushConstantsInfoKHR(
     d: &mut Dec,
     a: &mut Arena,
     s: &dyn Resolver,
@@ -10043,7 +11185,20 @@ unsafe fn enc_chain_in_SamplerCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT {
+            e.u32(vk::StructureType::SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT.as_raw() as u32);
+            enc_SamplerCustomBorderColorCreateInfoEXT_body(
+                e,
+                &*(p as *const vk::SamplerCustomBorderColorCreateInfoEXT),
+            )?;
+        } else if st == vk::StructureType::SAMPLER_REDUCTION_MODE_CREATE_INFO {
+            e.u32(vk::StructureType::SAMPLER_REDUCTION_MODE_CREATE_INFO.as_raw() as u32);
+            enc_SamplerReductionModeCreateInfo_body(
+                e,
+                &*(p as *const vk::SamplerReductionModeCreateInfo),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -10060,6 +11215,21 @@ unsafe fn dec_chain_in_SamplerCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t
+                == vk::StructureType::SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::SamplerCustomBorderColorCreateInfoEXT>(1);
+                dec_SamplerCustomBorderColorCreateInfoEXT_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t == vk::StructureType::SAMPLER_REDUCTION_MODE_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::SamplerReductionModeCreateInfo>(1);
+                dec_SamplerReductionModeCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -10103,7 +11273,11 @@ unsafe fn enc_chain_in_SemaphoreCreateInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO {
+            e.u32(vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO.as_raw() as u32);
+            enc_SemaphoreTypeCreateInfo_body(e, &*(p as *const vk::SemaphoreTypeCreateInfo))?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -10120,6 +11294,12 @@ unsafe fn dec_chain_in_SemaphoreCreateInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::SemaphoreTypeCreateInfo>(1);
+                dec_SemaphoreTypeCreateInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -10253,7 +11433,14 @@ unsafe fn enc_chain_in_SubmitInfo(
     while !p.is_null() {
         let base = p as *const vk::BaseInStructure;
         let st = (*base).s_type;
-        { /* not forwarded: dropped, as the specification allows for unknown structures */ }
+        if st == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO {
+            e.u32(vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO.as_raw() as u32);
+            enc_TimelineSemaphoreSubmitInfo_body(
+                e,
+                &*(p as *const vk::TimelineSemaphoreSubmitInfo),
+            )?;
+        } else { /* not forwarded: dropped, as the specification allows for unknown structures */
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -10270,6 +11457,12 @@ unsafe fn dec_chain_in_SubmitInfo(
     loop {
         match d.u32()? {
             CHAIN_END => break,
+            t if t == vk::StructureType::TIMELINE_SEMAPHORE_SUBMIT_INFO.as_raw() as u32 => {
+                let n = a.alloc::<vk::TimelineSemaphoreSubmitInfo>(1);
+                dec_TimelineSemaphoreSubmitInfo_body(d, a, s, n)?;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -10876,6 +12069,26 @@ unsafe fn enc_chain_out_req_PhysicalDeviceFeatures2(
                 vk::StructureType::PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT.as_raw() as u32,
             );
         }
+        if st == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT.as_raw() as u32,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT.as_raw()
+                    as u32,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT {
+            e.u32(
+                vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT.as_raw()
+                    as u32,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT {
+            e.u32(vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT.as_raw() as u32);
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     e.u32(CHAIN_END);
@@ -10953,6 +12166,43 @@ unsafe fn dec_chain_out_req_PhysicalDeviceFeatures2(
                 *link = n.cast();
                 link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
             }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>(1);
+                (*n).s_type = vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>(1);
+                (*n).s_type = vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>(1);
+                (*n).s_type =
+                    vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
+            t if t
+                == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT.as_raw()
+                    as u32 =>
+            {
+                let n = a.alloc::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>(1);
+                (*n).s_type = vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+                *link = n.cast();
+                link = &mut (*n).p_next as *mut _ as *mut *mut std::ffi::c_void;
+            }
             t => return Err(CodecError::BadTag(t)),
         }
     }
@@ -11014,6 +12264,30 @@ unsafe fn enc_chain_out_rep_PhysicalDeviceFeatures2(
                 std::mem::size_of::<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>() - 16,
             );
         }
+        if st == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT {
+            e.pod_slice(
+                (p as *const u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>() - 16,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT {
+            e.pod_slice(
+                (p as *const u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>() - 16,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT {
+            e.pod_slice(
+                (p as *const u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>() - 16,
+            );
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT {
+            e.pod_slice(
+                (p as *const u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>() - 16,
+            );
+        }
         p = (*base).p_next as *const std::ffi::c_void;
     }
     Ok(())
@@ -11072,6 +12346,30 @@ unsafe fn dec_chain_out_rep_PhysicalDeviceFeatures2(
             d.pod_slice_into(
                 (p as *mut u8).add(16),
                 std::mem::size_of::<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>() - 16,
+            )?;
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT {
+            d.pod_slice_into(
+                (p as *mut u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>() - 16,
+            )?;
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT {
+            d.pod_slice_into(
+                (p as *mut u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT>() - 16,
+            )?;
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT {
+            d.pod_slice_into(
+                (p as *mut u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>() - 16,
+            )?;
+        }
+        if st == vk::StructureType::PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT {
+            d.pod_slice_into(
+                (p as *mut u8).add(16),
+                std::mem::size_of::<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>() - 16,
             )?;
         }
         p = (*base).p_next as *mut std::ffi::c_void;
@@ -11810,7 +13108,7 @@ unsafe fn exec_vk_bind_buffer_memory2<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_1().bind_buffer_memory2)(device, bind_info_count, p_bind_infos)
+        (ctx.fp_v1_1().bind_buffer_memory2)(device, bind_info_count, p_bind_infos as *const _)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -11938,7 +13236,7 @@ unsafe fn exec_vk_bind_image_memory2<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_1().bind_image_memory2)(device, bind_info_count, p_bind_infos)
+        (ctx.fp_v1_1().bind_image_memory2)(device, bind_info_count, p_bind_infos as *const _)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -12304,16 +13602,78 @@ unsafe fn exec_vk_cmd_bind_descriptor_sets<H: Host>(
             layout,
             first_set,
             descriptor_set_count,
-            p_descriptor_sets,
+            p_descriptor_sets as *const _,
             dynamic_offset_count,
-            p_dynamic_offsets,
+            p_dynamic_offsets as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BIND_INDEX_BUFFER: u16 = 13;
+pub const CMD_VK_CMD_BIND_DESCRIPTOR_SETS2: u16 = 13;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_cmd_bind_descriptor_sets2(
+    link: &mut dyn Link,
+    command_buffer: vk::CommandBuffer,
+    p_bind_descriptor_sets_info: *const vk::BindDescriptorSetsInfoKHR,
+) -> () {
+    let r: Result<(), GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_CMD_BIND_DESCRIPTOR_SETS2);
+        e.u64(crate::hid_disp(command_buffer.as_raw()));
+        if p_bind_descriptor_sets_info.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            enc_BindDescriptorSetsInfoKHR(&mut e, &*p_bind_descriptor_sets_info)?;
+        }
+        link.send_async(e.as_slice())?;
+        let ok = true;
+        let mut d = Dec::new(&[]);
+        d.finish()?;
+        Ok(())
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkCmdBindDescriptorSets2", &err);
+            ()
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_cmd_bind_descriptor_sets2<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let command_buffer_id = d.u64()?;
+    let command_buffer = <vk::CommandBuffer as vk::Handle>::from_raw(
+        s.resolve(command_buffer_id, "VkCommandBuffer")?,
+    );
+    let p_bind_descriptor_sets_info: *const vk::BindDescriptorSetsInfoKHR = if d.bool()? {
+        let p = a.alloc::<vk::BindDescriptorSetsInfoKHR>(1);
+        dec_BindDescriptorSetsInfoKHR(d, a, &*s, p)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    {
+        let f = s
+            .device_proc(command_buffer_id, c"vkCmdBindDescriptorSets2KHR")?
+            .ok_or(CodecError::Invalid(
+                "driver lacks vkCmdBindDescriptorSets2KHR",
+            ))?;
+        let f: vk::PFN_vkCmdBindDescriptorSets2KHR = std::mem::transmute(f);
+        f(command_buffer, p_bind_descriptor_sets_info)
+    };
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_CMD_BIND_INDEX_BUFFER: u16 = 14;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_bind_index_buffer(
     link: &mut dyn Link,
@@ -12368,7 +13728,69 @@ unsafe fn exec_vk_cmd_bind_index_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BIND_PIPELINE: u16 = 14;
+pub const CMD_VK_CMD_BIND_INDEX_BUFFER2: u16 = 15;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_cmd_bind_index_buffer2(
+    link: &mut dyn Link,
+    command_buffer: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    index_type: vk::IndexType,
+) -> () {
+    let r: Result<(), GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_CMD_BIND_INDEX_BUFFER2);
+        e.u64(crate::hid_disp(command_buffer.as_raw()));
+        e.u64(buffer.as_raw());
+        e.pod(&offset);
+        e.pod(&size);
+        e.pod(&index_type);
+        link.send_async(e.as_slice())?;
+        let ok = true;
+        let mut d = Dec::new(&[]);
+        d.finish()?;
+        Ok(())
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkCmdBindIndexBuffer2", &err);
+            ()
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_cmd_bind_index_buffer2<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let command_buffer_id = d.u64()?;
+    let command_buffer = <vk::CommandBuffer as vk::Handle>::from_raw(
+        s.resolve(command_buffer_id, "VkCommandBuffer")?,
+    );
+    let buffer_id = d.u64()?;
+    let buffer = <vk::Buffer as vk::Handle>::from_raw(s.resolve(buffer_id, "VkBuffer")?);
+    let mut offset: vk::DeviceSize = std::mem::zeroed();
+    d.pod_into(&mut offset)?;
+    let mut size: vk::DeviceSize = std::mem::zeroed();
+    d.pod_into(&mut size)?;
+    let mut index_type: vk::IndexType = std::mem::zeroed();
+    d.pod_into(&mut index_type)?;
+    {
+        let f = s
+            .device_proc(command_buffer_id, c"vkCmdBindIndexBuffer2KHR")?
+            .ok_or(CodecError::Invalid("driver lacks vkCmdBindIndexBuffer2KHR"))?;
+        let f: vk::PFN_vkCmdBindIndexBuffer2KHR = std::mem::transmute(f);
+        f(command_buffer, buffer, offset, size, index_type)
+    };
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_CMD_BIND_PIPELINE: u16 = 16;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_bind_pipeline(
     link: &mut dyn Link,
@@ -12419,7 +13841,7 @@ unsafe fn exec_vk_cmd_bind_pipeline<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BIND_VERTEX_BUFFERS: u16 = 15;
+pub const CMD_VK_CMD_BIND_VERTEX_BUFFERS: u16 = 17;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_bind_vertex_buffers(
     link: &mut dyn Link,
@@ -12512,15 +13934,15 @@ unsafe fn exec_vk_cmd_bind_vertex_buffers<H: Host>(
             command_buffer,
             first_binding,
             binding_count,
-            p_buffers,
-            p_offsets,
+            p_buffers as *const _,
+            p_offsets as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BIND_VERTEX_BUFFERS2: u16 = 16;
+pub const CMD_VK_CMD_BIND_VERTEX_BUFFERS2: u16 = 18;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_bind_vertex_buffers2(
     link: &mut dyn Link,
@@ -12651,17 +14073,17 @@ unsafe fn exec_vk_cmd_bind_vertex_buffers2<H: Host>(
             command_buffer,
             first_binding,
             binding_count,
-            p_buffers,
-            p_offsets,
-            p_sizes,
-            p_strides,
+            p_buffers as *const _,
+            p_offsets as *const _,
+            p_sizes as *const _,
+            p_strides as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BLIT_IMAGE: u16 = 17;
+pub const CMD_VK_CMD_BLIT_IMAGE: u16 = 19;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_blit_image(
     link: &mut dyn Link,
@@ -12748,7 +14170,7 @@ unsafe fn exec_vk_cmd_blit_image<H: Host>(
             dst_image,
             dst_image_layout,
             region_count,
-            p_regions,
+            p_regions as *const _,
             filter,
         )
     };
@@ -12756,7 +14178,7 @@ unsafe fn exec_vk_cmd_blit_image<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_BLIT_IMAGE2: u16 = 18;
+pub const CMD_VK_CMD_BLIT_IMAGE2: u16 = 20;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_blit_image2(
     link: &mut dyn Link,
@@ -12813,7 +14235,7 @@ unsafe fn exec_vk_cmd_blit_image2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_CLEAR_ATTACHMENTS: u16 = 19;
+pub const CMD_VK_CMD_CLEAR_ATTACHMENTS: u16 = 21;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_clear_attachments(
     link: &mut dyn Link,
@@ -12899,16 +14321,16 @@ unsafe fn exec_vk_cmd_clear_attachments<H: Host>(
         (ctx.fp_v1_0().cmd_clear_attachments)(
             command_buffer,
             attachment_count,
-            p_attachments,
+            p_attachments as *const _,
             rect_count,
-            p_rects,
+            p_rects as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_CLEAR_COLOR_IMAGE: u16 = 20;
+pub const CMD_VK_CMD_CLEAR_COLOR_IMAGE: u16 = 22;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_clear_color_image(
     link: &mut dyn Link,
@@ -12996,14 +14418,14 @@ unsafe fn exec_vk_cmd_clear_color_image<H: Host>(
             image_layout,
             p_color,
             range_count,
-            p_ranges,
+            p_ranges as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: u16 = 21;
+pub const CMD_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE: u16 = 23;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_clear_depth_stencil_image(
     link: &mut dyn Link,
@@ -13091,14 +14513,14 @@ unsafe fn exec_vk_cmd_clear_depth_stencil_image<H: Host>(
             image_layout,
             p_depth_stencil,
             range_count,
-            p_ranges,
+            p_ranges as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_BUFFER: u16 = 22;
+pub const CMD_VK_CMD_COPY_BUFFER: u16 = 24;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_buffer(
     link: &mut dyn Link,
@@ -13171,14 +14593,14 @@ unsafe fn exec_vk_cmd_copy_buffer<H: Host>(
             src_buffer,
             dst_buffer,
             region_count,
-            p_regions,
+            p_regions as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_BUFFER2: u16 = 23;
+pub const CMD_VK_CMD_COPY_BUFFER2: u16 = 25;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_buffer2(
     link: &mut dyn Link,
@@ -13235,7 +14657,7 @@ unsafe fn exec_vk_cmd_copy_buffer2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_BUFFER_TO_IMAGE: u16 = 24;
+pub const CMD_VK_CMD_COPY_BUFFER_TO_IMAGE: u16 = 26;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_buffer_to_image(
     link: &mut dyn Link,
@@ -13313,14 +14735,14 @@ unsafe fn exec_vk_cmd_copy_buffer_to_image<H: Host>(
             dst_image,
             dst_image_layout,
             region_count,
-            p_regions,
+            p_regions as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_BUFFER_TO_IMAGE2: u16 = 25;
+pub const CMD_VK_CMD_COPY_BUFFER_TO_IMAGE2: u16 = 27;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_buffer_to_image2(
     link: &mut dyn Link,
@@ -13377,7 +14799,7 @@ unsafe fn exec_vk_cmd_copy_buffer_to_image2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_IMAGE: u16 = 26;
+pub const CMD_VK_CMD_COPY_IMAGE: u16 = 28;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_image(
     link: &mut dyn Link,
@@ -13460,14 +14882,14 @@ unsafe fn exec_vk_cmd_copy_image<H: Host>(
             dst_image,
             dst_image_layout,
             region_count,
-            p_regions,
+            p_regions as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_IMAGE2: u16 = 27;
+pub const CMD_VK_CMD_COPY_IMAGE2: u16 = 29;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_image2(
     link: &mut dyn Link,
@@ -13524,7 +14946,7 @@ unsafe fn exec_vk_cmd_copy_image2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_IMAGE_TO_BUFFER: u16 = 28;
+pub const CMD_VK_CMD_COPY_IMAGE_TO_BUFFER: u16 = 30;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_image_to_buffer(
     link: &mut dyn Link,
@@ -13602,14 +15024,14 @@ unsafe fn exec_vk_cmd_copy_image_to_buffer<H: Host>(
             src_image_layout,
             dst_buffer,
             region_count,
-            p_regions,
+            p_regions as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_IMAGE_TO_BUFFER2: u16 = 29;
+pub const CMD_VK_CMD_COPY_IMAGE_TO_BUFFER2: u16 = 31;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_image_to_buffer2(
     link: &mut dyn Link,
@@ -13666,7 +15088,7 @@ unsafe fn exec_vk_cmd_copy_image_to_buffer2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_COPY_QUERY_POOL_RESULTS: u16 = 30;
+pub const CMD_VK_CMD_COPY_QUERY_POOL_RESULTS: u16 = 32;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_copy_query_pool_results(
     link: &mut dyn Link,
@@ -13747,7 +15169,7 @@ unsafe fn exec_vk_cmd_copy_query_pool_results<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DISPATCH: u16 = 31;
+pub const CMD_VK_CMD_DISPATCH: u16 = 33;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_dispatch(
     link: &mut dyn Link,
@@ -13802,7 +15224,7 @@ unsafe fn exec_vk_cmd_dispatch<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DISPATCH_BASE: u16 = 32;
+pub const CMD_VK_CMD_DISPATCH_BASE: u16 = 34;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_dispatch_base(
     link: &mut dyn Link,
@@ -13877,7 +15299,7 @@ unsafe fn exec_vk_cmd_dispatch_base<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DISPATCH_INDIRECT: u16 = 33;
+pub const CMD_VK_CMD_DISPATCH_INDIRECT: u16 = 35;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_dispatch_indirect(
     link: &mut dyn Link,
@@ -13928,7 +15350,7 @@ unsafe fn exec_vk_cmd_dispatch_indirect<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW: u16 = 34;
+pub const CMD_VK_CMD_DRAW: u16 = 36;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw(
     link: &mut dyn Link,
@@ -13993,7 +15415,7 @@ unsafe fn exec_vk_cmd_draw<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW_INDEXED: u16 = 35;
+pub const CMD_VK_CMD_DRAW_INDEXED: u16 = 37;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw_indexed(
     link: &mut dyn Link,
@@ -14063,7 +15485,7 @@ unsafe fn exec_vk_cmd_draw_indexed<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW_INDEXED_INDIRECT: u16 = 36;
+pub const CMD_VK_CMD_DRAW_INDEXED_INDIRECT: u16 = 38;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw_indexed_indirect(
     link: &mut dyn Link,
@@ -14128,7 +15550,7 @@ unsafe fn exec_vk_cmd_draw_indexed_indirect<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT: u16 = 37;
+pub const CMD_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT: u16 = 39;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw_indexed_indirect_count(
     link: &mut dyn Link,
@@ -14204,7 +15626,7 @@ unsafe fn exec_vk_cmd_draw_indexed_indirect_count<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW_INDIRECT: u16 = 38;
+pub const CMD_VK_CMD_DRAW_INDIRECT: u16 = 40;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw_indirect(
     link: &mut dyn Link,
@@ -14263,7 +15685,7 @@ unsafe fn exec_vk_cmd_draw_indirect<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_DRAW_INDIRECT_COUNT: u16 = 39;
+pub const CMD_VK_CMD_DRAW_INDIRECT_COUNT: u16 = 41;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_draw_indirect_count(
     link: &mut dyn Link,
@@ -14339,7 +15761,7 @@ unsafe fn exec_vk_cmd_draw_indirect_count<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_END_QUERY: u16 = 40;
+pub const CMD_VK_CMD_END_QUERY: u16 = 42;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_end_query(
     link: &mut dyn Link,
@@ -14391,7 +15813,7 @@ unsafe fn exec_vk_cmd_end_query<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_END_RENDER_PASS: u16 = 41;
+pub const CMD_VK_CMD_END_RENDER_PASS: u16 = 43;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_end_render_pass(link: &mut dyn Link, command_buffer: vk::CommandBuffer) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -14431,7 +15853,7 @@ unsafe fn exec_vk_cmd_end_render_pass<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_END_RENDER_PASS2: u16 = 42;
+pub const CMD_VK_CMD_END_RENDER_PASS2: u16 = 44;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_end_render_pass2(
     link: &mut dyn Link,
@@ -14488,7 +15910,7 @@ unsafe fn exec_vk_cmd_end_render_pass2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_END_RENDERING: u16 = 43;
+pub const CMD_VK_CMD_END_RENDERING: u16 = 45;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_end_rendering(link: &mut dyn Link, command_buffer: vk::CommandBuffer) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -14528,7 +15950,7 @@ unsafe fn exec_vk_cmd_end_rendering<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_EXECUTE_COMMANDS: u16 = 44;
+pub const CMD_VK_CMD_EXECUTE_COMMANDS: u16 = 46;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_execute_commands(
     link: &mut dyn Link,
@@ -14598,14 +16020,14 @@ unsafe fn exec_vk_cmd_execute_commands<H: Host>(
         (ctx.fp_v1_0().cmd_execute_commands)(
             command_buffer,
             command_buffer_count,
-            p_command_buffers,
+            p_command_buffers as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_FILL_BUFFER: u16 = 45;
+pub const CMD_VK_CMD_FILL_BUFFER: u16 = 47;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_fill_buffer(
     link: &mut dyn Link,
@@ -14664,7 +16086,7 @@ unsafe fn exec_vk_cmd_fill_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_NEXT_SUBPASS: u16 = 46;
+pub const CMD_VK_CMD_NEXT_SUBPASS: u16 = 48;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_next_subpass(
     link: &mut dyn Link,
@@ -14711,7 +16133,7 @@ unsafe fn exec_vk_cmd_next_subpass<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_NEXT_SUBPASS2: u16 = 47;
+pub const CMD_VK_CMD_NEXT_SUBPASS2: u16 = 49;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_next_subpass2(
     link: &mut dyn Link,
@@ -14782,7 +16204,7 @@ unsafe fn exec_vk_cmd_next_subpass2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_PIPELINE_BARRIER: u16 = 48;
+pub const CMD_VK_CMD_PIPELINE_BARRIER: u16 = 50;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_pipeline_barrier(
     link: &mut dyn Link,
@@ -14918,18 +16340,18 @@ unsafe fn exec_vk_cmd_pipeline_barrier<H: Host>(
             dst_stage_mask,
             dependency_flags,
             memory_barrier_count,
-            p_memory_barriers,
+            p_memory_barriers as *const _,
             buffer_memory_barrier_count,
-            p_buffer_memory_barriers,
+            p_buffer_memory_barriers as *const _,
             image_memory_barrier_count,
-            p_image_memory_barriers,
+            p_image_memory_barriers as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_PIPELINE_BARRIER2: u16 = 49;
+pub const CMD_VK_CMD_PIPELINE_BARRIER2: u16 = 51;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_pipeline_barrier2(
     link: &mut dyn Link,
@@ -14986,7 +16408,7 @@ unsafe fn exec_vk_cmd_pipeline_barrier2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_PUSH_CONSTANTS: u16 = 50;
+pub const CMD_VK_CMD_PUSH_CONSTANTS: u16 = 52;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_push_constants(
     link: &mut dyn Link,
@@ -15065,14 +16487,74 @@ unsafe fn exec_vk_cmd_push_constants<H: Host>(
             stage_flags,
             offset,
             size,
-            p_values,
+            p_values as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_RESET_EVENT: u16 = 51;
+pub const CMD_VK_CMD_PUSH_CONSTANTS2: u16 = 53;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_cmd_push_constants2(
+    link: &mut dyn Link,
+    command_buffer: vk::CommandBuffer,
+    p_push_constants_info: *const vk::PushConstantsInfoKHR,
+) -> () {
+    let r: Result<(), GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_CMD_PUSH_CONSTANTS2);
+        e.u64(crate::hid_disp(command_buffer.as_raw()));
+        if p_push_constants_info.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            enc_PushConstantsInfoKHR(&mut e, &*p_push_constants_info)?;
+        }
+        link.send_async(e.as_slice())?;
+        let ok = true;
+        let mut d = Dec::new(&[]);
+        d.finish()?;
+        Ok(())
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkCmdPushConstants2", &err);
+            ()
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_cmd_push_constants2<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let command_buffer_id = d.u64()?;
+    let command_buffer = <vk::CommandBuffer as vk::Handle>::from_raw(
+        s.resolve(command_buffer_id, "VkCommandBuffer")?,
+    );
+    let p_push_constants_info: *const vk::PushConstantsInfoKHR = if d.bool()? {
+        let p = a.alloc::<vk::PushConstantsInfoKHR>(1);
+        dec_PushConstantsInfoKHR(d, a, &*s, p)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    {
+        let f = s
+            .device_proc(command_buffer_id, c"vkCmdPushConstants2KHR")?
+            .ok_or(CodecError::Invalid("driver lacks vkCmdPushConstants2KHR"))?;
+        let f: vk::PFN_vkCmdPushConstants2KHR = std::mem::transmute(f);
+        f(command_buffer, p_push_constants_info)
+    };
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_CMD_RESET_EVENT: u16 = 54;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_reset_event(
     link: &mut dyn Link,
@@ -15123,7 +16605,7 @@ unsafe fn exec_vk_cmd_reset_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_RESET_EVENT2: u16 = 52;
+pub const CMD_VK_CMD_RESET_EVENT2: u16 = 55;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_reset_event2(
     link: &mut dyn Link,
@@ -15174,7 +16656,7 @@ unsafe fn exec_vk_cmd_reset_event2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_RESET_QUERY_POOL: u16 = 53;
+pub const CMD_VK_CMD_RESET_QUERY_POOL: u16 = 56;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_reset_query_pool(
     link: &mut dyn Link,
@@ -15230,7 +16712,7 @@ unsafe fn exec_vk_cmd_reset_query_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_RESOLVE_IMAGE: u16 = 54;
+pub const CMD_VK_CMD_RESOLVE_IMAGE: u16 = 57;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_resolve_image(
     link: &mut dyn Link,
@@ -15313,14 +16795,14 @@ unsafe fn exec_vk_cmd_resolve_image<H: Host>(
             dst_image,
             dst_image_layout,
             region_count,
-            p_regions,
+            p_regions as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_RESOLVE_IMAGE2: u16 = 55;
+pub const CMD_VK_CMD_RESOLVE_IMAGE2: u16 = 58;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_resolve_image2(
     link: &mut dyn Link,
@@ -15377,7 +16859,69 @@ unsafe fn exec_vk_cmd_resolve_image2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_CULL_MODE: u16 = 56;
+pub const CMD_VK_CMD_SET_BLEND_CONSTANTS: u16 = 59;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_cmd_set_blend_constants(
+    link: &mut dyn Link,
+    command_buffer: vk::CommandBuffer,
+    blend_constants: *const f32,
+) -> () {
+    let r: Result<(), GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_CMD_SET_BLEND_CONSTANTS);
+        e.u64(crate::hid_disp(command_buffer.as_raw()));
+        if blend_constants.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            e.pod_slice(blend_constants, 4 as usize);
+        }
+        link.send_async(e.as_slice())?;
+        let ok = true;
+        let mut d = Dec::new(&[]);
+        d.finish()?;
+        Ok(())
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkCmdSetBlendConstants", &err);
+            ()
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_cmd_set_blend_constants<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let command_buffer_id = d.u64()?;
+    let command_buffer = <vk::CommandBuffer as vk::Handle>::from_raw(
+        s.resolve(command_buffer_id, "VkCommandBuffer")?,
+    );
+    let mut blend_constants_ids: Vec<u64> = Vec::new();
+    let blend_constants: *const f32 = if d.bool()? {
+        let n = 4 as usize;
+        if n > MAX_ENUM {
+            return Err(CodecError::BadLength(n as u64));
+        }
+        let p = a.alloc::<f32>(n);
+        d.pod_slice_into(p, n)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    {
+        let ctx = s.device(command_buffer_id)?;
+        (ctx.fp_v1_0().cmd_set_blend_constants)(command_buffer, blend_constants as *const _)
+    };
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_CMD_SET_CULL_MODE: u16 = 60;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_cull_mode(
     link: &mut dyn Link,
@@ -15424,7 +16968,7 @@ unsafe fn exec_vk_cmd_set_cull_mode<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_BIAS: u16 = 57;
+pub const CMD_VK_CMD_SET_DEPTH_BIAS: u16 = 61;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_bias(
     link: &mut dyn Link,
@@ -15484,7 +17028,7 @@ unsafe fn exec_vk_cmd_set_depth_bias<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_BIAS_ENABLE: u16 = 58;
+pub const CMD_VK_CMD_SET_DEPTH_BIAS_ENABLE: u16 = 62;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_bias_enable(
     link: &mut dyn Link,
@@ -15531,7 +17075,7 @@ unsafe fn exec_vk_cmd_set_depth_bias_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_BOUNDS: u16 = 59;
+pub const CMD_VK_CMD_SET_DEPTH_BOUNDS: u16 = 63;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_bounds(
     link: &mut dyn Link,
@@ -15582,7 +17126,7 @@ unsafe fn exec_vk_cmd_set_depth_bounds<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE: u16 = 60;
+pub const CMD_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE: u16 = 64;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_bounds_test_enable(
     link: &mut dyn Link,
@@ -15629,7 +17173,7 @@ unsafe fn exec_vk_cmd_set_depth_bounds_test_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_COMPARE_OP: u16 = 61;
+pub const CMD_VK_CMD_SET_DEPTH_COMPARE_OP: u16 = 65;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_compare_op(
     link: &mut dyn Link,
@@ -15676,7 +17220,7 @@ unsafe fn exec_vk_cmd_set_depth_compare_op<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_TEST_ENABLE: u16 = 62;
+pub const CMD_VK_CMD_SET_DEPTH_TEST_ENABLE: u16 = 66;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_test_enable(
     link: &mut dyn Link,
@@ -15723,7 +17267,7 @@ unsafe fn exec_vk_cmd_set_depth_test_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEPTH_WRITE_ENABLE: u16 = 63;
+pub const CMD_VK_CMD_SET_DEPTH_WRITE_ENABLE: u16 = 67;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_depth_write_enable(
     link: &mut dyn Link,
@@ -15770,7 +17314,7 @@ unsafe fn exec_vk_cmd_set_depth_write_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_DEVICE_MASK: u16 = 64;
+pub const CMD_VK_CMD_SET_DEVICE_MASK: u16 = 68;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_device_mask(
     link: &mut dyn Link,
@@ -15817,7 +17361,7 @@ unsafe fn exec_vk_cmd_set_device_mask<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_EVENT: u16 = 65;
+pub const CMD_VK_CMD_SET_EVENT: u16 = 69;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_event(
     link: &mut dyn Link,
@@ -15868,7 +17412,7 @@ unsafe fn exec_vk_cmd_set_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_EVENT2: u16 = 66;
+pub const CMD_VK_CMD_SET_EVENT2: u16 = 70;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_event2(
     link: &mut dyn Link,
@@ -15929,7 +17473,7 @@ unsafe fn exec_vk_cmd_set_event2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_FRONT_FACE: u16 = 67;
+pub const CMD_VK_CMD_SET_FRONT_FACE: u16 = 71;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_front_face(
     link: &mut dyn Link,
@@ -15976,7 +17520,7 @@ unsafe fn exec_vk_cmd_set_front_face<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_LINE_WIDTH: u16 = 68;
+pub const CMD_VK_CMD_SET_LINE_WIDTH: u16 = 72;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_line_width(
     link: &mut dyn Link,
@@ -16023,7 +17567,7 @@ unsafe fn exec_vk_cmd_set_line_width<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE: u16 = 69;
+pub const CMD_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE: u16 = 73;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_primitive_restart_enable(
     link: &mut dyn Link,
@@ -16070,7 +17614,7 @@ unsafe fn exec_vk_cmd_set_primitive_restart_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_PRIMITIVE_TOPOLOGY: u16 = 70;
+pub const CMD_VK_CMD_SET_PRIMITIVE_TOPOLOGY: u16 = 74;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_primitive_topology(
     link: &mut dyn Link,
@@ -16117,7 +17661,7 @@ unsafe fn exec_vk_cmd_set_primitive_topology<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE: u16 = 71;
+pub const CMD_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE: u16 = 75;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_rasterizer_discard_enable(
     link: &mut dyn Link,
@@ -16164,7 +17708,7 @@ unsafe fn exec_vk_cmd_set_rasterizer_discard_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_SCISSOR: u16 = 72;
+pub const CMD_VK_CMD_SET_SCISSOR: u16 = 76;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_scissor(
     link: &mut dyn Link,
@@ -16228,13 +17772,18 @@ unsafe fn exec_vk_cmd_set_scissor<H: Host>(
     };
     {
         let ctx = s.device(command_buffer_id)?;
-        (ctx.fp_v1_0().cmd_set_scissor)(command_buffer, first_scissor, scissor_count, p_scissors)
+        (ctx.fp_v1_0().cmd_set_scissor)(
+            command_buffer,
+            first_scissor,
+            scissor_count,
+            p_scissors as *const _,
+        )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_SCISSOR_WITH_COUNT: u16 = 73;
+pub const CMD_VK_CMD_SET_SCISSOR_WITH_COUNT: u16 = 77;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_scissor_with_count(
     link: &mut dyn Link,
@@ -16294,13 +17843,17 @@ unsafe fn exec_vk_cmd_set_scissor_with_count<H: Host>(
     };
     {
         let ctx = s.device(command_buffer_id)?;
-        (ctx.fp_v1_3().cmd_set_scissor_with_count)(command_buffer, scissor_count, p_scissors)
+        (ctx.fp_v1_3().cmd_set_scissor_with_count)(
+            command_buffer,
+            scissor_count,
+            p_scissors as *const _,
+        )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_STENCIL_COMPARE_MASK: u16 = 74;
+pub const CMD_VK_CMD_SET_STENCIL_COMPARE_MASK: u16 = 78;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_stencil_compare_mask(
     link: &mut dyn Link,
@@ -16351,7 +17904,7 @@ unsafe fn exec_vk_cmd_set_stencil_compare_mask<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_STENCIL_OP: u16 = 75;
+pub const CMD_VK_CMD_SET_STENCIL_OP: u16 = 79;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_stencil_op(
     link: &mut dyn Link,
@@ -16421,7 +17974,7 @@ unsafe fn exec_vk_cmd_set_stencil_op<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_STENCIL_REFERENCE: u16 = 76;
+pub const CMD_VK_CMD_SET_STENCIL_REFERENCE: u16 = 80;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_stencil_reference(
     link: &mut dyn Link,
@@ -16472,7 +18025,7 @@ unsafe fn exec_vk_cmd_set_stencil_reference<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_STENCIL_TEST_ENABLE: u16 = 77;
+pub const CMD_VK_CMD_SET_STENCIL_TEST_ENABLE: u16 = 81;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_stencil_test_enable(
     link: &mut dyn Link,
@@ -16519,7 +18072,7 @@ unsafe fn exec_vk_cmd_set_stencil_test_enable<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_STENCIL_WRITE_MASK: u16 = 78;
+pub const CMD_VK_CMD_SET_STENCIL_WRITE_MASK: u16 = 82;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_stencil_write_mask(
     link: &mut dyn Link,
@@ -16570,7 +18123,7 @@ unsafe fn exec_vk_cmd_set_stencil_write_mask<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_VIEWPORT: u16 = 79;
+pub const CMD_VK_CMD_SET_VIEWPORT: u16 = 83;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_viewport(
     link: &mut dyn Link,
@@ -16638,14 +18191,14 @@ unsafe fn exec_vk_cmd_set_viewport<H: Host>(
             command_buffer,
             first_viewport,
             viewport_count,
-            p_viewports,
+            p_viewports as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_SET_VIEWPORT_WITH_COUNT: u16 = 80;
+pub const CMD_VK_CMD_SET_VIEWPORT_WITH_COUNT: u16 = 84;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_set_viewport_with_count(
     link: &mut dyn Link,
@@ -16705,13 +18258,17 @@ unsafe fn exec_vk_cmd_set_viewport_with_count<H: Host>(
     };
     {
         let ctx = s.device(command_buffer_id)?;
-        (ctx.fp_v1_3().cmd_set_viewport_with_count)(command_buffer, viewport_count, p_viewports)
+        (ctx.fp_v1_3().cmd_set_viewport_with_count)(
+            command_buffer,
+            viewport_count,
+            p_viewports as *const _,
+        )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_UPDATE_BUFFER: u16 = 81;
+pub const CMD_VK_CMD_UPDATE_BUFFER: u16 = 85;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_update_buffer(
     link: &mut dyn Link,
@@ -16779,13 +18336,19 @@ unsafe fn exec_vk_cmd_update_buffer<H: Host>(
     };
     {
         let ctx = s.device(command_buffer_id)?;
-        (ctx.fp_v1_0().cmd_update_buffer)(command_buffer, dst_buffer, dst_offset, data_size, p_data)
+        (ctx.fp_v1_0().cmd_update_buffer)(
+            command_buffer,
+            dst_buffer,
+            dst_offset,
+            data_size,
+            p_data as *const _,
+        )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_WAIT_EVENTS: u16 = 82;
+pub const CMD_VK_CMD_WAIT_EVENTS: u16 = 86;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_wait_events(
     link: &mut dyn Link,
@@ -16943,22 +18506,22 @@ unsafe fn exec_vk_cmd_wait_events<H: Host>(
         (ctx.fp_v1_0().cmd_wait_events)(
             command_buffer,
             event_count,
-            p_events,
+            p_events as *const _,
             src_stage_mask,
             dst_stage_mask,
             memory_barrier_count,
-            p_memory_barriers,
+            p_memory_barriers as *const _,
             buffer_memory_barrier_count,
-            p_buffer_memory_barriers,
+            p_buffer_memory_barriers as *const _,
             image_memory_barrier_count,
-            p_image_memory_barriers,
+            p_image_memory_barriers as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_WAIT_EVENTS2: u16 = 83;
+pub const CMD_VK_CMD_WAIT_EVENTS2: u16 = 87;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_wait_events2(
     link: &mut dyn Link,
@@ -17047,13 +18610,18 @@ unsafe fn exec_vk_cmd_wait_events2<H: Host>(
     };
     {
         let ctx = s.device(command_buffer_id)?;
-        (ctx.fp_v1_3().cmd_wait_events2)(command_buffer, event_count, p_events, p_dependency_infos)
+        (ctx.fp_v1_3().cmd_wait_events2)(
+            command_buffer,
+            event_count,
+            p_events as *const _,
+            p_dependency_infos as *const _,
+        )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_WRITE_TIMESTAMP: u16 = 84;
+pub const CMD_VK_CMD_WRITE_TIMESTAMP: u16 = 88;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_write_timestamp(
     link: &mut dyn Link,
@@ -17109,7 +18677,7 @@ unsafe fn exec_vk_cmd_write_timestamp<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CMD_WRITE_TIMESTAMP2: u16 = 85;
+pub const CMD_VK_CMD_WRITE_TIMESTAMP2: u16 = 89;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_cmd_write_timestamp2(
     link: &mut dyn Link,
@@ -17165,7 +18733,7 @@ unsafe fn exec_vk_cmd_write_timestamp2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_BUFFER: u16 = 86;
+pub const CMD_VK_CREATE_BUFFER: u16 = 90;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_buffer(
     link: &mut dyn Link,
@@ -17241,7 +18809,7 @@ unsafe fn exec_vk_create_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_BUFFER_VIEW: u16 = 87;
+pub const CMD_VK_CREATE_BUFFER_VIEW: u16 = 91;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_buffer_view(
     link: &mut dyn Link,
@@ -17317,7 +18885,7 @@ unsafe fn exec_vk_create_buffer_view<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_COMMAND_POOL: u16 = 88;
+pub const CMD_VK_CREATE_COMMAND_POOL: u16 = 92;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_command_pool(
     link: &mut dyn Link,
@@ -17398,7 +18966,7 @@ unsafe fn exec_vk_create_command_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_COMPUTE_PIPELINES: u16 = 89;
+pub const CMD_VK_CREATE_COMPUTE_PIPELINES: u16 = 93;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_compute_pipelines(
     link: &mut dyn Link,
@@ -17494,7 +19062,7 @@ unsafe fn exec_vk_create_compute_pipelines<H: Host>(
             device,
             pipeline_cache,
             create_info_count,
-            p_create_infos,
+            p_create_infos as *const _,
             std::ptr::null(),
             p_pipelines,
         )
@@ -17515,7 +19083,7 @@ unsafe fn exec_vk_create_compute_pipelines<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_DESCRIPTOR_POOL: u16 = 90;
+pub const CMD_VK_CREATE_DESCRIPTOR_POOL: u16 = 94;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_descriptor_pool(
     link: &mut dyn Link,
@@ -17598,7 +19166,7 @@ unsafe fn exec_vk_create_descriptor_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_DESCRIPTOR_SET_LAYOUT: u16 = 91;
+pub const CMD_VK_CREATE_DESCRIPTOR_SET_LAYOUT: u16 = 95;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_descriptor_set_layout(
     link: &mut dyn Link,
@@ -17679,7 +19247,7 @@ unsafe fn exec_vk_create_descriptor_set_layout<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_DESCRIPTOR_UPDATE_TEMPLATE: u16 = 92;
+pub const CMD_VK_CREATE_DESCRIPTOR_UPDATE_TEMPLATE: u16 = 96;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_descriptor_update_template(
     link: &mut dyn Link,
@@ -17764,7 +19332,7 @@ unsafe fn exec_vk_create_descriptor_update_template<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_DEVICE: u16 = 93;
+pub const CMD_VK_CREATE_DEVICE: u16 = 97;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_device(
     link: &mut dyn Link,
@@ -17839,7 +19407,7 @@ unsafe fn exec_vk_create_device<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_EVENT: u16 = 94;
+pub const CMD_VK_CREATE_EVENT: u16 = 98;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_event(
     link: &mut dyn Link,
@@ -17915,7 +19483,7 @@ unsafe fn exec_vk_create_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_FENCE: u16 = 95;
+pub const CMD_VK_CREATE_FENCE: u16 = 99;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_fence(
     link: &mut dyn Link,
@@ -17991,7 +19559,7 @@ unsafe fn exec_vk_create_fence<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_FRAMEBUFFER: u16 = 96;
+pub const CMD_VK_CREATE_FRAMEBUFFER: u16 = 100;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_framebuffer(
     link: &mut dyn Link,
@@ -18072,7 +19640,7 @@ unsafe fn exec_vk_create_framebuffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_GRAPHICS_PIPELINES: u16 = 97;
+pub const CMD_VK_CREATE_GRAPHICS_PIPELINES: u16 = 101;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_graphics_pipelines(
     link: &mut dyn Link,
@@ -18168,7 +19736,7 @@ unsafe fn exec_vk_create_graphics_pipelines<H: Host>(
             device,
             pipeline_cache,
             create_info_count,
-            p_create_infos,
+            p_create_infos as *const _,
             std::ptr::null(),
             p_pipelines,
         )
@@ -18189,7 +19757,7 @@ unsafe fn exec_vk_create_graphics_pipelines<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_IMAGE: u16 = 98;
+pub const CMD_VK_CREATE_IMAGE: u16 = 102;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_image(
     link: &mut dyn Link,
@@ -18265,7 +19833,7 @@ unsafe fn exec_vk_create_image<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_IMAGE_VIEW: u16 = 99;
+pub const CMD_VK_CREATE_IMAGE_VIEW: u16 = 103;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_image_view(
     link: &mut dyn Link,
@@ -18341,7 +19909,7 @@ unsafe fn exec_vk_create_image_view<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_INSTANCE: u16 = 100;
+pub const CMD_VK_CREATE_INSTANCE: u16 = 104;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_instance(
     link: &mut dyn Link,
@@ -18410,7 +19978,7 @@ unsafe fn exec_vk_create_instance<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_PIPELINE_CACHE: u16 = 101;
+pub const CMD_VK_CREATE_PIPELINE_CACHE: u16 = 105;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_pipeline_cache(
     link: &mut dyn Link,
@@ -18491,7 +20059,7 @@ unsafe fn exec_vk_create_pipeline_cache<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_PIPELINE_LAYOUT: u16 = 102;
+pub const CMD_VK_CREATE_PIPELINE_LAYOUT: u16 = 106;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_pipeline_layout(
     link: &mut dyn Link,
@@ -18574,7 +20142,7 @@ unsafe fn exec_vk_create_pipeline_layout<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_PRIVATE_DATA_SLOT: u16 = 103;
+pub const CMD_VK_CREATE_PRIVATE_DATA_SLOT: u16 = 107;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_private_data_slot(
     link: &mut dyn Link,
@@ -18657,7 +20225,7 @@ unsafe fn exec_vk_create_private_data_slot<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_QUERY_POOL: u16 = 104;
+pub const CMD_VK_CREATE_QUERY_POOL: u16 = 108;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_query_pool(
     link: &mut dyn Link,
@@ -18738,7 +20306,7 @@ unsafe fn exec_vk_create_query_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_RENDER_PASS: u16 = 105;
+pub const CMD_VK_CREATE_RENDER_PASS: u16 = 109;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_render_pass(
     link: &mut dyn Link,
@@ -18819,7 +20387,7 @@ unsafe fn exec_vk_create_render_pass<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_RENDER_PASS2: u16 = 106;
+pub const CMD_VK_CREATE_RENDER_PASS2: u16 = 110;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_render_pass2(
     link: &mut dyn Link,
@@ -18900,7 +20468,7 @@ unsafe fn exec_vk_create_render_pass2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_SAMPLER: u16 = 107;
+pub const CMD_VK_CREATE_SAMPLER: u16 = 111;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_sampler(
     link: &mut dyn Link,
@@ -18976,7 +20544,7 @@ unsafe fn exec_vk_create_sampler<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_SAMPLER_YCBCR_CONVERSION: u16 = 108;
+pub const CMD_VK_CREATE_SAMPLER_YCBCR_CONVERSION: u16 = 112;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_sampler_ycbcr_conversion(
     link: &mut dyn Link,
@@ -19059,7 +20627,7 @@ unsafe fn exec_vk_create_sampler_ycbcr_conversion<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_SEMAPHORE: u16 = 109;
+pub const CMD_VK_CREATE_SEMAPHORE: u16 = 113;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_semaphore(
     link: &mut dyn Link,
@@ -19135,7 +20703,7 @@ unsafe fn exec_vk_create_semaphore<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_CREATE_SHADER_MODULE: u16 = 110;
+pub const CMD_VK_CREATE_SHADER_MODULE: u16 = 114;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_create_shader_module(
     link: &mut dyn Link,
@@ -19216,7 +20784,7 @@ unsafe fn exec_vk_create_shader_module<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_BUFFER: u16 = 111;
+pub const CMD_VK_DESTROY_BUFFER: u16 = 115;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_buffer(link: &mut dyn Link, device: vk::Device, buffer: vk::Buffer) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19258,7 +20826,7 @@ unsafe fn exec_vk_destroy_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_BUFFER_VIEW: u16 = 112;
+pub const CMD_VK_DESTROY_BUFFER_VIEW: u16 = 116;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_buffer_view(
     link: &mut dyn Link,
@@ -19305,7 +20873,7 @@ unsafe fn exec_vk_destroy_buffer_view<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_COMMAND_POOL: u16 = 113;
+pub const CMD_VK_DESTROY_COMMAND_POOL: u16 = 117;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_command_pool(
     link: &mut dyn Link,
@@ -19352,7 +20920,7 @@ unsafe fn exec_vk_destroy_command_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_DESCRIPTOR_POOL: u16 = 114;
+pub const CMD_VK_DESTROY_DESCRIPTOR_POOL: u16 = 118;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_descriptor_pool(
     link: &mut dyn Link,
@@ -19400,7 +20968,7 @@ unsafe fn exec_vk_destroy_descriptor_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_DESCRIPTOR_SET_LAYOUT: u16 = 115;
+pub const CMD_VK_DESTROY_DESCRIPTOR_SET_LAYOUT: u16 = 119;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_descriptor_set_layout(
     link: &mut dyn Link,
@@ -19452,7 +21020,7 @@ unsafe fn exec_vk_destroy_descriptor_set_layout<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_DESCRIPTOR_UPDATE_TEMPLATE: u16 = 116;
+pub const CMD_VK_DESTROY_DESCRIPTOR_UPDATE_TEMPLATE: u16 = 120;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_descriptor_update_template(
     link: &mut dyn Link,
@@ -19504,7 +21072,7 @@ unsafe fn exec_vk_destroy_descriptor_update_template<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_DEVICE: u16 = 117;
+pub const CMD_VK_DESTROY_DEVICE: u16 = 121;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_device(link: &mut dyn Link, device: vk::Device) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19543,7 +21111,7 @@ unsafe fn exec_vk_destroy_device<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_EVENT: u16 = 118;
+pub const CMD_VK_DESTROY_EVENT: u16 = 122;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_event(link: &mut dyn Link, device: vk::Device, event: vk::Event) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19585,7 +21153,7 @@ unsafe fn exec_vk_destroy_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_FENCE: u16 = 119;
+pub const CMD_VK_DESTROY_FENCE: u16 = 123;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_fence(link: &mut dyn Link, device: vk::Device, fence: vk::Fence) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19627,7 +21195,7 @@ unsafe fn exec_vk_destroy_fence<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_FRAMEBUFFER: u16 = 120;
+pub const CMD_VK_DESTROY_FRAMEBUFFER: u16 = 124;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_framebuffer(
     link: &mut dyn Link,
@@ -19674,7 +21242,7 @@ unsafe fn exec_vk_destroy_framebuffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_IMAGE: u16 = 121;
+pub const CMD_VK_DESTROY_IMAGE: u16 = 125;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_image(link: &mut dyn Link, device: vk::Device, image: vk::Image) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19716,7 +21284,7 @@ unsafe fn exec_vk_destroy_image<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_IMAGE_VIEW: u16 = 122;
+pub const CMD_VK_DESTROY_IMAGE_VIEW: u16 = 126;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_image_view(
     link: &mut dyn Link,
@@ -19763,7 +21331,7 @@ unsafe fn exec_vk_destroy_image_view<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_INSTANCE: u16 = 123;
+pub const CMD_VK_DESTROY_INSTANCE: u16 = 127;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_instance(link: &mut dyn Link, instance: vk::Instance) -> () {
     let r: Result<(), GuestError> = (|| {
@@ -19802,7 +21370,7 @@ unsafe fn exec_vk_destroy_instance<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_PIPELINE: u16 = 124;
+pub const CMD_VK_DESTROY_PIPELINE: u16 = 128;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_pipeline(
     link: &mut dyn Link,
@@ -19848,7 +21416,7 @@ unsafe fn exec_vk_destroy_pipeline<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_PIPELINE_CACHE: u16 = 125;
+pub const CMD_VK_DESTROY_PIPELINE_CACHE: u16 = 129;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_pipeline_cache(
     link: &mut dyn Link,
@@ -19896,7 +21464,7 @@ unsafe fn exec_vk_destroy_pipeline_cache<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_PIPELINE_LAYOUT: u16 = 126;
+pub const CMD_VK_DESTROY_PIPELINE_LAYOUT: u16 = 130;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_pipeline_layout(
     link: &mut dyn Link,
@@ -19944,7 +21512,7 @@ unsafe fn exec_vk_destroy_pipeline_layout<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_PRIVATE_DATA_SLOT: u16 = 127;
+pub const CMD_VK_DESTROY_PRIVATE_DATA_SLOT: u16 = 131;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_private_data_slot(
     link: &mut dyn Link,
@@ -19992,7 +21560,7 @@ unsafe fn exec_vk_destroy_private_data_slot<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_QUERY_POOL: u16 = 128;
+pub const CMD_VK_DESTROY_QUERY_POOL: u16 = 132;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_query_pool(
     link: &mut dyn Link,
@@ -20039,7 +21607,7 @@ unsafe fn exec_vk_destroy_query_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_RENDER_PASS: u16 = 129;
+pub const CMD_VK_DESTROY_RENDER_PASS: u16 = 133;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_render_pass(
     link: &mut dyn Link,
@@ -20086,7 +21654,7 @@ unsafe fn exec_vk_destroy_render_pass<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_SAMPLER: u16 = 130;
+pub const CMD_VK_DESTROY_SAMPLER: u16 = 134;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_sampler(
     link: &mut dyn Link,
@@ -20132,7 +21700,7 @@ unsafe fn exec_vk_destroy_sampler<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_SAMPLER_YCBCR_CONVERSION: u16 = 131;
+pub const CMD_VK_DESTROY_SAMPLER_YCBCR_CONVERSION: u16 = 135;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_sampler_ycbcr_conversion(
     link: &mut dyn Link,
@@ -20180,7 +21748,7 @@ unsafe fn exec_vk_destroy_sampler_ycbcr_conversion<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_SEMAPHORE: u16 = 132;
+pub const CMD_VK_DESTROY_SEMAPHORE: u16 = 136;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_semaphore(
     link: &mut dyn Link,
@@ -20227,7 +21795,7 @@ unsafe fn exec_vk_destroy_semaphore<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DESTROY_SHADER_MODULE: u16 = 133;
+pub const CMD_VK_DESTROY_SHADER_MODULE: u16 = 137;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_destroy_shader_module(
     link: &mut dyn Link,
@@ -20274,7 +21842,7 @@ unsafe fn exec_vk_destroy_shader_module<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_DEVICE_WAIT_IDLE: u16 = 134;
+pub const CMD_VK_DEVICE_WAIT_IDLE: u16 = 138;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_device_wait_idle(link: &mut dyn Link, device: vk::Device) -> vk::Result {
     let r: Result<vk::Result, GuestError> = (|| {
@@ -20315,7 +21883,7 @@ unsafe fn exec_vk_device_wait_idle<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_END_COMMAND_BUFFER: u16 = 135;
+pub const CMD_VK_END_COMMAND_BUFFER: u16 = 139;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_end_command_buffer(
     link: &mut dyn Link,
@@ -20361,7 +21929,7 @@ unsafe fn exec_vk_end_command_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_DEVICE_EXTENSION_PROPERTIES: u16 = 136;
+pub const CMD_VK_ENUMERATE_DEVICE_EXTENSION_PROPERTIES: u16 = 140;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_device_extension_properties(
     link: &mut dyn Link,
@@ -20463,7 +22031,7 @@ unsafe fn exec_vk_enumerate_device_extension_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_DEVICE_LAYER_PROPERTIES: u16 = 137;
+pub const CMD_VK_ENUMERATE_DEVICE_LAYER_PROPERTIES: u16 = 141;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_device_layer_properties(
     link: &mut dyn Link,
@@ -20552,7 +22120,7 @@ unsafe fn exec_vk_enumerate_device_layer_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_INSTANCE_EXTENSION_PROPERTIES: u16 = 138;
+pub const CMD_VK_ENUMERATE_INSTANCE_EXTENSION_PROPERTIES: u16 = 142;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_instance_extension_properties(
     link: &mut dyn Link,
@@ -20644,7 +22212,7 @@ unsafe fn exec_vk_enumerate_instance_extension_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_INSTANCE_LAYER_PROPERTIES: u16 = 139;
+pub const CMD_VK_ENUMERATE_INSTANCE_LAYER_PROPERTIES: u16 = 143;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_instance_layer_properties(
     link: &mut dyn Link,
@@ -20723,7 +22291,7 @@ unsafe fn exec_vk_enumerate_instance_layer_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_INSTANCE_VERSION: u16 = 140;
+pub const CMD_VK_ENUMERATE_INSTANCE_VERSION: u16 = 144;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_instance_version(
     link: &mut dyn Link,
@@ -20768,7 +22336,7 @@ unsafe fn exec_vk_enumerate_instance_version<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_ENUMERATE_PHYSICAL_DEVICES: u16 = 141;
+pub const CMD_VK_ENUMERATE_PHYSICAL_DEVICES: u16 = 145;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_enumerate_physical_devices(
     link: &mut dyn Link,
@@ -20874,7 +22442,7 @@ unsafe fn exec_vk_enumerate_physical_devices<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_FLUSH_MAPPED_MEMORY_RANGES: u16 = 142;
+pub const CMD_VK_FLUSH_MAPPED_MEMORY_RANGES: u16 = 146;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_flush_mapped_memory_ranges(
     link: &mut dyn Link,
@@ -20937,7 +22505,11 @@ unsafe fn exec_vk_flush_mapped_memory_ranges<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_0().flush_mapped_memory_ranges)(device, memory_range_count, p_memory_ranges)
+        (ctx.fp_v1_0().flush_mapped_memory_ranges)(
+            device,
+            memory_range_count,
+            p_memory_ranges as *const _,
+        )
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -20945,7 +22517,7 @@ unsafe fn exec_vk_flush_mapped_memory_ranges<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_FREE_COMMAND_BUFFERS: u16 = 143;
+pub const CMD_VK_FREE_COMMAND_BUFFERS: u16 = 147;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_free_command_buffers(
     link: &mut dyn Link,
@@ -21019,7 +22591,7 @@ unsafe fn exec_vk_free_command_buffers<H: Host>(
             device,
             command_pool,
             command_buffer_count,
-            p_command_buffers,
+            p_command_buffers as *const _,
         )
     };
     let ok = true;
@@ -21029,7 +22601,7 @@ unsafe fn exec_vk_free_command_buffers<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_FREE_DESCRIPTOR_SETS: u16 = 144;
+pub const CMD_VK_FREE_DESCRIPTOR_SETS: u16 = 148;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_free_descriptor_sets(
     link: &mut dyn Link,
@@ -21105,7 +22677,7 @@ unsafe fn exec_vk_free_descriptor_sets<H: Host>(
             device,
             descriptor_pool,
             descriptor_set_count,
-            p_descriptor_sets,
+            p_descriptor_sets as *const _,
         )
     };
     r.i32(res.as_raw());
@@ -21117,7 +22689,7 @@ unsafe fn exec_vk_free_descriptor_sets<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_FREE_MEMORY: u16 = 145;
+pub const CMD_VK_FREE_MEMORY: u16 = 149;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_free_memory(
     link: &mut dyn Link,
@@ -21161,7 +22733,65 @@ unsafe fn exec_vk_free_memory<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_BUFFER_MEMORY_REQUIREMENTS: u16 = 146;
+pub const CMD_VK_GET_BUFFER_DEVICE_ADDRESS: u16 = 150;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_get_buffer_device_address(
+    link: &mut dyn Link,
+    device: vk::Device,
+    p_info: *const vk::BufferDeviceAddressInfo,
+) -> u64 {
+    let r: Result<u64, GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_GET_BUFFER_DEVICE_ADDRESS);
+        e.u64(crate::hid_disp(device.as_raw()));
+        if p_info.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            enc_BufferDeviceAddressInfo(&mut e, &*p_info)?;
+        }
+        let rep = link.call(e.as_slice())?;
+        let mut d = Dec::new(&rep);
+        let res = d.u64()?;
+        let ok = true;
+        d.finish()?;
+        Ok(res)
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkGetBufferDeviceAddress", &err);
+            0
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_get_buffer_device_address<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let device_id = d.u64()?;
+    let device = <vk::Device as vk::Handle>::from_raw(s.resolve(device_id, "VkDevice")?);
+    let p_info: *const vk::BufferDeviceAddressInfo = if d.bool()? {
+        let p = a.alloc::<vk::BufferDeviceAddressInfo>(1);
+        dec_BufferDeviceAddressInfo(d, a, &*s, p)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    let res: u64 = {
+        let ctx = s.device(device_id)?;
+        (ctx.fp_v1_2().get_buffer_device_address)(device, p_info)
+    }
+    .into();
+    r.u64(res);
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_GET_BUFFER_MEMORY_REQUIREMENTS: u16 = 151;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_buffer_memory_requirements(
     link: &mut dyn Link,
@@ -21214,7 +22844,7 @@ unsafe fn exec_vk_get_buffer_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_BUFFER_MEMORY_REQUIREMENTS2: u16 = 147;
+pub const CMD_VK_GET_BUFFER_MEMORY_REQUIREMENTS2: u16 = 152;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_buffer_memory_requirements2(
     link: &mut dyn Link,
@@ -21297,7 +22927,65 @@ unsafe fn exec_vk_get_buffer_memory_requirements2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DESCRIPTOR_SET_LAYOUT_SUPPORT: u16 = 148;
+pub const CMD_VK_GET_BUFFER_OPAQUE_CAPTURE_ADDRESS: u16 = 153;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_get_buffer_opaque_capture_address(
+    link: &mut dyn Link,
+    device: vk::Device,
+    p_info: *const vk::BufferDeviceAddressInfo,
+) -> u64 {
+    let r: Result<u64, GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_GET_BUFFER_OPAQUE_CAPTURE_ADDRESS);
+        e.u64(crate::hid_disp(device.as_raw()));
+        if p_info.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            enc_BufferDeviceAddressInfo(&mut e, &*p_info)?;
+        }
+        let rep = link.call(e.as_slice())?;
+        let mut d = Dec::new(&rep);
+        let res = d.u64()?;
+        let ok = true;
+        d.finish()?;
+        Ok(res)
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkGetBufferOpaqueCaptureAddress", &err);
+            0
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_get_buffer_opaque_capture_address<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let device_id = d.u64()?;
+    let device = <vk::Device as vk::Handle>::from_raw(s.resolve(device_id, "VkDevice")?);
+    let p_info: *const vk::BufferDeviceAddressInfo = if d.bool()? {
+        let p = a.alloc::<vk::BufferDeviceAddressInfo>(1);
+        dec_BufferDeviceAddressInfo(d, a, &*s, p)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    let res: u64 = {
+        let ctx = s.device(device_id)?;
+        (ctx.fp_v1_2().get_buffer_opaque_capture_address)(device, p_info)
+    }
+    .into();
+    r.u64(res);
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_GET_DESCRIPTOR_SET_LAYOUT_SUPPORT: u16 = 154;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_descriptor_set_layout_support(
     link: &mut dyn Link,
@@ -21380,7 +23068,7 @@ unsafe fn exec_vk_get_descriptor_set_layout_support<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_BUFFER_MEMORY_REQUIREMENTS: u16 = 149;
+pub const CMD_VK_GET_DEVICE_BUFFER_MEMORY_REQUIREMENTS: u16 = 155;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_buffer_memory_requirements(
     link: &mut dyn Link,
@@ -21463,7 +23151,7 @@ unsafe fn exec_vk_get_device_buffer_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_GROUP_PEER_MEMORY_FEATURES: u16 = 150;
+pub const CMD_VK_GET_DEVICE_GROUP_PEER_MEMORY_FEATURES: u16 = 156;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_group_peer_memory_features(
     link: &mut dyn Link,
@@ -21530,7 +23218,7 @@ unsafe fn exec_vk_get_device_group_peer_memory_features<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_IMAGE_MEMORY_REQUIREMENTS: u16 = 151;
+pub const CMD_VK_GET_DEVICE_IMAGE_MEMORY_REQUIREMENTS: u16 = 157;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_image_memory_requirements(
     link: &mut dyn Link,
@@ -21613,7 +23301,7 @@ unsafe fn exec_vk_get_device_image_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_IMAGE_SPARSE_MEMORY_REQUIREMENTS: u16 = 152;
+pub const CMD_VK_GET_DEVICE_IMAGE_SPARSE_MEMORY_REQUIREMENTS: u16 = 158;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_image_sparse_memory_requirements(
     link: &mut dyn Link,
@@ -21725,7 +23413,7 @@ unsafe fn exec_vk_get_device_image_sparse_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_MEMORY_COMMITMENT: u16 = 153;
+pub const CMD_VK_GET_DEVICE_MEMORY_COMMITMENT: u16 = 159;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_memory_commitment(
     link: &mut dyn Link,
@@ -21783,7 +23471,65 @@ unsafe fn exec_vk_get_device_memory_commitment<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_QUEUE: u16 = 154;
+pub const CMD_VK_GET_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS: u16 = 160;
+#[cfg(feature = "guest")]
+pub unsafe fn vk_get_device_memory_opaque_capture_address(
+    link: &mut dyn Link,
+    device: vk::Device,
+    p_info: *const vk::DeviceMemoryOpaqueCaptureAddressInfo,
+) -> u64 {
+    let r: Result<u64, GuestError> = (|| {
+        let mut e = Enc::new();
+        e.u16(CMD_VK_GET_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS);
+        e.u64(crate::hid_disp(device.as_raw()));
+        if p_info.is_null() {
+            e.bool(false);
+        } else {
+            e.bool(true);
+            enc_DeviceMemoryOpaqueCaptureAddressInfo(&mut e, &*p_info)?;
+        }
+        let rep = link.call(e.as_slice())?;
+        let mut d = Dec::new(&rep);
+        let res = d.u64()?;
+        let ok = true;
+        d.finish()?;
+        Ok(res)
+    })();
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            link.failed("vkGetDeviceMemoryOpaqueCaptureAddress", &err);
+            0
+        }
+    }
+}
+#[cfg(feature = "host")]
+unsafe fn exec_vk_get_device_memory_opaque_capture_address<H: Host>(
+    s: &mut H,
+    d: &mut Dec,
+    a: &mut Arena,
+    r: &mut Enc,
+) -> Result<(), CodecError> {
+    let device_id = d.u64()?;
+    let device = <vk::Device as vk::Handle>::from_raw(s.resolve(device_id, "VkDevice")?);
+    let p_info: *const vk::DeviceMemoryOpaqueCaptureAddressInfo = if d.bool()? {
+        let p = a.alloc::<vk::DeviceMemoryOpaqueCaptureAddressInfo>(1);
+        dec_DeviceMemoryOpaqueCaptureAddressInfo(d, a, &*s, p)?;
+        p
+    } else {
+        std::ptr::null()
+    };
+    let res: u64 = {
+        let ctx = s.device(device_id)?;
+        (ctx.fp_v1_2().get_device_memory_opaque_capture_address)(device, p_info)
+    }
+    .into();
+    r.u64(res);
+    let ok = true;
+    Ok(())
+}
+#[cfg(feature = "guest")]
+pub const CMD_VK_GET_DEVICE_QUEUE: u16 = 161;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_queue(
     link: &mut dyn Link,
@@ -21850,7 +23596,7 @@ unsafe fn exec_vk_get_device_queue<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_DEVICE_QUEUE2: u16 = 155;
+pub const CMD_VK_GET_DEVICE_QUEUE2: u16 = 162;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_device_queue2(
     link: &mut dyn Link,
@@ -21923,7 +23669,7 @@ unsafe fn exec_vk_get_device_queue2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_EVENT_STATUS: u16 = 156;
+pub const CMD_VK_GET_EVENT_STATUS: u16 = 163;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_event_status(
     link: &mut dyn Link,
@@ -21971,7 +23717,7 @@ unsafe fn exec_vk_get_event_status<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_FENCE_STATUS: u16 = 157;
+pub const CMD_VK_GET_FENCE_STATUS: u16 = 164;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_fence_status(
     link: &mut dyn Link,
@@ -22019,7 +23765,7 @@ unsafe fn exec_vk_get_fence_status<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_IMAGE_MEMORY_REQUIREMENTS: u16 = 158;
+pub const CMD_VK_GET_IMAGE_MEMORY_REQUIREMENTS: u16 = 165;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_image_memory_requirements(
     link: &mut dyn Link,
@@ -22072,7 +23818,7 @@ unsafe fn exec_vk_get_image_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_IMAGE_MEMORY_REQUIREMENTS2: u16 = 159;
+pub const CMD_VK_GET_IMAGE_MEMORY_REQUIREMENTS2: u16 = 166;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_image_memory_requirements2(
     link: &mut dyn Link,
@@ -22155,7 +23901,7 @@ unsafe fn exec_vk_get_image_memory_requirements2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS: u16 = 160;
+pub const CMD_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS: u16 = 167;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_image_sparse_memory_requirements(
     link: &mut dyn Link,
@@ -22244,7 +23990,7 @@ unsafe fn exec_vk_get_image_sparse_memory_requirements<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS2: u16 = 161;
+pub const CMD_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS2: u16 = 168;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_image_sparse_memory_requirements2(
     link: &mut dyn Link,
@@ -22356,7 +24102,7 @@ unsafe fn exec_vk_get_image_sparse_memory_requirements2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_IMAGE_SUBRESOURCE_LAYOUT: u16 = 162;
+pub const CMD_VK_GET_IMAGE_SUBRESOURCE_LAYOUT: u16 = 169;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_image_subresource_layout(
     link: &mut dyn Link,
@@ -22423,7 +24169,7 @@ unsafe fn exec_vk_get_image_subresource_layout<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES: u16 = 163;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES: u16 = 170;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_external_buffer_properties(
     link: &mut dyn Link,
@@ -22512,7 +24258,7 @@ unsafe fn exec_vk_get_physical_device_external_buffer_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES: u16 = 164;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES: u16 = 171;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_external_fence_properties(
     link: &mut dyn Link,
@@ -22601,7 +24347,7 @@ unsafe fn exec_vk_get_physical_device_external_fence_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES: u16 = 165;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES: u16 = 172;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_external_semaphore_properties(
     link: &mut dyn Link,
@@ -22692,7 +24438,7 @@ unsafe fn exec_vk_get_physical_device_external_semaphore_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_FEATURES: u16 = 166;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_FEATURES: u16 = 173;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_features(
     link: &mut dyn Link,
@@ -22743,7 +24489,7 @@ unsafe fn exec_vk_get_physical_device_features<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_FEATURES2: u16 = 167;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_FEATURES2: u16 = 174;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_features2(
     link: &mut dyn Link,
@@ -22814,7 +24560,7 @@ unsafe fn exec_vk_get_physical_device_features2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES: u16 = 168;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES: u16 = 175;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_format_properties(
     link: &mut dyn Link,
@@ -22873,7 +24619,7 @@ unsafe fn exec_vk_get_physical_device_format_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES2: u16 = 169;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES2: u16 = 176;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_format_properties2(
     link: &mut dyn Link,
@@ -22952,7 +24698,7 @@ unsafe fn exec_vk_get_physical_device_format_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES: u16 = 170;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES: u16 = 177;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_image_format_properties(
     link: &mut dyn Link,
@@ -23034,7 +24780,7 @@ unsafe fn exec_vk_get_physical_device_image_format_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES2: u16 = 171;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES2: u16 = 178;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_image_format_properties2(
     link: &mut dyn Link,
@@ -23126,7 +24872,7 @@ unsafe fn exec_vk_get_physical_device_image_format_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u16 = 172;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u16 = 179;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_memory_properties(
     link: &mut dyn Link,
@@ -23177,7 +24923,7 @@ unsafe fn exec_vk_get_physical_device_memory_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2: u16 = 173;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES2: u16 = 180;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_memory_properties2(
     link: &mut dyn Link,
@@ -23248,7 +24994,7 @@ unsafe fn exec_vk_get_physical_device_memory_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_PROPERTIES: u16 = 174;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_PROPERTIES: u16 = 181;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_properties(
     link: &mut dyn Link,
@@ -23299,7 +25045,7 @@ unsafe fn exec_vk_get_physical_device_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_PROPERTIES2: u16 = 175;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_PROPERTIES2: u16 = 182;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_properties2(
     link: &mut dyn Link,
@@ -23370,7 +25116,7 @@ unsafe fn exec_vk_get_physical_device_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES: u16 = 176;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES: u16 = 183;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_queue_family_properties(
     link: &mut dyn Link,
@@ -23456,7 +25202,7 @@ unsafe fn exec_vk_get_physical_device_queue_family_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2: u16 = 177;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2: u16 = 184;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_queue_family_properties2(
     link: &mut dyn Link,
@@ -23555,7 +25301,7 @@ unsafe fn exec_vk_get_physical_device_queue_family_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES: u16 = 178;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES: u16 = 185;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_sparse_image_format_properties(
     link: &mut dyn Link,
@@ -23667,7 +25413,7 @@ unsafe fn exec_vk_get_physical_device_sparse_image_format_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES2: u16 = 179;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES2: u16 = 186;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_sparse_image_format_properties2(
     link: &mut dyn Link,
@@ -23781,7 +25527,7 @@ unsafe fn exec_vk_get_physical_device_sparse_image_format_properties2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PHYSICAL_DEVICE_TOOL_PROPERTIES: u16 = 180;
+pub const CMD_VK_GET_PHYSICAL_DEVICE_TOOL_PROPERTIES: u16 = 187;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_physical_device_tool_properties(
     link: &mut dyn Link,
@@ -23882,7 +25628,7 @@ unsafe fn exec_vk_get_physical_device_tool_properties<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_PRIVATE_DATA: u16 = 181;
+pub const CMD_VK_GET_PRIVATE_DATA: u16 = 188;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_private_data(
     link: &mut dyn Link,
@@ -23951,7 +25697,7 @@ unsafe fn exec_vk_get_private_data<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_RENDER_AREA_GRANULARITY: u16 = 182;
+pub const CMD_VK_GET_RENDER_AREA_GRANULARITY: u16 = 189;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_render_area_granularity(
     link: &mut dyn Link,
@@ -24005,7 +25751,7 @@ unsafe fn exec_vk_get_render_area_granularity<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_GET_SEMAPHORE_COUNTER_VALUE: u16 = 183;
+pub const CMD_VK_GET_SEMAPHORE_COUNTER_VALUE: u16 = 190;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_get_semaphore_counter_value(
     link: &mut dyn Link,
@@ -24062,7 +25808,7 @@ unsafe fn exec_vk_get_semaphore_counter_value<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_INVALIDATE_MAPPED_MEMORY_RANGES: u16 = 184;
+pub const CMD_VK_INVALIDATE_MAPPED_MEMORY_RANGES: u16 = 191;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_invalidate_mapped_memory_ranges(
     link: &mut dyn Link,
@@ -24125,7 +25871,11 @@ unsafe fn exec_vk_invalidate_mapped_memory_ranges<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_0().invalidate_mapped_memory_ranges)(device, memory_range_count, p_memory_ranges)
+        (ctx.fp_v1_0().invalidate_mapped_memory_ranges)(
+            device,
+            memory_range_count,
+            p_memory_ranges as *const _,
+        )
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24133,7 +25883,7 @@ unsafe fn exec_vk_invalidate_mapped_memory_ranges<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_MERGE_PIPELINE_CACHES: u16 = 185;
+pub const CMD_VK_MERGE_PIPELINE_CACHES: u16 = 192;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_merge_pipeline_caches(
     link: &mut dyn Link,
@@ -24204,7 +25954,12 @@ unsafe fn exec_vk_merge_pipeline_caches<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_0().merge_pipeline_caches)(device, dst_cache, src_cache_count, p_src_caches)
+        (ctx.fp_v1_0().merge_pipeline_caches)(
+            device,
+            dst_cache,
+            src_cache_count,
+            p_src_caches as *const _,
+        )
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24212,7 +25967,7 @@ unsafe fn exec_vk_merge_pipeline_caches<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_QUEUE_BIND_SPARSE: u16 = 186;
+pub const CMD_VK_QUEUE_BIND_SPARSE: u16 = 193;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_queue_bind_sparse(
     link: &mut dyn Link,
@@ -24280,7 +26035,7 @@ unsafe fn exec_vk_queue_bind_sparse<H: Host>(
     let fence = <vk::Fence as vk::Handle>::from_raw(s.resolve(fence_id, "VkFence")?);
     let res: vk::Result = {
         let ctx = s.device(queue_id)?;
-        (ctx.fp_v1_0().queue_bind_sparse)(queue, bind_info_count, p_bind_info, fence)
+        (ctx.fp_v1_0().queue_bind_sparse)(queue, bind_info_count, p_bind_info as *const _, fence)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24288,7 +26043,7 @@ unsafe fn exec_vk_queue_bind_sparse<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_QUEUE_SUBMIT: u16 = 187;
+pub const CMD_VK_QUEUE_SUBMIT: u16 = 194;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_queue_submit(
     link: &mut dyn Link,
@@ -24356,7 +26111,7 @@ unsafe fn exec_vk_queue_submit<H: Host>(
     let fence = <vk::Fence as vk::Handle>::from_raw(s.resolve(fence_id, "VkFence")?);
     let res: vk::Result = {
         let ctx = s.device(queue_id)?;
-        (ctx.fp_v1_0().queue_submit)(queue, submit_count, p_submits, fence)
+        (ctx.fp_v1_0().queue_submit)(queue, submit_count, p_submits as *const _, fence)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24364,7 +26119,7 @@ unsafe fn exec_vk_queue_submit<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_QUEUE_SUBMIT2: u16 = 188;
+pub const CMD_VK_QUEUE_SUBMIT2: u16 = 195;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_queue_submit2(
     link: &mut dyn Link,
@@ -24432,7 +26187,7 @@ unsafe fn exec_vk_queue_submit2<H: Host>(
     let fence = <vk::Fence as vk::Handle>::from_raw(s.resolve(fence_id, "VkFence")?);
     let res: vk::Result = {
         let ctx = s.device(queue_id)?;
-        (ctx.fp_v1_3().queue_submit2)(queue, submit_count, p_submits, fence)
+        (ctx.fp_v1_3().queue_submit2)(queue, submit_count, p_submits as *const _, fence)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24440,7 +26195,7 @@ unsafe fn exec_vk_queue_submit2<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_QUEUE_WAIT_IDLE: u16 = 189;
+pub const CMD_VK_QUEUE_WAIT_IDLE: u16 = 196;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_queue_wait_idle(link: &mut dyn Link, queue: vk::Queue) -> vk::Result {
     let r: Result<vk::Result, GuestError> = (|| {
@@ -24481,7 +26236,7 @@ unsafe fn exec_vk_queue_wait_idle<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_COMMAND_BUFFER: u16 = 190;
+pub const CMD_VK_RESET_COMMAND_BUFFER: u16 = 197;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_command_buffer(
     link: &mut dyn Link,
@@ -24531,7 +26286,7 @@ unsafe fn exec_vk_reset_command_buffer<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_COMMAND_POOL: u16 = 191;
+pub const CMD_VK_RESET_COMMAND_POOL: u16 = 198;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_command_pool(
     link: &mut dyn Link,
@@ -24584,7 +26339,7 @@ unsafe fn exec_vk_reset_command_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_DESCRIPTOR_POOL: u16 = 192;
+pub const CMD_VK_RESET_DESCRIPTOR_POOL: u16 = 199;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_descriptor_pool(
     link: &mut dyn Link,
@@ -24638,7 +26393,7 @@ unsafe fn exec_vk_reset_descriptor_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_EVENT: u16 = 193;
+pub const CMD_VK_RESET_EVENT: u16 = 200;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_event(
     link: &mut dyn Link,
@@ -24686,7 +26441,7 @@ unsafe fn exec_vk_reset_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_FENCES: u16 = 194;
+pub const CMD_VK_RESET_FENCES: u16 = 201;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_fences(
     link: &mut dyn Link,
@@ -24751,7 +26506,7 @@ unsafe fn exec_vk_reset_fences<H: Host>(
     };
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_0().reset_fences)(device, fence_count, p_fences)
+        (ctx.fp_v1_0().reset_fences)(device, fence_count, p_fences as *const _)
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -24759,7 +26514,7 @@ unsafe fn exec_vk_reset_fences<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_RESET_QUERY_POOL: u16 = 195;
+pub const CMD_VK_RESET_QUERY_POOL: u16 = 202;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_reset_query_pool(
     link: &mut dyn Link,
@@ -24813,7 +26568,7 @@ unsafe fn exec_vk_reset_query_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_SET_EVENT: u16 = 196;
+pub const CMD_VK_SET_EVENT: u16 = 203;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_set_event(
     link: &mut dyn Link,
@@ -24861,7 +26616,7 @@ unsafe fn exec_vk_set_event<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_SET_PRIVATE_DATA: u16 = 197;
+pub const CMD_VK_SET_PRIVATE_DATA: u16 = 204;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_set_private_data(
     link: &mut dyn Link,
@@ -24929,7 +26684,7 @@ unsafe fn exec_vk_set_private_data<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_SIGNAL_SEMAPHORE: u16 = 198;
+pub const CMD_VK_SIGNAL_SEMAPHORE: u16 = 205;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_signal_semaphore(
     link: &mut dyn Link,
@@ -24987,7 +26742,7 @@ unsafe fn exec_vk_signal_semaphore<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_TRIM_COMMAND_POOL: u16 = 199;
+pub const CMD_VK_TRIM_COMMAND_POOL: u16 = 206;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_trim_command_pool(
     link: &mut dyn Link,
@@ -25037,7 +26792,7 @@ unsafe fn exec_vk_trim_command_pool<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_UNMAP_MEMORY: u16 = 200;
+pub const CMD_VK_UNMAP_MEMORY: u16 = 207;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_unmap_memory(
     link: &mut dyn Link,
@@ -25083,7 +26838,7 @@ unsafe fn exec_vk_unmap_memory<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_UPDATE_DESCRIPTOR_SETS: u16 = 201;
+pub const CMD_VK_UPDATE_DESCRIPTOR_SETS: u16 = 208;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_update_descriptor_sets(
     link: &mut dyn Link,
@@ -25175,16 +26930,16 @@ unsafe fn exec_vk_update_descriptor_sets<H: Host>(
         (ctx.fp_v1_0().update_descriptor_sets)(
             device,
             descriptor_write_count,
-            p_descriptor_writes,
+            p_descriptor_writes as *const _,
             descriptor_copy_count,
-            p_descriptor_copies,
+            p_descriptor_copies as *const _,
         )
     };
     let ok = true;
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_WAIT_FOR_FENCES: u16 = 202;
+pub const CMD_VK_WAIT_FOR_FENCES: u16 = 209;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_wait_for_fences(
     link: &mut dyn Link,
@@ -25257,7 +27012,13 @@ unsafe fn exec_vk_wait_for_fences<H: Host>(
     d.pod_into(&mut timeout)?;
     let res: vk::Result = {
         let ctx = s.device(device_id)?;
-        (ctx.fp_v1_0().wait_for_fences)(device, fence_count, p_fences, wait_all, timeout)
+        (ctx.fp_v1_0().wait_for_fences)(
+            device,
+            fence_count,
+            p_fences as *const _,
+            wait_all,
+            timeout,
+        )
     };
     r.i32(res.as_raw());
     let ok = res.as_raw() >= 0;
@@ -25265,7 +27026,7 @@ unsafe fn exec_vk_wait_for_fences<H: Host>(
     Ok(())
 }
 #[cfg(feature = "guest")]
-pub const CMD_VK_WAIT_SEMAPHORES: u16 = 203;
+pub const CMD_VK_WAIT_SEMAPHORES: u16 = 210;
 #[cfg(feature = "guest")]
 pub unsafe fn vk_wait_semaphores(
     link: &mut dyn Link,
@@ -25347,203 +27108,210 @@ pub unsafe fn dispatch<H: Host>(s: &mut H, req: &[u8]) -> Result<Vec<u8>, CodecE
         10 => exec_vk_cmd_begin_render_pass2(s, &mut d, &mut a, &mut r)?,
         11 => exec_vk_cmd_begin_rendering(s, &mut d, &mut a, &mut r)?,
         12 => exec_vk_cmd_bind_descriptor_sets(s, &mut d, &mut a, &mut r)?,
-        13 => exec_vk_cmd_bind_index_buffer(s, &mut d, &mut a, &mut r)?,
-        14 => exec_vk_cmd_bind_pipeline(s, &mut d, &mut a, &mut r)?,
-        15 => exec_vk_cmd_bind_vertex_buffers(s, &mut d, &mut a, &mut r)?,
-        16 => exec_vk_cmd_bind_vertex_buffers2(s, &mut d, &mut a, &mut r)?,
-        17 => exec_vk_cmd_blit_image(s, &mut d, &mut a, &mut r)?,
-        18 => exec_vk_cmd_blit_image2(s, &mut d, &mut a, &mut r)?,
-        19 => exec_vk_cmd_clear_attachments(s, &mut d, &mut a, &mut r)?,
-        20 => exec_vk_cmd_clear_color_image(s, &mut d, &mut a, &mut r)?,
-        21 => exec_vk_cmd_clear_depth_stencil_image(s, &mut d, &mut a, &mut r)?,
-        22 => exec_vk_cmd_copy_buffer(s, &mut d, &mut a, &mut r)?,
-        23 => exec_vk_cmd_copy_buffer2(s, &mut d, &mut a, &mut r)?,
-        24 => exec_vk_cmd_copy_buffer_to_image(s, &mut d, &mut a, &mut r)?,
-        25 => exec_vk_cmd_copy_buffer_to_image2(s, &mut d, &mut a, &mut r)?,
-        26 => exec_vk_cmd_copy_image(s, &mut d, &mut a, &mut r)?,
-        27 => exec_vk_cmd_copy_image2(s, &mut d, &mut a, &mut r)?,
-        28 => exec_vk_cmd_copy_image_to_buffer(s, &mut d, &mut a, &mut r)?,
-        29 => exec_vk_cmd_copy_image_to_buffer2(s, &mut d, &mut a, &mut r)?,
-        30 => exec_vk_cmd_copy_query_pool_results(s, &mut d, &mut a, &mut r)?,
-        31 => exec_vk_cmd_dispatch(s, &mut d, &mut a, &mut r)?,
-        32 => exec_vk_cmd_dispatch_base(s, &mut d, &mut a, &mut r)?,
-        33 => exec_vk_cmd_dispatch_indirect(s, &mut d, &mut a, &mut r)?,
-        34 => exec_vk_cmd_draw(s, &mut d, &mut a, &mut r)?,
-        35 => exec_vk_cmd_draw_indexed(s, &mut d, &mut a, &mut r)?,
-        36 => exec_vk_cmd_draw_indexed_indirect(s, &mut d, &mut a, &mut r)?,
-        37 => exec_vk_cmd_draw_indexed_indirect_count(s, &mut d, &mut a, &mut r)?,
-        38 => exec_vk_cmd_draw_indirect(s, &mut d, &mut a, &mut r)?,
-        39 => exec_vk_cmd_draw_indirect_count(s, &mut d, &mut a, &mut r)?,
-        40 => exec_vk_cmd_end_query(s, &mut d, &mut a, &mut r)?,
-        41 => exec_vk_cmd_end_render_pass(s, &mut d, &mut a, &mut r)?,
-        42 => exec_vk_cmd_end_render_pass2(s, &mut d, &mut a, &mut r)?,
-        43 => exec_vk_cmd_end_rendering(s, &mut d, &mut a, &mut r)?,
-        44 => exec_vk_cmd_execute_commands(s, &mut d, &mut a, &mut r)?,
-        45 => exec_vk_cmd_fill_buffer(s, &mut d, &mut a, &mut r)?,
-        46 => exec_vk_cmd_next_subpass(s, &mut d, &mut a, &mut r)?,
-        47 => exec_vk_cmd_next_subpass2(s, &mut d, &mut a, &mut r)?,
-        48 => exec_vk_cmd_pipeline_barrier(s, &mut d, &mut a, &mut r)?,
-        49 => exec_vk_cmd_pipeline_barrier2(s, &mut d, &mut a, &mut r)?,
-        50 => exec_vk_cmd_push_constants(s, &mut d, &mut a, &mut r)?,
-        51 => exec_vk_cmd_reset_event(s, &mut d, &mut a, &mut r)?,
-        52 => exec_vk_cmd_reset_event2(s, &mut d, &mut a, &mut r)?,
-        53 => exec_vk_cmd_reset_query_pool(s, &mut d, &mut a, &mut r)?,
-        54 => exec_vk_cmd_resolve_image(s, &mut d, &mut a, &mut r)?,
-        55 => exec_vk_cmd_resolve_image2(s, &mut d, &mut a, &mut r)?,
-        56 => exec_vk_cmd_set_cull_mode(s, &mut d, &mut a, &mut r)?,
-        57 => exec_vk_cmd_set_depth_bias(s, &mut d, &mut a, &mut r)?,
-        58 => exec_vk_cmd_set_depth_bias_enable(s, &mut d, &mut a, &mut r)?,
-        59 => exec_vk_cmd_set_depth_bounds(s, &mut d, &mut a, &mut r)?,
-        60 => exec_vk_cmd_set_depth_bounds_test_enable(s, &mut d, &mut a, &mut r)?,
-        61 => exec_vk_cmd_set_depth_compare_op(s, &mut d, &mut a, &mut r)?,
-        62 => exec_vk_cmd_set_depth_test_enable(s, &mut d, &mut a, &mut r)?,
-        63 => exec_vk_cmd_set_depth_write_enable(s, &mut d, &mut a, &mut r)?,
-        64 => exec_vk_cmd_set_device_mask(s, &mut d, &mut a, &mut r)?,
-        65 => exec_vk_cmd_set_event(s, &mut d, &mut a, &mut r)?,
-        66 => exec_vk_cmd_set_event2(s, &mut d, &mut a, &mut r)?,
-        67 => exec_vk_cmd_set_front_face(s, &mut d, &mut a, &mut r)?,
-        68 => exec_vk_cmd_set_line_width(s, &mut d, &mut a, &mut r)?,
-        69 => exec_vk_cmd_set_primitive_restart_enable(s, &mut d, &mut a, &mut r)?,
-        70 => exec_vk_cmd_set_primitive_topology(s, &mut d, &mut a, &mut r)?,
-        71 => exec_vk_cmd_set_rasterizer_discard_enable(s, &mut d, &mut a, &mut r)?,
-        72 => exec_vk_cmd_set_scissor(s, &mut d, &mut a, &mut r)?,
-        73 => exec_vk_cmd_set_scissor_with_count(s, &mut d, &mut a, &mut r)?,
-        74 => exec_vk_cmd_set_stencil_compare_mask(s, &mut d, &mut a, &mut r)?,
-        75 => exec_vk_cmd_set_stencil_op(s, &mut d, &mut a, &mut r)?,
-        76 => exec_vk_cmd_set_stencil_reference(s, &mut d, &mut a, &mut r)?,
-        77 => exec_vk_cmd_set_stencil_test_enable(s, &mut d, &mut a, &mut r)?,
-        78 => exec_vk_cmd_set_stencil_write_mask(s, &mut d, &mut a, &mut r)?,
-        79 => exec_vk_cmd_set_viewport(s, &mut d, &mut a, &mut r)?,
-        80 => exec_vk_cmd_set_viewport_with_count(s, &mut d, &mut a, &mut r)?,
-        81 => exec_vk_cmd_update_buffer(s, &mut d, &mut a, &mut r)?,
-        82 => exec_vk_cmd_wait_events(s, &mut d, &mut a, &mut r)?,
-        83 => exec_vk_cmd_wait_events2(s, &mut d, &mut a, &mut r)?,
-        84 => exec_vk_cmd_write_timestamp(s, &mut d, &mut a, &mut r)?,
-        85 => exec_vk_cmd_write_timestamp2(s, &mut d, &mut a, &mut r)?,
-        86 => exec_vk_create_buffer(s, &mut d, &mut a, &mut r)?,
-        87 => exec_vk_create_buffer_view(s, &mut d, &mut a, &mut r)?,
-        88 => exec_vk_create_command_pool(s, &mut d, &mut a, &mut r)?,
-        89 => exec_vk_create_compute_pipelines(s, &mut d, &mut a, &mut r)?,
-        90 => exec_vk_create_descriptor_pool(s, &mut d, &mut a, &mut r)?,
-        91 => exec_vk_create_descriptor_set_layout(s, &mut d, &mut a, &mut r)?,
-        92 => exec_vk_create_descriptor_update_template(s, &mut d, &mut a, &mut r)?,
-        93 => exec_vk_create_device(s, &mut d, &mut a, &mut r)?,
-        94 => exec_vk_create_event(s, &mut d, &mut a, &mut r)?,
-        95 => exec_vk_create_fence(s, &mut d, &mut a, &mut r)?,
-        96 => exec_vk_create_framebuffer(s, &mut d, &mut a, &mut r)?,
-        97 => exec_vk_create_graphics_pipelines(s, &mut d, &mut a, &mut r)?,
-        98 => exec_vk_create_image(s, &mut d, &mut a, &mut r)?,
-        99 => exec_vk_create_image_view(s, &mut d, &mut a, &mut r)?,
-        100 => exec_vk_create_instance(s, &mut d, &mut a, &mut r)?,
-        101 => exec_vk_create_pipeline_cache(s, &mut d, &mut a, &mut r)?,
-        102 => exec_vk_create_pipeline_layout(s, &mut d, &mut a, &mut r)?,
-        103 => exec_vk_create_private_data_slot(s, &mut d, &mut a, &mut r)?,
-        104 => exec_vk_create_query_pool(s, &mut d, &mut a, &mut r)?,
-        105 => exec_vk_create_render_pass(s, &mut d, &mut a, &mut r)?,
-        106 => exec_vk_create_render_pass2(s, &mut d, &mut a, &mut r)?,
-        107 => exec_vk_create_sampler(s, &mut d, &mut a, &mut r)?,
-        108 => exec_vk_create_sampler_ycbcr_conversion(s, &mut d, &mut a, &mut r)?,
-        109 => exec_vk_create_semaphore(s, &mut d, &mut a, &mut r)?,
-        110 => exec_vk_create_shader_module(s, &mut d, &mut a, &mut r)?,
-        111 => exec_vk_destroy_buffer(s, &mut d, &mut a, &mut r)?,
-        112 => exec_vk_destroy_buffer_view(s, &mut d, &mut a, &mut r)?,
-        113 => exec_vk_destroy_command_pool(s, &mut d, &mut a, &mut r)?,
-        114 => exec_vk_destroy_descriptor_pool(s, &mut d, &mut a, &mut r)?,
-        115 => exec_vk_destroy_descriptor_set_layout(s, &mut d, &mut a, &mut r)?,
-        116 => exec_vk_destroy_descriptor_update_template(s, &mut d, &mut a, &mut r)?,
-        117 => exec_vk_destroy_device(s, &mut d, &mut a, &mut r)?,
-        118 => exec_vk_destroy_event(s, &mut d, &mut a, &mut r)?,
-        119 => exec_vk_destroy_fence(s, &mut d, &mut a, &mut r)?,
-        120 => exec_vk_destroy_framebuffer(s, &mut d, &mut a, &mut r)?,
-        121 => exec_vk_destroy_image(s, &mut d, &mut a, &mut r)?,
-        122 => exec_vk_destroy_image_view(s, &mut d, &mut a, &mut r)?,
-        123 => exec_vk_destroy_instance(s, &mut d, &mut a, &mut r)?,
-        124 => exec_vk_destroy_pipeline(s, &mut d, &mut a, &mut r)?,
-        125 => exec_vk_destroy_pipeline_cache(s, &mut d, &mut a, &mut r)?,
-        126 => exec_vk_destroy_pipeline_layout(s, &mut d, &mut a, &mut r)?,
-        127 => exec_vk_destroy_private_data_slot(s, &mut d, &mut a, &mut r)?,
-        128 => exec_vk_destroy_query_pool(s, &mut d, &mut a, &mut r)?,
-        129 => exec_vk_destroy_render_pass(s, &mut d, &mut a, &mut r)?,
-        130 => exec_vk_destroy_sampler(s, &mut d, &mut a, &mut r)?,
-        131 => exec_vk_destroy_sampler_ycbcr_conversion(s, &mut d, &mut a, &mut r)?,
-        132 => exec_vk_destroy_semaphore(s, &mut d, &mut a, &mut r)?,
-        133 => exec_vk_destroy_shader_module(s, &mut d, &mut a, &mut r)?,
-        134 => exec_vk_device_wait_idle(s, &mut d, &mut a, &mut r)?,
-        135 => exec_vk_end_command_buffer(s, &mut d, &mut a, &mut r)?,
-        136 => exec_vk_enumerate_device_extension_properties(s, &mut d, &mut a, &mut r)?,
-        137 => exec_vk_enumerate_device_layer_properties(s, &mut d, &mut a, &mut r)?,
-        138 => exec_vk_enumerate_instance_extension_properties(s, &mut d, &mut a, &mut r)?,
-        139 => exec_vk_enumerate_instance_layer_properties(s, &mut d, &mut a, &mut r)?,
-        140 => exec_vk_enumerate_instance_version(s, &mut d, &mut a, &mut r)?,
-        141 => exec_vk_enumerate_physical_devices(s, &mut d, &mut a, &mut r)?,
-        142 => exec_vk_flush_mapped_memory_ranges(s, &mut d, &mut a, &mut r)?,
-        143 => exec_vk_free_command_buffers(s, &mut d, &mut a, &mut r)?,
-        144 => exec_vk_free_descriptor_sets(s, &mut d, &mut a, &mut r)?,
-        145 => exec_vk_free_memory(s, &mut d, &mut a, &mut r)?,
-        146 => exec_vk_get_buffer_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        147 => exec_vk_get_buffer_memory_requirements2(s, &mut d, &mut a, &mut r)?,
-        148 => exec_vk_get_descriptor_set_layout_support(s, &mut d, &mut a, &mut r)?,
-        149 => exec_vk_get_device_buffer_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        150 => exec_vk_get_device_group_peer_memory_features(s, &mut d, &mut a, &mut r)?,
-        151 => exec_vk_get_device_image_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        152 => exec_vk_get_device_image_sparse_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        153 => exec_vk_get_device_memory_commitment(s, &mut d, &mut a, &mut r)?,
-        154 => exec_vk_get_device_queue(s, &mut d, &mut a, &mut r)?,
-        155 => exec_vk_get_device_queue2(s, &mut d, &mut a, &mut r)?,
-        156 => exec_vk_get_event_status(s, &mut d, &mut a, &mut r)?,
-        157 => exec_vk_get_fence_status(s, &mut d, &mut a, &mut r)?,
-        158 => exec_vk_get_image_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        159 => exec_vk_get_image_memory_requirements2(s, &mut d, &mut a, &mut r)?,
-        160 => exec_vk_get_image_sparse_memory_requirements(s, &mut d, &mut a, &mut r)?,
-        161 => exec_vk_get_image_sparse_memory_requirements2(s, &mut d, &mut a, &mut r)?,
-        162 => exec_vk_get_image_subresource_layout(s, &mut d, &mut a, &mut r)?,
-        163 => exec_vk_get_physical_device_external_buffer_properties(s, &mut d, &mut a, &mut r)?,
-        164 => exec_vk_get_physical_device_external_fence_properties(s, &mut d, &mut a, &mut r)?,
-        165 => {
+        13 => exec_vk_cmd_bind_descriptor_sets2(s, &mut d, &mut a, &mut r)?,
+        14 => exec_vk_cmd_bind_index_buffer(s, &mut d, &mut a, &mut r)?,
+        15 => exec_vk_cmd_bind_index_buffer2(s, &mut d, &mut a, &mut r)?,
+        16 => exec_vk_cmd_bind_pipeline(s, &mut d, &mut a, &mut r)?,
+        17 => exec_vk_cmd_bind_vertex_buffers(s, &mut d, &mut a, &mut r)?,
+        18 => exec_vk_cmd_bind_vertex_buffers2(s, &mut d, &mut a, &mut r)?,
+        19 => exec_vk_cmd_blit_image(s, &mut d, &mut a, &mut r)?,
+        20 => exec_vk_cmd_blit_image2(s, &mut d, &mut a, &mut r)?,
+        21 => exec_vk_cmd_clear_attachments(s, &mut d, &mut a, &mut r)?,
+        22 => exec_vk_cmd_clear_color_image(s, &mut d, &mut a, &mut r)?,
+        23 => exec_vk_cmd_clear_depth_stencil_image(s, &mut d, &mut a, &mut r)?,
+        24 => exec_vk_cmd_copy_buffer(s, &mut d, &mut a, &mut r)?,
+        25 => exec_vk_cmd_copy_buffer2(s, &mut d, &mut a, &mut r)?,
+        26 => exec_vk_cmd_copy_buffer_to_image(s, &mut d, &mut a, &mut r)?,
+        27 => exec_vk_cmd_copy_buffer_to_image2(s, &mut d, &mut a, &mut r)?,
+        28 => exec_vk_cmd_copy_image(s, &mut d, &mut a, &mut r)?,
+        29 => exec_vk_cmd_copy_image2(s, &mut d, &mut a, &mut r)?,
+        30 => exec_vk_cmd_copy_image_to_buffer(s, &mut d, &mut a, &mut r)?,
+        31 => exec_vk_cmd_copy_image_to_buffer2(s, &mut d, &mut a, &mut r)?,
+        32 => exec_vk_cmd_copy_query_pool_results(s, &mut d, &mut a, &mut r)?,
+        33 => exec_vk_cmd_dispatch(s, &mut d, &mut a, &mut r)?,
+        34 => exec_vk_cmd_dispatch_base(s, &mut d, &mut a, &mut r)?,
+        35 => exec_vk_cmd_dispatch_indirect(s, &mut d, &mut a, &mut r)?,
+        36 => exec_vk_cmd_draw(s, &mut d, &mut a, &mut r)?,
+        37 => exec_vk_cmd_draw_indexed(s, &mut d, &mut a, &mut r)?,
+        38 => exec_vk_cmd_draw_indexed_indirect(s, &mut d, &mut a, &mut r)?,
+        39 => exec_vk_cmd_draw_indexed_indirect_count(s, &mut d, &mut a, &mut r)?,
+        40 => exec_vk_cmd_draw_indirect(s, &mut d, &mut a, &mut r)?,
+        41 => exec_vk_cmd_draw_indirect_count(s, &mut d, &mut a, &mut r)?,
+        42 => exec_vk_cmd_end_query(s, &mut d, &mut a, &mut r)?,
+        43 => exec_vk_cmd_end_render_pass(s, &mut d, &mut a, &mut r)?,
+        44 => exec_vk_cmd_end_render_pass2(s, &mut d, &mut a, &mut r)?,
+        45 => exec_vk_cmd_end_rendering(s, &mut d, &mut a, &mut r)?,
+        46 => exec_vk_cmd_execute_commands(s, &mut d, &mut a, &mut r)?,
+        47 => exec_vk_cmd_fill_buffer(s, &mut d, &mut a, &mut r)?,
+        48 => exec_vk_cmd_next_subpass(s, &mut d, &mut a, &mut r)?,
+        49 => exec_vk_cmd_next_subpass2(s, &mut d, &mut a, &mut r)?,
+        50 => exec_vk_cmd_pipeline_barrier(s, &mut d, &mut a, &mut r)?,
+        51 => exec_vk_cmd_pipeline_barrier2(s, &mut d, &mut a, &mut r)?,
+        52 => exec_vk_cmd_push_constants(s, &mut d, &mut a, &mut r)?,
+        53 => exec_vk_cmd_push_constants2(s, &mut d, &mut a, &mut r)?,
+        54 => exec_vk_cmd_reset_event(s, &mut d, &mut a, &mut r)?,
+        55 => exec_vk_cmd_reset_event2(s, &mut d, &mut a, &mut r)?,
+        56 => exec_vk_cmd_reset_query_pool(s, &mut d, &mut a, &mut r)?,
+        57 => exec_vk_cmd_resolve_image(s, &mut d, &mut a, &mut r)?,
+        58 => exec_vk_cmd_resolve_image2(s, &mut d, &mut a, &mut r)?,
+        59 => exec_vk_cmd_set_blend_constants(s, &mut d, &mut a, &mut r)?,
+        60 => exec_vk_cmd_set_cull_mode(s, &mut d, &mut a, &mut r)?,
+        61 => exec_vk_cmd_set_depth_bias(s, &mut d, &mut a, &mut r)?,
+        62 => exec_vk_cmd_set_depth_bias_enable(s, &mut d, &mut a, &mut r)?,
+        63 => exec_vk_cmd_set_depth_bounds(s, &mut d, &mut a, &mut r)?,
+        64 => exec_vk_cmd_set_depth_bounds_test_enable(s, &mut d, &mut a, &mut r)?,
+        65 => exec_vk_cmd_set_depth_compare_op(s, &mut d, &mut a, &mut r)?,
+        66 => exec_vk_cmd_set_depth_test_enable(s, &mut d, &mut a, &mut r)?,
+        67 => exec_vk_cmd_set_depth_write_enable(s, &mut d, &mut a, &mut r)?,
+        68 => exec_vk_cmd_set_device_mask(s, &mut d, &mut a, &mut r)?,
+        69 => exec_vk_cmd_set_event(s, &mut d, &mut a, &mut r)?,
+        70 => exec_vk_cmd_set_event2(s, &mut d, &mut a, &mut r)?,
+        71 => exec_vk_cmd_set_front_face(s, &mut d, &mut a, &mut r)?,
+        72 => exec_vk_cmd_set_line_width(s, &mut d, &mut a, &mut r)?,
+        73 => exec_vk_cmd_set_primitive_restart_enable(s, &mut d, &mut a, &mut r)?,
+        74 => exec_vk_cmd_set_primitive_topology(s, &mut d, &mut a, &mut r)?,
+        75 => exec_vk_cmd_set_rasterizer_discard_enable(s, &mut d, &mut a, &mut r)?,
+        76 => exec_vk_cmd_set_scissor(s, &mut d, &mut a, &mut r)?,
+        77 => exec_vk_cmd_set_scissor_with_count(s, &mut d, &mut a, &mut r)?,
+        78 => exec_vk_cmd_set_stencil_compare_mask(s, &mut d, &mut a, &mut r)?,
+        79 => exec_vk_cmd_set_stencil_op(s, &mut d, &mut a, &mut r)?,
+        80 => exec_vk_cmd_set_stencil_reference(s, &mut d, &mut a, &mut r)?,
+        81 => exec_vk_cmd_set_stencil_test_enable(s, &mut d, &mut a, &mut r)?,
+        82 => exec_vk_cmd_set_stencil_write_mask(s, &mut d, &mut a, &mut r)?,
+        83 => exec_vk_cmd_set_viewport(s, &mut d, &mut a, &mut r)?,
+        84 => exec_vk_cmd_set_viewport_with_count(s, &mut d, &mut a, &mut r)?,
+        85 => exec_vk_cmd_update_buffer(s, &mut d, &mut a, &mut r)?,
+        86 => exec_vk_cmd_wait_events(s, &mut d, &mut a, &mut r)?,
+        87 => exec_vk_cmd_wait_events2(s, &mut d, &mut a, &mut r)?,
+        88 => exec_vk_cmd_write_timestamp(s, &mut d, &mut a, &mut r)?,
+        89 => exec_vk_cmd_write_timestamp2(s, &mut d, &mut a, &mut r)?,
+        90 => exec_vk_create_buffer(s, &mut d, &mut a, &mut r)?,
+        91 => exec_vk_create_buffer_view(s, &mut d, &mut a, &mut r)?,
+        92 => exec_vk_create_command_pool(s, &mut d, &mut a, &mut r)?,
+        93 => exec_vk_create_compute_pipelines(s, &mut d, &mut a, &mut r)?,
+        94 => exec_vk_create_descriptor_pool(s, &mut d, &mut a, &mut r)?,
+        95 => exec_vk_create_descriptor_set_layout(s, &mut d, &mut a, &mut r)?,
+        96 => exec_vk_create_descriptor_update_template(s, &mut d, &mut a, &mut r)?,
+        97 => exec_vk_create_device(s, &mut d, &mut a, &mut r)?,
+        98 => exec_vk_create_event(s, &mut d, &mut a, &mut r)?,
+        99 => exec_vk_create_fence(s, &mut d, &mut a, &mut r)?,
+        100 => exec_vk_create_framebuffer(s, &mut d, &mut a, &mut r)?,
+        101 => exec_vk_create_graphics_pipelines(s, &mut d, &mut a, &mut r)?,
+        102 => exec_vk_create_image(s, &mut d, &mut a, &mut r)?,
+        103 => exec_vk_create_image_view(s, &mut d, &mut a, &mut r)?,
+        104 => exec_vk_create_instance(s, &mut d, &mut a, &mut r)?,
+        105 => exec_vk_create_pipeline_cache(s, &mut d, &mut a, &mut r)?,
+        106 => exec_vk_create_pipeline_layout(s, &mut d, &mut a, &mut r)?,
+        107 => exec_vk_create_private_data_slot(s, &mut d, &mut a, &mut r)?,
+        108 => exec_vk_create_query_pool(s, &mut d, &mut a, &mut r)?,
+        109 => exec_vk_create_render_pass(s, &mut d, &mut a, &mut r)?,
+        110 => exec_vk_create_render_pass2(s, &mut d, &mut a, &mut r)?,
+        111 => exec_vk_create_sampler(s, &mut d, &mut a, &mut r)?,
+        112 => exec_vk_create_sampler_ycbcr_conversion(s, &mut d, &mut a, &mut r)?,
+        113 => exec_vk_create_semaphore(s, &mut d, &mut a, &mut r)?,
+        114 => exec_vk_create_shader_module(s, &mut d, &mut a, &mut r)?,
+        115 => exec_vk_destroy_buffer(s, &mut d, &mut a, &mut r)?,
+        116 => exec_vk_destroy_buffer_view(s, &mut d, &mut a, &mut r)?,
+        117 => exec_vk_destroy_command_pool(s, &mut d, &mut a, &mut r)?,
+        118 => exec_vk_destroy_descriptor_pool(s, &mut d, &mut a, &mut r)?,
+        119 => exec_vk_destroy_descriptor_set_layout(s, &mut d, &mut a, &mut r)?,
+        120 => exec_vk_destroy_descriptor_update_template(s, &mut d, &mut a, &mut r)?,
+        121 => exec_vk_destroy_device(s, &mut d, &mut a, &mut r)?,
+        122 => exec_vk_destroy_event(s, &mut d, &mut a, &mut r)?,
+        123 => exec_vk_destroy_fence(s, &mut d, &mut a, &mut r)?,
+        124 => exec_vk_destroy_framebuffer(s, &mut d, &mut a, &mut r)?,
+        125 => exec_vk_destroy_image(s, &mut d, &mut a, &mut r)?,
+        126 => exec_vk_destroy_image_view(s, &mut d, &mut a, &mut r)?,
+        127 => exec_vk_destroy_instance(s, &mut d, &mut a, &mut r)?,
+        128 => exec_vk_destroy_pipeline(s, &mut d, &mut a, &mut r)?,
+        129 => exec_vk_destroy_pipeline_cache(s, &mut d, &mut a, &mut r)?,
+        130 => exec_vk_destroy_pipeline_layout(s, &mut d, &mut a, &mut r)?,
+        131 => exec_vk_destroy_private_data_slot(s, &mut d, &mut a, &mut r)?,
+        132 => exec_vk_destroy_query_pool(s, &mut d, &mut a, &mut r)?,
+        133 => exec_vk_destroy_render_pass(s, &mut d, &mut a, &mut r)?,
+        134 => exec_vk_destroy_sampler(s, &mut d, &mut a, &mut r)?,
+        135 => exec_vk_destroy_sampler_ycbcr_conversion(s, &mut d, &mut a, &mut r)?,
+        136 => exec_vk_destroy_semaphore(s, &mut d, &mut a, &mut r)?,
+        137 => exec_vk_destroy_shader_module(s, &mut d, &mut a, &mut r)?,
+        138 => exec_vk_device_wait_idle(s, &mut d, &mut a, &mut r)?,
+        139 => exec_vk_end_command_buffer(s, &mut d, &mut a, &mut r)?,
+        140 => exec_vk_enumerate_device_extension_properties(s, &mut d, &mut a, &mut r)?,
+        141 => exec_vk_enumerate_device_layer_properties(s, &mut d, &mut a, &mut r)?,
+        142 => exec_vk_enumerate_instance_extension_properties(s, &mut d, &mut a, &mut r)?,
+        143 => exec_vk_enumerate_instance_layer_properties(s, &mut d, &mut a, &mut r)?,
+        144 => exec_vk_enumerate_instance_version(s, &mut d, &mut a, &mut r)?,
+        145 => exec_vk_enumerate_physical_devices(s, &mut d, &mut a, &mut r)?,
+        146 => exec_vk_flush_mapped_memory_ranges(s, &mut d, &mut a, &mut r)?,
+        147 => exec_vk_free_command_buffers(s, &mut d, &mut a, &mut r)?,
+        148 => exec_vk_free_descriptor_sets(s, &mut d, &mut a, &mut r)?,
+        149 => exec_vk_free_memory(s, &mut d, &mut a, &mut r)?,
+        150 => exec_vk_get_buffer_device_address(s, &mut d, &mut a, &mut r)?,
+        151 => exec_vk_get_buffer_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        152 => exec_vk_get_buffer_memory_requirements2(s, &mut d, &mut a, &mut r)?,
+        153 => exec_vk_get_buffer_opaque_capture_address(s, &mut d, &mut a, &mut r)?,
+        154 => exec_vk_get_descriptor_set_layout_support(s, &mut d, &mut a, &mut r)?,
+        155 => exec_vk_get_device_buffer_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        156 => exec_vk_get_device_group_peer_memory_features(s, &mut d, &mut a, &mut r)?,
+        157 => exec_vk_get_device_image_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        158 => exec_vk_get_device_image_sparse_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        159 => exec_vk_get_device_memory_commitment(s, &mut d, &mut a, &mut r)?,
+        160 => exec_vk_get_device_memory_opaque_capture_address(s, &mut d, &mut a, &mut r)?,
+        161 => exec_vk_get_device_queue(s, &mut d, &mut a, &mut r)?,
+        162 => exec_vk_get_device_queue2(s, &mut d, &mut a, &mut r)?,
+        163 => exec_vk_get_event_status(s, &mut d, &mut a, &mut r)?,
+        164 => exec_vk_get_fence_status(s, &mut d, &mut a, &mut r)?,
+        165 => exec_vk_get_image_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        166 => exec_vk_get_image_memory_requirements2(s, &mut d, &mut a, &mut r)?,
+        167 => exec_vk_get_image_sparse_memory_requirements(s, &mut d, &mut a, &mut r)?,
+        168 => exec_vk_get_image_sparse_memory_requirements2(s, &mut d, &mut a, &mut r)?,
+        169 => exec_vk_get_image_subresource_layout(s, &mut d, &mut a, &mut r)?,
+        170 => exec_vk_get_physical_device_external_buffer_properties(s, &mut d, &mut a, &mut r)?,
+        171 => exec_vk_get_physical_device_external_fence_properties(s, &mut d, &mut a, &mut r)?,
+        172 => {
             exec_vk_get_physical_device_external_semaphore_properties(s, &mut d, &mut a, &mut r)?
         }
-        166 => exec_vk_get_physical_device_features(s, &mut d, &mut a, &mut r)?,
-        167 => exec_vk_get_physical_device_features2(s, &mut d, &mut a, &mut r)?,
-        168 => exec_vk_get_physical_device_format_properties(s, &mut d, &mut a, &mut r)?,
-        169 => exec_vk_get_physical_device_format_properties2(s, &mut d, &mut a, &mut r)?,
-        170 => exec_vk_get_physical_device_image_format_properties(s, &mut d, &mut a, &mut r)?,
-        171 => exec_vk_get_physical_device_image_format_properties2(s, &mut d, &mut a, &mut r)?,
-        172 => exec_vk_get_physical_device_memory_properties(s, &mut d, &mut a, &mut r)?,
-        173 => exec_vk_get_physical_device_memory_properties2(s, &mut d, &mut a, &mut r)?,
-        174 => exec_vk_get_physical_device_properties(s, &mut d, &mut a, &mut r)?,
-        175 => exec_vk_get_physical_device_properties2(s, &mut d, &mut a, &mut r)?,
-        176 => exec_vk_get_physical_device_queue_family_properties(s, &mut d, &mut a, &mut r)?,
-        177 => exec_vk_get_physical_device_queue_family_properties2(s, &mut d, &mut a, &mut r)?,
-        178 => {
+        173 => exec_vk_get_physical_device_features(s, &mut d, &mut a, &mut r)?,
+        174 => exec_vk_get_physical_device_features2(s, &mut d, &mut a, &mut r)?,
+        175 => exec_vk_get_physical_device_format_properties(s, &mut d, &mut a, &mut r)?,
+        176 => exec_vk_get_physical_device_format_properties2(s, &mut d, &mut a, &mut r)?,
+        177 => exec_vk_get_physical_device_image_format_properties(s, &mut d, &mut a, &mut r)?,
+        178 => exec_vk_get_physical_device_image_format_properties2(s, &mut d, &mut a, &mut r)?,
+        179 => exec_vk_get_physical_device_memory_properties(s, &mut d, &mut a, &mut r)?,
+        180 => exec_vk_get_physical_device_memory_properties2(s, &mut d, &mut a, &mut r)?,
+        181 => exec_vk_get_physical_device_properties(s, &mut d, &mut a, &mut r)?,
+        182 => exec_vk_get_physical_device_properties2(s, &mut d, &mut a, &mut r)?,
+        183 => exec_vk_get_physical_device_queue_family_properties(s, &mut d, &mut a, &mut r)?,
+        184 => exec_vk_get_physical_device_queue_family_properties2(s, &mut d, &mut a, &mut r)?,
+        185 => {
             exec_vk_get_physical_device_sparse_image_format_properties(s, &mut d, &mut a, &mut r)?
         }
-        179 => {
+        186 => {
             exec_vk_get_physical_device_sparse_image_format_properties2(s, &mut d, &mut a, &mut r)?
         }
-        180 => exec_vk_get_physical_device_tool_properties(s, &mut d, &mut a, &mut r)?,
-        181 => exec_vk_get_private_data(s, &mut d, &mut a, &mut r)?,
-        182 => exec_vk_get_render_area_granularity(s, &mut d, &mut a, &mut r)?,
-        183 => exec_vk_get_semaphore_counter_value(s, &mut d, &mut a, &mut r)?,
-        184 => exec_vk_invalidate_mapped_memory_ranges(s, &mut d, &mut a, &mut r)?,
-        185 => exec_vk_merge_pipeline_caches(s, &mut d, &mut a, &mut r)?,
-        186 => exec_vk_queue_bind_sparse(s, &mut d, &mut a, &mut r)?,
-        187 => exec_vk_queue_submit(s, &mut d, &mut a, &mut r)?,
-        188 => exec_vk_queue_submit2(s, &mut d, &mut a, &mut r)?,
-        189 => exec_vk_queue_wait_idle(s, &mut d, &mut a, &mut r)?,
-        190 => exec_vk_reset_command_buffer(s, &mut d, &mut a, &mut r)?,
-        191 => exec_vk_reset_command_pool(s, &mut d, &mut a, &mut r)?,
-        192 => exec_vk_reset_descriptor_pool(s, &mut d, &mut a, &mut r)?,
-        193 => exec_vk_reset_event(s, &mut d, &mut a, &mut r)?,
-        194 => exec_vk_reset_fences(s, &mut d, &mut a, &mut r)?,
-        195 => exec_vk_reset_query_pool(s, &mut d, &mut a, &mut r)?,
-        196 => exec_vk_set_event(s, &mut d, &mut a, &mut r)?,
-        197 => exec_vk_set_private_data(s, &mut d, &mut a, &mut r)?,
-        198 => exec_vk_signal_semaphore(s, &mut d, &mut a, &mut r)?,
-        199 => exec_vk_trim_command_pool(s, &mut d, &mut a, &mut r)?,
-        200 => exec_vk_unmap_memory(s, &mut d, &mut a, &mut r)?,
-        201 => exec_vk_update_descriptor_sets(s, &mut d, &mut a, &mut r)?,
-        202 => exec_vk_wait_for_fences(s, &mut d, &mut a, &mut r)?,
-        203 => exec_vk_wait_semaphores(s, &mut d, &mut a, &mut r)?,
+        187 => exec_vk_get_physical_device_tool_properties(s, &mut d, &mut a, &mut r)?,
+        188 => exec_vk_get_private_data(s, &mut d, &mut a, &mut r)?,
+        189 => exec_vk_get_render_area_granularity(s, &mut d, &mut a, &mut r)?,
+        190 => exec_vk_get_semaphore_counter_value(s, &mut d, &mut a, &mut r)?,
+        191 => exec_vk_invalidate_mapped_memory_ranges(s, &mut d, &mut a, &mut r)?,
+        192 => exec_vk_merge_pipeline_caches(s, &mut d, &mut a, &mut r)?,
+        193 => exec_vk_queue_bind_sparse(s, &mut d, &mut a, &mut r)?,
+        194 => exec_vk_queue_submit(s, &mut d, &mut a, &mut r)?,
+        195 => exec_vk_queue_submit2(s, &mut d, &mut a, &mut r)?,
+        196 => exec_vk_queue_wait_idle(s, &mut d, &mut a, &mut r)?,
+        197 => exec_vk_reset_command_buffer(s, &mut d, &mut a, &mut r)?,
+        198 => exec_vk_reset_command_pool(s, &mut d, &mut a, &mut r)?,
+        199 => exec_vk_reset_descriptor_pool(s, &mut d, &mut a, &mut r)?,
+        200 => exec_vk_reset_event(s, &mut d, &mut a, &mut r)?,
+        201 => exec_vk_reset_fences(s, &mut d, &mut a, &mut r)?,
+        202 => exec_vk_reset_query_pool(s, &mut d, &mut a, &mut r)?,
+        203 => exec_vk_set_event(s, &mut d, &mut a, &mut r)?,
+        204 => exec_vk_set_private_data(s, &mut d, &mut a, &mut r)?,
+        205 => exec_vk_signal_semaphore(s, &mut d, &mut a, &mut r)?,
+        206 => exec_vk_trim_command_pool(s, &mut d, &mut a, &mut r)?,
+        207 => exec_vk_unmap_memory(s, &mut d, &mut a, &mut r)?,
+        208 => exec_vk_update_descriptor_sets(s, &mut d, &mut a, &mut r)?,
+        209 => exec_vk_wait_for_fences(s, &mut d, &mut a, &mut r)?,
+        210 => exec_vk_wait_semaphores(s, &mut d, &mut a, &mut r)?,
         t => return Err(CodecError::BadTag(t as u32)),
     }
     d.finish()?;

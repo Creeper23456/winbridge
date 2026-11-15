@@ -190,3 +190,164 @@ pub mod sys {
 }
 
 pub use sys::VirtioSerialStream;
+
+
+// ---------------------------------------------------------------------------------------------
+// Transport seam: serial port or shared-memory lanes (docs/PROTOCOL.md, "Shared-memory transport").
+// ---------------------------------------------------------------------------------------------
+
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use winbridge_proto::ring::{answer_offer, Endpoint, Routed, SerialSend};
+use winbridge_proto::{read_frame, write_frame, Message};
+
+/// The serial port shared by every sender; the lock is held per message only.
+pub type SharedSerial = Arc<Mutex<VirtioSerialStream>>;
+
+/// Writes one message to the serial port. Used for everything that must travel on serial
+/// (negotiation, kicks, the fallback path).
+pub fn serial_sender(serial: SharedSerial) -> SerialSend {
+    Arc::new(move |msg| {
+        if let Ok(mut port) = serial.lock() {
+            if let Err(e) = write_frame(&mut *port, &msg) {
+                warn!("Serial write failed: {}", e);
+            }
+        }
+    })
+}
+
+/// Outgoing path of the agent: a lane while shared memory is active (control or bulk by
+/// message class), the serial port otherwise. Cheap to clone; callable from any thread.
+#[derive(Clone)]
+pub struct Outgoing {
+    ep: Arc<Endpoint>,
+    serial: SharedSerial,
+}
+
+impl Outgoing {
+    /// `serial` is the port the endpoint's serial path writes to.
+    pub fn new(ep: Arc<Endpoint>, serial: SharedSerial) -> Self {
+        Self { ep, serial }
+    }
+
+    /// Sends `msg`. Blocks while the chosen lane's queue is full (back-pressure), like a serial
+    /// write blocks on a full port.
+    pub fn send(&self, msg: Message) -> Result<(), String> {
+        match self.ep.route(msg) {
+            Routed::Sent => Ok(()),
+            Routed::Serial(msg) => {
+                let mut port = self.serial.lock().map_err(|e| e.to_string())?;
+                write_frame(&mut *port, &msg).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+/// A random id of this agent process, announced in `StatusReply` so the host can tell an agent
+/// restart from a repeated status reply.
+pub fn instance_id() -> u32 {
+    let mut h = RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.finish() as u32
+}
+
+/// Reads the serial port on its own thread and feeds the endpoint: transport messages are
+/// handled there, everything else goes in order into the dispatch inbox. A read error is
+/// logged and retried after 500 ms, as the message loop did before. Never touches the lanes.
+pub fn spawn_serial_reader(mut port: VirtioSerialStream, ep: Arc<Endpoint>) {
+    let spawned = std::thread::Builder::new().name("winbridge-serial-rx".into()).spawn(move || loop {
+        // Reads use their own clone of the port handle: they must never hold the write lock.
+        match read_frame(&mut port) {
+            Ok(msg) => {
+                if let Some(negotiation) = ep.on_serial(msg) {
+                    on_negotiation(&ep, negotiation);
+                }
+            }
+            Err(e) => {
+                warn!("Stream read error: {}, reconnecting...", e);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        error!("Could not start the serial reader thread: {}", e);
+    }
+}
+
+/// One offer at a time: mapping the device must not overlap with the previous link's teardown.
+static OFFER_LOCK: Mutex<()> = Mutex::new(());
+
+/// `ShmOffer` arrived: map the device and attach on a separate thread (it can take a while and
+/// the serial reader must keep reading), then answer with `ShmReady`.
+fn on_negotiation(ep: &Arc<Endpoint>, msg: Message) {
+    let Message::ShmOffer { shm_version, region_len } = msg else {
+        warn!("Unexpected negotiation message from the host: {:?}", msg);
+        return;
+    };
+    let ep = ep.clone();
+    let spawned = std::thread::Builder::new().name("winbridge-shm-offer".into()).spawn({
+        let ep = ep.clone();
+        move || {
+            let _one_at_a_time = OFFER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reply = answer_offer(&ep, shm_version, region_len, map_bar);
+            if let Message::ShmReady { ok, reason } = &reply {
+                if *ok {
+                    info!("Shared memory active: control and bulk lanes in use");
+                } else {
+                    info!("Shared memory not used: {}", reason);
+                }
+            }
+            ep.send_serial(reply);
+        }
+    });
+    if let Err(e) = spawned {
+        warn!("Could not start the shared-memory thread: {}", e);
+        ep.send_serial(Message::ShmReady {
+            ok: false,
+            reason: format!("agent could not start a thread: {e}"),
+        });
+    }
+}
+
+/// The guest mapping of the ivshmem device (cached, hardened by `ivshmem::map_device`).
+#[cfg(windows)]
+fn map_bar(region_len: u64) -> Result<crate::ivshmem::Bar, String> {
+    crate::ivshmem::map_device(region_len).map_err(|e| e.to_string())
+}
+
+/// Without Windows there is no device: the offer is declined (only the unit tests run here).
+#[cfg(not(windows))]
+fn map_bar(_region_len: u64) -> Result<winbridge_shm::HeapMapping, String> {
+    Err("shared memory needs the Windows ivshmem driver".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winbridge_proto::ring::{Inbox, LinkConfig, REGION_LEN};
+    use winbridge_shm::HeapMapping;
+
+    fn endpoint(log: Arc<Mutex<Vec<Message>>>) -> Arc<Endpoint> {
+        Endpoint::new(Arc::new(move |m| log.lock().unwrap().push(m)), Inbox::new(8, 8, 4), LinkConfig::default())
+    }
+
+    #[test]
+    fn announcement_carries_the_capability() {
+        let text = winbridge_proto::caps::announce("Windows 11 x64", instance_id());
+        let caps = winbridge_proto::caps::parse(&text).unwrap();
+        assert_eq!(caps.shm_protocol, winbridge_proto::caps::SHM_PROTOCOL);
+    }
+
+    #[test]
+    fn offer_is_declined_cleanly_when_the_device_cannot_be_mapped() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ep = endpoint(log);
+        let reply = answer_offer(&ep, winbridge_shm::VERSION, REGION_LEN, |_| -> Result<HeapMapping, String> {
+            Err("no ivshmem device".to_string())
+        });
+        assert!(matches!(&reply, Message::ShmReady { ok: false, reason } if reason.contains("no ivshmem")));
+        assert!(!ep.is_active());
+    }
+}

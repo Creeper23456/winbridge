@@ -80,6 +80,7 @@ pub fn serve<T: MessageTransport + ?Sized>(writer: &mut T, session: &mut Session
             _ if !hello_done => return Err(fail(writer, "first frame must be HELLO".into())),
             OP_PING => writer.send(OP_PONG, 0, seq, &msg.payload)?,
             OP_VK_CALL => {
+                trace_call(&msg.payload, "call");
                 // SAFETY: `dispatch` validates every handle and length it decodes.
                 match unsafe { winbridge_gfx_vk::dispatch(session, &msg.payload) } {
                     Ok(reply) => writer.send(OP_VK_REPLY, 0, seq, &reply)?,
@@ -94,6 +95,7 @@ pub fn serve<T: MessageTransport + ?Sized>(writer: &mut T, session: &mut Session
                 for (kind, bytes) in items {
                     match kind {
                         BATCH_VK_CALL => {
+                            trace_call(bytes, "async");
                             // SAFETY: as for OP_VK_CALL; the reply of an asynchronous call is dropped.
                             if let Err(e) = unsafe { winbridge_gfx_vk::dispatch(session, bytes) } {
                                 return Err(fail(writer, format!("async vk call: {e}")));
@@ -177,6 +179,19 @@ pub fn serve<T: MessageTransport + ?Sized>(writer: &mut T, session: &mut Session
                 }
             }
             op => return Err(fail(writer, format!("unknown opcode {op:#06x}"))),
+        }
+    }
+}
+
+/// With `RUST_LOG=winbridge_gfx=trace`, names every command before it runs, so a host-side hang
+/// shows the command it stuck in.
+fn trace_call(payload: &[u8], how: &str) {
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let id = payload.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+        tracing::trace!("{how} {}", id.and_then(|i| winbridge_gfx_vk::COMMAND_NAMES.get(i)).copied().unwrap_or("?"));
+        // The newest request, for replaying a hang or a decode problem offline.
+        if let Some(path) = std::env::var_os("WINBRIDGE_GFX_DUMP_LAST") {
+            let _ = std::fs::write(path, payload);
         }
     }
 }

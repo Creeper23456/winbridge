@@ -38,6 +38,10 @@ pub struct Shadow {
     pub coherent: bool,
     /// Coherent and cached: GPU writes must be downloaded after waits.
     pub readback: bool,
+    /// Buffers bound to this allocation: buffer id -> (offset, length). A readback allocation
+    /// downloads only the ranges that submitted copy commands wrote; with no buffer bound
+    /// (linear images) it downloads everything after every wait.
+    pub bufs: HashMap<u64, (u64, u64)>,
 }
 
 pub struct State {
@@ -50,6 +54,15 @@ pub struct State {
     /// Property flags of the memory types as the application sees them.
     pub mem_types: Vec<ash::vk::MemoryPropertyFlags>,
     pub swapchains: HashMap<u64, wsi::Swapchain>,
+    /// Buffers created through the ICD: id -> size.
+    pub buffers: HashMap<u64, u64>,
+    /// Ranges (buffer id, offset, length; `u64::MAX` = to the end of the buffer) that the
+    /// commands recorded in a command buffer make the GPU write.
+    pub cmd_writes: HashMap<u64, Vec<(u64, u64, u64)>>,
+    /// The same for submitted work: downloaded by the next wait (if the memory is readback).
+    pub pending: Vec<(u64, u64, u64)>,
+    /// Entries of every descriptor update template (expanded into plain writes on update).
+    pub templates: HashMap<u64, Vec<ash::vk::DescriptorUpdateTemplateEntry>>,
 }
 
 
@@ -63,7 +76,7 @@ pub fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     }
     if g.is_none() {
         match HostLink::connect() {
-            Ok(link) => *g = Some(State { link, phys: HashMap::new(), queues: HashMap::new(), mems: HashMap::new(), mem_types: Vec::new(), swapchains: HashMap::new() }),
+            Ok(link) => *g = Some(State { link, phys: HashMap::new(), queues: HashMap::new(), mems: HashMap::new(), mem_types: Vec::new(), swapchains: HashMap::new(), buffers: HashMap::new(), cmd_writes: HashMap::new(), pending: Vec::new(), templates: HashMap::new() }),
             Err(e) => {
                 link::log(&format!("cannot reach the host: {e}"));
                 return None;
@@ -139,10 +152,25 @@ unsafe fn proc_addr(p_name: *const c_char, _instance: vk::Instance, device_only:
         b"vkGetSwapchainImagesKHR" => Some((wsi::vk_get_swapchain_images_khr as *const (), Level::Device)),
         b"vkAcquireNextImageKHR" => Some((wsi::vk_acquire_next_image_khr as *const (), Level::Device)),
         b"vkQueuePresentKHR" => Some((wsi::vk_queue_present_khr as *const (), Level::Device)),
+        b"vkGetPipelineCacheData" => Some((custom::vk_get_pipeline_cache_data as *const (), Level::Device)),
         b"vkMapMemory" => Some((custom::vk_map_memory as *const (), Level::Device)),
         b"vkUnmapMemory" => Some((custom::vk_unmap_memory as *const (), Level::Device)),
         b"vkFlushMappedMemoryRanges" => Some((custom::vk_flush_mapped_memory_ranges as *const (), Level::Device)),
+        b"vkCreateBuffer" => Some((custom::vk_create_buffer as *const (), Level::Device)),
+        b"vkDestroyBuffer" => Some((custom::vk_destroy_buffer as *const (), Level::Device)),
+        b"vkBindBufferMemory" => Some((custom::vk_bind_buffer_memory as *const (), Level::Device)),
+        b"vkCmdCopyBuffer" => Some((custom::vk_cmd_copy_buffer as *const (), Level::Device)),
+        b"vkCmdCopyBuffer2" => Some((custom::vk_cmd_copy_buffer2 as *const (), Level::Device)),
+        b"vkCmdCopyImageToBuffer" => Some((custom::vk_cmd_copy_image_to_buffer as *const (), Level::Device)),
+        b"vkCmdCopyImageToBuffer2" => Some((custom::vk_cmd_copy_image_to_buffer2 as *const (), Level::Device)),
+        b"vkCmdFillBuffer" => Some((custom::vk_cmd_fill_buffer as *const (), Level::Device)),
+        b"vkCmdUpdateBuffer" => Some((custom::vk_cmd_update_buffer as *const (), Level::Device)),
+        b"vkCmdCopyQueryPoolResults" => Some((custom::vk_cmd_copy_query_pool_results as *const (), Level::Device)),
+        b"vkBindBufferMemory2" => Some((custom::vk_bind_buffer_memory2 as *const (), Level::Device)),
         b"vkInvalidateMappedMemoryRanges" => Some((custom::vk_invalidate_mapped_memory_ranges as *const (), Level::Device)),
+        b"vkCreateDescriptorUpdateTemplate" => Some((custom::vk_create_descriptor_update_template as *const (), Level::Device)),
+        b"vkDestroyDescriptorUpdateTemplate" => Some((custom::vk_destroy_descriptor_update_template as *const (), Level::Device)),
+        b"vkUpdateDescriptorSetWithTemplate" => Some((custom::vk_update_descriptor_set_with_template as *const (), Level::Device)),
         _ => shims::lookup(name),
     };
     let Some((p, level)) = hit else {

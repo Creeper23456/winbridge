@@ -229,3 +229,46 @@ If a target exits with an NTSTATUS error code within 3 seconds of launch, that i
 - When an interactive session ends (WM_ENDSESSION), the agent removes all its redirects and clears the record. A non-interactive service session does not receive this message, so recovery then depends on `--uninstall-gfx` or the offline steps above.
 
 
+## 7. Shared memory (guest side)
+
+Guest half of the ivshmem transport (`crates/winbridge-agent/src/ivshmem.rs`, design in `docs/IVSHMEM-TRANSPORT.md`). Everything here is opt-in: nothing is installed or changed unless one of the flags below is given, and the agent never installs the driver by itself.
+
+### Flags (run from an elevated terminal; each prints what it does and exits non-zero on failure)
+| Flag | Effect |
+|---|---|
+| `--install-ivshmem <dir>` | Installs the driver package from `<dir>` (`ivshmem.inf`, `ivshmem.cat`, `ivshmem.sys`; the Red Hat/WHQL package, for example the one inside the Looking Glass installer). Add `--force` to continue when a device already has another driver. |
+| `--uninstall-ivshmem` | Removes our package (`pnputil /delete-driver oemNN.inf /uninstall`). The package is found by original INF name `ivshmem.inf` and provider Red Hat; no other driver is touched. Says so when nothing is installed. |
+| `--ivshmem-status` | Read-only report: device interfaces with size and DACL, PCI devices `PCI\VEN_1AF4&DEV_1110` with bound driver and problem code, and whether every device is restricted. Does not map anything. |
+| `--ivshmem-selftest [user]` | Build-VM test: harden, map every device, pattern, `Region::attach`, single-mapping rule, release on drop. With `user` (run as a standard user): every device must refuse to open. |
+| `--ivshmem-output <file>` | Also writes the output of the commands above to `<file>` (the agent is a GUI-subsystem program, so redirected stdout of a service or scheduled task would otherwise be lost). |
+
+### What `--install-ivshmem` checks, in order
+1. The three files exist.
+2. Signatures, before anything touches the system (`WinVerifyTrust`): the catalog has a valid embedded signature, and the INF and the `.sys` are listed in that catalog with matching hashes (SHA-256, then SHA-1). A changed byte in any of the three files is refused (tested). Revocation is not checked (the guest may be offline). The signer is not pinned: whoever Windows trusts for drivers is accepted; Windows itself checks the signature again when the package is staged.
+3. Existing devices: a device whose bound driver is not an inbox INF (`machine.inf`, "PCI standard RAM Controller") and not ours is a conflict; the install stops and prints the driver unless `--force` is given.
+4. If every device is already bound to our driver without a problem: prints `already installed` and does nothing (running it twice is safe). To upgrade, uninstall first.
+5. `pnputil /add-driver <inf> /install`; its output is printed (OEM code page decoded). Exit 0 and 3010 (reboot needed) are success.
+6. Verification: at least one device with hardware id `PCI\VEN_1AF4&DEV_1110` exists, is bound to the package, and reports problem code 0. Otherwise the command fails and says why (for example code 52 for a signature the kernel rejects).
+
+### Failure modes
+- Not elevated: `pnputil` and `SetKernelObjectSecurity` fail with access denied; reported with the Win32 error.
+- No device (not attached to the VM, or no driver): `map_device` returns `NoDevice`; `--install-ivshmem` stages the package and fails the verification step.
+- Another process already holds the mapping (the driver allows one per device): `AlreadyAttached`.
+- Anything unexpected in `REQUEST_MMAP` (null pointer, size different from `IOCTL_SIZE`) releases the mapping and fails.
+
+### Hardening, every boot
+The driver's default DACL on the device object lets Everyone map the whole BAR (measured, `experiments/shmprobe/RESULTS.md`). The elevated agent therefore calls `ivshmem::harden_devices()` before it maps anything: it sets a protected DACL (SYSTEM and Administrators only) with `SetKernelObjectSecurity` on every device interface and reads it back (`D:P(A;;FA;;;SY)(A;;FA;;;BA)`). A failed open, set or read-back is an error and the shared memory is treated as unavailable (the agent stays on virtio-serial). The change lives on the device object, so it is redone at every agent start (after a reboot or a device restart the default DACL is back); there is a window between boot and the agent start in which a local process could still open the device. `map_device` calls it itself, always before the mapping. The mapping is cached, requested once, and released (`RELEASE_MMAP`, handle closed) when the `Bar` is dropped.
+
+### Tested in the disposable build VM
+Two `ivshmem-plain` devices (256 MiB), driver installed through `--install-ivshmem` (first run installs, second prints `already installed`), `--ivshmem-selftest` as SYSTEM passes (including `Region::attach` on a header written by the host), a standard-user scheduled task gets `ACCESS_DENIED` on both devices after hardening while SYSTEM still maps, tampered `.sys`/`.inf`/`.cat` are refused, and `--uninstall-ivshmem` returns both devices to the inbox "PCI standard RAM Controller" state (no ivshmem interface). Not tested: the conflict refusal and `--force` (no second driver available), reboot-required outcomes, and Secure Boot or HVCI guests with this tool.
+
+
+## 8. Shared-memory transport
+
+Optional and off by default: control and bulk traffic (clipboard, drag-and-drop, status, file streams) can move from virtio-serial onto a QEMU `ivshmem-plain` region with prioritised lanes, so a large file never delays a `Ping`. Design, measurements and security model: `docs/IVSHMEM-TRANSPORT.md`; wire-level negotiation, lane mapping and capability gating: `docs/PROTOCOL.md` section 3; guest device and driver handling: section 7 above.
+
+- **Seam.** Both ends talk to a small endpoint (`winbridge_proto::ring::Endpoint`): every outgoing message is routed to the serial channel or, when a link is active, to the control or the bulk lane (`Message::is_bulk`); everything read from serial or from a lane ends in one dispatch queue (`Inbox`). The host's `SerialClient` and the agent's `channel.rs` / reader loop use it; with the transport off nothing but the serial path is ever taken and the bytes on the wire are unchanged.
+- **Threads.** One writer thread per direction (control strict priority, bulk credit window and minimum progress through the `winbridge-shm` scheduler), one reader thread per consumer lane, a small kick thread. The agent's serial reader is its own thread and never waits for a lane.
+- **Enabling.** Host: `shm = true` in `config.toml` or `--shm`; `WINBRIDGE_SHM=1` makes `scripts/launch-qemu-winbridge.sh` add the device and create `/dev/shm/winbridge-ctl`. Guest: the driver and `--install-ivshmem` (section 7). The host offers only to an agent that announced the capability in its `StatusReply`.
+- **Fallback.** No device, driver problem, a refused offer, a timeout, ring corruption or a stalled peer leave the session on virtio-serial; the next serial session negotiates again.
+- **Verification without a viewer.** `cargo test -p winbridge-proto --test shm_loopback` (in-memory region, real file-stream path), and `cargo run --release -p winbridge-host --example shme2e` plays the host role against an agent in a VM (no GTK).

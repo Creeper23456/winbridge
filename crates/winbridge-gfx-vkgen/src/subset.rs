@@ -34,6 +34,21 @@ pub const ICD_CUSTOM: &[&str] = &[
     "vkDestroyDevice",
 ];
 
+/// Vulkan 1.4 commands that DXVK reaches through `VK_KHR_maintenance5` / `VK_KHR_maintenance6`:
+/// (registry name, name the loader asks for). The host loads them with `vkGetDeviceProcAddr`
+/// under the KHR name because the pinned `ash` has no 1.4 function table.
+pub const PROMOTED_14: &[(&str, &str)] = &[
+    ("vkCmdBindIndexBuffer2", "vkCmdBindIndexBuffer2KHR"),
+    ("vkCmdBindDescriptorSets2", "vkCmdBindDescriptorSets2KHR"),
+    ("vkCmdPushConstants2", "vkCmdPushConstants2KHR"),
+];
+
+/// Core names of promoted structures and the `...KHR` names the pinned `ash` knows them by.
+pub const PROMOTED_TYPES: &[(&str, &str)] = &[
+    ("VkBindDescriptorSetsInfo", "VkBindDescriptorSetsInfoKHR"),
+    ("VkPushConstantsInfo", "VkPushConstantsInfoKHR"),
+];
+
 /// `pNext` structures that may travel in chains. A node whose `sType` is not here (or is not
 /// listed as extending the chain's root) is dropped by the guest serializer, as the Vulkan
 /// specification allows for structures an implementation does not recognise.
@@ -58,6 +73,22 @@ pub const CHAIN_ALLOW: &[&str] = &[
     "VkMemoryAllocateFlagsInfo",
     "VkMemoryDedicatedAllocateInfo",
     "VkMemoryPriorityAllocateInfoEXT",
+    "VkPipelineRenderingCreateInfo",
+    "VkShaderModuleCreateInfo",
+    "VkPipelineCreateFlags2CreateInfoKHR",
+    "VkPipelineRasterizationDepthClipStateCreateInfoEXT",
+    "VkPipelineRasterizationStateStreamCreateInfoEXT",
+    "VkSemaphoreTypeCreateInfo",
+    "VkTimelineSemaphoreSubmitInfo",
+    "VkSamplerCustomBorderColorCreateInfoEXT",
+    "VkSamplerReductionModeCreateInfo",
+    "VkImageViewUsageCreateInfo",
+    "VkImageFormatListCreateInfo",
+    "VkBufferUsageFlags2CreateInfoKHR",
+    "VkPhysicalDeviceCustomBorderColorFeaturesEXT",
+    "VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT",
+    "VkPhysicalDeviceExtendedDynamicState3FeaturesEXT",
+    "VkPhysicalDeviceMemoryPriorityFeaturesEXT",
 ];
 
 /// Commands that always wait for the host: their result or side effect is what the caller

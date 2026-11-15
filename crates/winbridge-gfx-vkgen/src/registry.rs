@@ -15,6 +15,8 @@ pub struct Decl {
     /// Number of `*` after the type.
     pub ptr: usize,
     pub is_array: bool,
+    /// Element count of a fixed-size array parameter (`float blendConstants[4]`).
+    pub fixed_len: Option<usize>,
     pub bitfield: bool,
     /// First element of `len=`, if any (a sibling name, a number, or `latexmath`).
     pub len: Option<String>,
@@ -115,6 +117,7 @@ fn parse_decl(n: Node) -> Decl {
         base_const: before.contains("const"),
         ptr: after_ty.matches('*').count(),
         is_array: after_name.contains('['),
+        fixed_len: after_name.split_once('[').and_then(|(_, t)| t.split_once(']')).and_then(|(n, _)| n.trim().parse().ok()),
         bitfield: after_name.contains(':'),
         len,
         null_terminated,
@@ -213,6 +216,14 @@ impl Registry {
                     .collect();
                 let core = core_of.get(&name).copied();
                 commands.insert(name, Command { ret, params, core });
+            }
+        }
+        // Vulkan 1.4 promoted types: the pinned ash only knows their `...KHR` names.
+        for c in commands.values_mut() {
+            for p in c.params.iter_mut() {
+                if let Some((_, khr)) = crate::subset::PROMOTED_TYPES.iter().find(|(core, _)| *core == p.ty) {
+                    p.ty = khr.to_string();
+                }
             }
         }
         let mut stype_aliases: HashMap<String, Vec<String>> = HashMap::new();

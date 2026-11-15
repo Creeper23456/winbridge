@@ -9,6 +9,7 @@ description = "Linux GTK4 viewer and bridge host for Windows 11 QEMU guest"
 
 [dependencies]
 winbridge-proto = { path = "../winbridge-proto", features = ["tokio"] }
+winbridge-shm = { path = "../winbridge-shm" }
 gtk4 = { version = "0.11", features = ["v4_18"] }
 gdk4-x11 = { version = "0.11", features = ["v4_18", "xlib"] }
 x11-dl = "2"
@@ -21,4 +22,6 @@ bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+memmap2 = "0.9"
+libc = "0.2"
 ksni = "0.3"

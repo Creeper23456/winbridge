@@ -21,6 +21,8 @@ mod pointer;
 mod qmp;
 mod router;
 mod serial_client;
+mod shm;
+mod shmfile;
 mod tray;
 mod transfer;
 mod ui;
@@ -90,6 +92,11 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     launch_script: Option<PathBuf>,
 
+    /// Use the shared-memory transport (ivshmem) for control and bulk traffic when the guest
+    /// supports it; the serial channel stays the handshake and fallback (config key: shm = true)
+    #[arg(long)]
+    shm: bool,
+
     /// Run in headless self-test mode without opening GTK window
     #[arg(long)]
     headless_test: bool,
@@ -118,6 +125,7 @@ fn main() -> glib::ExitCode {
         qmp_socket: cli.qmp_socket,
         usb_bus: cli.usb_bus,
         grab_keyboard: cli.grab_keyboard,
+        shm: cli.shm,
     };
     let config = match config::load(overrides) {
         Ok(config) => config,
@@ -153,7 +161,11 @@ fn main() -> glib::ExitCode {
 
         let serial_slot: Arc<OnceLock<SerialClientHandle>> = Arc::new(OnceLock::new());
         let serial_for_requests = serial_slot.clone();
-        let serial = SerialClient::start(config.socket.clone(), move |msg| match msg {
+        let shm_settings = shm::ShmSettings {
+            enabled: config.shm,
+            ..shm::ShmSettings::default()
+        };
+        let serial = SerialClient::start(config.socket.clone(), shm_settings, move |msg| match msg {
             Message::ResolutionResult {
                 width,
                 height,

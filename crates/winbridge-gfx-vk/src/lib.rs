@@ -96,6 +96,9 @@ pub trait Host: Resolver + Hooks {
     fn instance_of_physical(&self, id: u64) -> Result<std::sync::Arc<ash::Instance>, CodecError>;
     /// `id` names a device, or an object owned by one (queue, command buffer).
     fn device(&self, id: u64) -> Result<std::sync::Arc<ash::Device>, CodecError>;
+    /// The driver's address of a device-level command by name (for commands the pinned `ash`
+    /// has no function table for). `id` names a device or an object owned by one.
+    fn device_proc(&self, id: u64, name: &std::ffi::CStr) -> Result<ash::vk::PFN_vkVoidFunction, CodecError>;
     /// Records that guest id `id` is the driver handle `raw`, created below `parent`.
     fn register(&mut self, id: u64, raw: u64, kind: &'static str, parent: u64) -> Result<(), CodecError>;
     /// Forgets `id` after its destroy command ran.

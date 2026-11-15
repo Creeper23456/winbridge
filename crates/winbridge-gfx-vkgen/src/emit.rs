@@ -4,7 +4,7 @@
 //! (`shims`) to `winbridge-gfx-icd/src/shims.rs`.
 
 use crate::registry::{Decl, Registry, Struct, TyKind};
-use crate::subset::{CHAIN_ALLOW, FLUSH_AFTER, HOST_HOOKS, ICD_CUSTOM, SYNC};
+use crate::subset::{CHAIN_ALLOW, FLUSH_AFTER, HOST_HOOKS, ICD_CUSTOM, PROMOTED_14, SYNC};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -100,6 +100,8 @@ struct P {
 struct Cmd {
     name: String,
     ret_result: bool,
+    /// The command returns a `uint64_t` (a device address): sent back as a u64.
+    ret_u64: bool,
     params: Vec<P>,
     /// `fp_v1_N` table selector and how to find the dispatch object.
     core: (u32, u32),
@@ -141,7 +143,7 @@ pub fn survey(reg: &Registry) {
 /// Core 1.0-1.3 commands the generator can handle, sorted by name (the wire command id is the index).
 fn supported(reg: &Registry) -> Vec<String> {
     let names: Vec<String> =
-        reg.commands.iter().filter(|(_, c)| c.core.is_some_and(|v| v <= (1, 3))).map(|(n, _)| n.clone()).collect();
+        reg.commands.iter().filter(|(n, c)| c.core.is_some_and(|v| v <= (1, 3)) || PROMOTED_14.iter().any(|(p, _)| p == n)).map(|(n, _)| n.clone()).collect();
     let prev = std::panic::take_hook();
     if std::env::var_os("VKGEN_DEBUG").is_none() { std::panic::set_hook(Box::new(|_| {})); }
     let ok = names
@@ -197,9 +199,10 @@ impl<'a> Gen<'a> {
     fn classify(&mut self, names: &[&str]) {
         for &name in names {
             let c = self.reg.commands.get(name).unwrap_or_else(|| panic!("{name} not in registry"));
+            let ret_u64 = matches!(c.ret.as_str(), "VkDeviceAddress" | "uint64_t");
             let ret_result = match c.ret.as_str() {
                 "VkResult" => true,
-                "void" => false,
+                "void" | "VkDeviceAddress" | "uint64_t" => false,
                 r => panic!("{name}: return type {r} unsupported"),
             };
             // Pair every enumeration count with its array.
@@ -221,10 +224,14 @@ impl<'a> Gen<'a> {
             }
             let mut params = Vec::new();
             for (i, p) in c.params.iter().enumerate() {
-                if p.is_array {
-                    panic!("{name}: array parameter {} is not supported by the generator", p.name);
-                }
-                let kind = if let Some(k) = kinds[i].clone() {
+                let fixed = match (p.is_array, p.fixed_len, p.base_const, self.reg.kind(&p.ty)) {
+                    (true, Some(n), true, TyKind::Scalar) => Some((n, rs_scalar(&p.ty))),
+                    (true, ..) => panic!("{name}: array parameter {} is not supported by the generator", p.name),
+                    _ => None,
+                };
+                let kind = if let Some((n, t)) = fixed {
+                    PKind::ArrayIn { elem: Elem::Pod(t), count: n.to_string() }
+                } else if let Some(k) = kinds[i].clone() {
                     k
                 } else if p.ty == "VkAllocationCallbacks" {
                     PKind::Skip
@@ -262,10 +269,11 @@ impl<'a> Gen<'a> {
                         _ => panic!("{name}: parameter {} ({}, {} ptr) is not supported by the generator", p.name, p.ty, p.ptr),
                     }
                 };
-                params.push(P { rs: snake(&p.name), rs_ty: self.param_rs_ty(p), kind });
+                let rs_ty = if p.is_array { format!("*const {}", rs_scalar(&p.ty)) } else { self.param_rs_ty(p) };
+                params.push(P { rs: snake(&p.name), rs_ty, kind });
             }
             let core = c.core.unwrap_or_else(|| panic!("{name} is not a core command"));
-            self.cmds.push(Cmd { name: name.to_string(), ret_result, params, core });
+            self.cmds.push(Cmd { name: name.to_string(), ret_result, ret_u64, params, core });
         }
     }
 
@@ -572,6 +580,16 @@ impl<'a> Gen<'a> {
         }
     }
 
+    fn ret_ty(c: &Cmd) -> &'static str {
+        if c.ret_u64 {
+            "u64"
+        } else if c.ret_result {
+            "vk::Result"
+        } else {
+            "()"
+        }
+    }
+
     fn guest_sig(c: &Cmd) -> String {
         c.params.iter().filter(|p| !matches!(p.kind, PKind::Skip)).map(|p| format!("{}: {}", p.rs, p.rs_ty)).collect::<Vec<_>>().join(", ")
     }
@@ -579,7 +597,7 @@ impl<'a> Gen<'a> {
     fn emit_guest(&self, o: &mut String, c: &Cmd) {
         let up = snake(&c.name).to_uppercase();
         let fname = snake(&c.name);
-        let ret = if c.ret_result { "vk::Result" } else { "()" };
+        let ret = Self::ret_ty(c);
         let mut req = String::new();
         let mut rep = String::new();
         for p in &c.params {
@@ -646,11 +664,12 @@ impl<'a> Gen<'a> {
                 PKind::EnumArray { .. } | PKind::Skip => {}
             }
         }
-        let is_async = !SYNC.contains(&c.name.as_str())
+        let is_async = !c.ret_u64
+            && !SYNC.contains(&c.name.as_str())
             && !c.params.iter().any(|p| matches!(p.kind, PKind::OutStruct { .. } | PKind::OutScalar { .. } | PKind::EnumCount { .. }));
-        let res_decode = if c.ret_result { "let res = vk::Result::from_raw(d.i32()?); let ok = res.as_raw() >= 0;" } else { "let ok = true;" };
-        let ok_ret = if c.ret_result { "Ok(res)" } else { "Ok(())" };
-        let fail = if c.ret_result { "vk::Result::ERROR_DEVICE_LOST" } else { "()" };
+        let res_decode = if c.ret_u64 { "let res = d.u64()?; let ok = true;" } else if c.ret_result { "let res = vk::Result::from_raw(d.i32()?); let ok = res.as_raw() >= 0;" } else { "let ok = true;" };
+        let ok_ret = if c.ret_result || c.ret_u64 { "Ok(res)" } else { "Ok(())" };
+        let fail = if c.ret_u64 { "0" } else if c.ret_result { "vk::Result::ERROR_DEVICE_LOST" } else { "()" };
         writeln!(o, "#[cfg(feature = \"guest\")]\npub const CMD_{up}: u16 = {};", self.names.iter().position(|x| *x == c.name).unwrap_or(0)).unwrap();
         let flush = if FLUSH_AFTER.contains(&c.name.as_str()) { "link.flush()?;\n" } else { "" };
         let transport = if is_async {
@@ -733,7 +752,7 @@ impl<'a> Gen<'a> {
                         Elem::Struct { ty, plain: false } => format!("for i in 0..n {{ dec_{}(d, a, &*s, p.add(i))?; }}", &ty[2..]),
                     };
                     writeln!(dec, "let mut {n}_ids: Vec<u64> = Vec::new();\nlet {n}: *const {t} = if d.bool()? {{ let n = {cn} as usize; if n > MAX_ENUM {{ return Err(CodecError::BadLength(n as u64)); }} let p = a.alloc::<{t}>(n); {body} p }} else {{ std::ptr::null() }};").unwrap();
-                    args.push(n.clone());
+                    args.push(format!("{n} as *const _"));
                 }
                 PKind::OutScalar { ty } => {
                     writeln!(dec, "let mut {n}: {ty} = std::mem::zeroed();").unwrap();
@@ -748,7 +767,9 @@ impl<'a> Gen<'a> {
             }
         }
         let call = self.host_call(c, &args);
-        let (call_stmt, ok_stmt) = if c.ret_result {
+        let (call_stmt, ok_stmt) = if c.ret_u64 {
+            (format!("let res: u64 = {call}.into();\nr.u64(res);"), "let ok = true;")
+        } else if c.ret_result {
             (format!("let res: vk::Result = {call};\nr.i32(res.as_raw());\nlet ok = res.as_raw() >= 0;"), "")
         } else {
             (format!("{call};"), "let ok = true;")
@@ -827,6 +848,16 @@ impl<'a> Gen<'a> {
         }
         let field = snake(&c.name[2..]);
         let (maj, min) = c.core;
+        if let Some((_, khr)) = PROMOTED_14.iter().find(|(n, _)| *n == c.name) {
+            // No 1.4 function table in the pinned ash: load the KHR name from the driver.
+            let (p0, ty) = Self::first_handle(c).expect("promoted commands take a handle");
+            assert!(matches!(ty, "VkDevice" | "VkQueue" | "VkCommandBuffer"), "{}: promoted command on {ty}", c.name);
+            let id = format!("{}_id", p0.rs);
+            let pfn = format!("vk::PFN_{khr}");
+            return format!(
+                "{{ let f = s.device_proc({id}, c\"{khr}\")?.ok_or(CodecError::Invalid(\"driver lacks {khr}\"))?; let f: {pfn} = std::mem::transmute(f); f({a}) }}"
+            );
+        }
         match Self::first_handle(c) {
             None => format!("(s.entry().fp_v1_{min}().{field})({a})"),
             Some((p, ty)) => {
@@ -847,7 +878,7 @@ impl<'a> Gen<'a> {
         writeln!(o, "/// Host-side commands that the session implements itself instead of forwarding blindly.\n#[cfg(feature = \"host\")]\npub trait Hooks {{").unwrap();
         for c in &self.cmds {
             if HOST_HOOKS.contains(&c.name.as_str()) {
-                let ret = if c.ret_result { "vk::Result" } else { "()" };
+                let ret = Self::ret_ty(c);
                 let sig = Self::guest_sig(c);
                 writeln!(o, "unsafe fn {}(&mut self, {sig}) -> {ret};", snake(&c.name)).unwrap();
             }
@@ -896,8 +927,10 @@ impl<'a> Gen<'a> {
             }
             let full: Vec<String> = c.params.iter().map(|p| format!("{}: {}", p.rs, p.rs_ty)).collect();
             let call_args: Vec<&str> = c.params.iter().filter(|p| !matches!(p.kind, PKind::Skip)).map(|p| p.rs.as_str()).collect();
-            let ret = if c.ret_result { "vk::Result" } else { "()" };
-            let fail = if !c.ret_result {
+            let ret = Self::ret_ty(c);
+            let fail = if c.ret_u64 {
+                "0"
+            } else if !c.ret_result {
                 "()"
             } else if c.name == "vkCreateInstance" {
                 "vk::Result::ERROR_INCOMPATIBLE_DRIVER"
@@ -911,6 +944,9 @@ impl<'a> Gen<'a> {
         for c in &self.cmds {
             let target = if ICD_CUSTOM.contains(&c.name.as_str()) { format!("crate::custom::{}", snake(&c.name)) } else { format!("shim_{}", snake(&c.name)) };
             writeln!(o, "b\"{}\" => Some(({target} as *const (), Level::{})),", c.name, Self::level(c)).unwrap();
+            if let Some((_, khr)) = PROMOTED_14.iter().find(|(n, _)| *n == c.name) {
+                writeln!(o, "b\"{khr}\" => Some(({target} as *const (), Level::{})),", Self::level(c)).unwrap();
+            }
         }
         writeln!(o, "_ => None,\n}}\n}}").unwrap();
         o

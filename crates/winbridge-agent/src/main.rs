@@ -16,12 +16,14 @@ mod dragipc;
 mod dragout;
 mod dragprobe;
 mod gfx_inject;
+#[cfg(windows)]
+mod ivshmem;
 mod hostfiles;
 mod logging;
 mod medium;
 mod owner;
 
-use channel::VirtioSerialStream;
+use channel::{Outgoing, VirtioSerialStream};
 use clipboard::{write_bundle, ClipboardWatcher, GuestOffer};
 use hostfiles::HOST_FILES;
 use dnd::DndManager;
@@ -30,7 +32,8 @@ use std::sync::{Arc, Mutex};
 #[allow(unused_imports)]
 use tracing::{error, info, warn};
 use winbridge_proto::clip::{self, Assembler, ClipBundle, FilesEvent};
-use winbridge_proto::{read_frame, write_frame, Message};
+use winbridge_proto::ring::{Endpoint, Inbox, LinkConfig, Pop};
+use winbridge_proto::{caps, Message};
 
 fn main() {
     let has_console = logging::attach_console();
@@ -61,6 +64,11 @@ fn main() {
         println!("  --version, -V          Print version");
         println!("  --enable-gfx           Turn on the experimental GPU injection (writes IFEO entries; off by default)");
         println!("  --uninstall-gfx        Remove every IFEO entry the injection created, then exit");
+        println!("  --install-ivshmem <DIR>  Install the signed ivshmem driver package from DIR (add --force to replace another driver), then exit");
+        println!("  --uninstall-ivshmem    Remove the ivshmem driver package this tool installed, then exit");
+        println!("  --ivshmem-status       Print ivshmem devices, DACLs and bound drivers (read-only), then exit");
+        println!("  --ivshmem-selftest [user]  Shared-memory device self-test (build VM), then exit");
+        println!("  --ivshmem-output <FILE>  With the ivshmem commands: also write their output to FILE");
         println!("  --help, -h             Print help");
         return;
     }
@@ -97,6 +105,10 @@ fn main() {
         let out = args.get(i + 1).cloned().unwrap_or_else(|| "drag-selftest.txt".into());
         std::process::exit(dragout::self_test(&out, args[i] == "--self-test-drag-hold"));
     }
+    #[cfg(windows)]
+    if let Some(code) = ivshmem::run_cli(&args) {
+        std::process::exit(code);
+    }
     if args.iter().any(|a| a == "--uninstall-gfx") {
         gfx_inject::uninstall();
         return;
@@ -120,12 +132,30 @@ fn main() {
     let clip_staging = std::env::temp_dir().join("WinBridge").join("clip");
     let _ = std::fs::remove_dir_all(&clip_staging);
 
-    let mut reader = VirtioSerialStream::open(port_arg);
-    let stream_writer = Arc::new(Mutex::new(reader.clone()));
+    let reader = VirtioSerialStream::open(port_arg);
+    // One inbox for everything the host sends (serial port and lanes); one outgoing path that
+    // picks a lane when shared memory is active and the serial port otherwise.
+    let serial = Arc::new(Mutex::new(reader.clone()));
+    let inbox = Inbox::new(64, 1024, 4);
+    let endpoint = Endpoint::new(channel::serial_sender(serial.clone()), inbox.clone(), LinkConfig::default());
+    let out = Outgoing::new(endpoint.clone(), serial);
+    // Keepalives arriving on the control lane are answered by the lane's reader thread: a
+    // dispatch loop busy with a slow disk write must not delay the Pong.
+    endpoint.set_fast_path(Arc::new({
+        let out = out.clone();
+        move |msg| match msg {
+            Message::Ping { seq, timestamp_ms } => {
+                let _ = out.send(Message::Pong { seq: *seq, timestamp_ms: *timestamp_ms });
+                true
+            }
+            _ => false,
+        }
+    }));
+    let instance = channel::instance_id();
 
     // Clipboard changes are sent by a worker so a big copy never blocks the message loop.
     let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipBundle>();
-    let writer_for_clipboard = stream_writer.clone();
+    let out_for_clipboard = out.clone();
     let guest_offer = Arc::new(GuestOffer::default());
     let offer_for_clipboard = guest_offer.clone();
     std::thread::spawn(move || {
@@ -141,10 +171,7 @@ fn main() {
             );
             // Remembered before the offer goes out: the host's request can follow immediately.
             offer_for_clipboard.remember(clip_id, &bundle.files);
-            let result = bundle.send(clip_id, &mut |msg| {
-                let mut writer = writer_for_clipboard.lock().map_err(|e| e.to_string())?;
-                write_frame(&mut *writer, &msg).map_err(|e| e.to_string())
-            });
+            let result = bundle.send(clip_id, &mut |msg| out_for_clipboard.send(msg));
             match result {
                 Ok(warnings) => warnings.iter().for_each(|w| warn!("Clipboard: {}", w)),
                 Err(e) => warn!("Clipboard send failed: {}", e),
@@ -152,103 +179,91 @@ fn main() {
         }
     });
     // A guest application reads the content of host files: ask the host for them (once).
-    let writer_for_requests = stream_writer.clone();
+    let out_for_requests = out.clone();
     hostfiles::set_requester(move |clip_id| {
         info!("Paste of host files (clip {}): asking the host for them", clip_id);
-        let mut writer = writer_for_requests.lock().map_err(|e| e.to_string())?;
-        write_frame(&mut *writer, &Message::ClipFilesRequest { clip_id }).map_err(|e| e.to_string())
+        out_for_requests.send(Message::ClipFilesRequest { clip_id })
     });
     let _watcher = ClipboardWatcher::start(move |bundle| {
         let _ = clip_tx.send(bundle);
     });
 
-    let writer_for_drag = stream_writer.clone();
-    let dragout = DragOut::start(Arc::new(move |msg| {
-        let mut writer = writer_for_drag.lock().map_err(|e| e.to_string())?;
-        write_frame(&mut *writer, &msg).map_err(|e| e.to_string())
-    }));
+    let out_for_drag = out.clone();
+    let dragout = DragOut::start(Arc::new(move |msg| out_for_drag.send(msg)));
     let mut clips = Assembler::new(clip_staging.clone());
     let mut dnd = DndManager::new();
 
     // Notify host agent is alive with initial status
     {
         let (w, h, dpi) = display::get_display_info();
-        let initial_status = Message::StatusReply {
+        let _ = out.send(Message::StatusReply {
             current_width: w,
             current_height: h,
             current_dpi: dpi,
-            os_description: "Windows 11 x64".to_string(),
-        };
-        if let Ok(mut writer) = stream_writer.lock() {
-            let _ = write_frame(&mut *writer, &initial_status);
-        }
+            os_description: caps::announce("Windows 11 x64", instance),
+        });
     }
 
     info!("Agent ready, listening for host messages...");
 
     let mut file_milestone = 25u64;
+    // The serial port is read by its own thread: it never waits for this loop (except when the
+    // serial queue is full, as before) and never for the lanes.
+    channel::spawn_serial_reader(reader, endpoint.clone());
     loop {
-        // Read incoming frame from host
-        // Reads use their own clone of the port handle: they must never hold the write lock.
-        let msg = read_frame(&mut reader);
+        // Everything the host sent arrives in one inbox, from the serial port and, when shared
+        // memory is active, from the lane readers: control lane first, then serial, then bulk.
+        let msg = match inbox.pop(std::time::Duration::from_secs(1)) {
+            Pop::Msg(msg) => msg,
+            Pop::Timeout => continue,
+            Pop::Closed => break,
+        };
 
         match msg {
-            Ok(Message::Ping { seq, timestamp_ms }) => {
-                let reply = Message::Pong { seq, timestamp_ms };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
+            Message::Ping { seq, timestamp_ms } => {
+                let _ = out.send(Message::Pong { seq, timestamp_ms });
             }
 
-            Ok(Message::SetResolution { width, height }) => {
+            Message::SetResolution { width, height } => {
                 info!("Received SetResolution: {}x{}", width, height);
                 let (success, error) = match display::set_resolution(width, height) {
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e)),
                 };
-                let reply = Message::ResolutionResult {
+                let _ = out.send(Message::ResolutionResult {
                     width,
                     height,
                     success,
                     error,
-                };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
+                });
             }
 
-            Ok(Message::SetDpiScale { scale_percent }) => {
+            Message::SetDpiScale { scale_percent } => {
                 info!("Received SetDpiScale: {}%", scale_percent);
                 let (success, error) = match display::set_dpi_scale(scale_percent) {
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e)),
                 };
-                let reply = Message::DpiScaleResult {
+                let _ = out.send(Message::DpiScaleResult {
                     scale_percent,
                     success,
                     error,
-                };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
+                });
             }
 
-            Ok(Message::QueryStatus) => {
+            Message::QueryStatus => {
                 let (w, h, dpi) = display::get_display_info();
-                let reply = Message::StatusReply {
+                let _ = out.send(Message::StatusReply {
                     current_width: w,
                     current_height: h,
                     current_dpi: dpi,
-                    os_description: "Windows 11 x64".to_string(),
-                };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
+                    os_description: caps::announce("Windows 11 x64", instance),
+                });
             }
 
-            Ok(msg @ (Message::ClipboardOffer { clip_id, .. }
+            msg @ (Message::ClipboardOffer { clip_id, .. }
             | Message::ClipboardItem { clip_id, .. }
-            | Message::ClipFilesManifest { clip_id, .. })) => {
+            | Message::ClipFilesManifest { clip_id, .. }) => {
                 if matches!(msg, Message::ClipboardOffer { .. }) {
                     // The old snapshot (and its staged files) is being replaced.
                     HOST_FILES.invalidate();
@@ -276,10 +291,10 @@ fn main() {
                 }
             }
 
-            Ok(msg @ (Message::FilesBegin { stream_id, .. }
+            msg @ (Message::FilesBegin { stream_id, .. }
             | Message::FileEntry { stream_id, .. }
             | Message::FileChunk { stream_id, .. }
-            | Message::FilesEnd { stream_id, .. })) => match clips.handle_files(&msg) {
+            | Message::FilesEnd { stream_id, .. }) => match clips.handle_files(&msg) {
                 Ok(FilesEvent::Progress { done, total }) => {
                     if done == 0 {
                         info!("Receiving host files of clip {}: {} bytes", stream_id, total);
@@ -312,66 +327,49 @@ fn main() {
                 }
             },
 
-            Ok(Message::ClipFilesRequest { clip_id }) => {
-                spawn_files_sender(stream_writer.clone(), guest_offer.clone(), clip_id)
+            Message::ClipFilesRequest { clip_id } => {
+                spawn_files_sender(out.clone(), guest_offer.clone(), clip_id)
             }
 
-            Ok(Message::GuestDragProbe { x, y }) => dragout.probe(x, y),
-            Ok(Message::GuestDragFetch { drag_id }) => dragout.fetch(drag_id),
-            Ok(Message::GuestDragEnd { .. }) => dragout.end(),
+            Message::GuestDragProbe { x, y } => dragout.probe(x, y),
+            Message::GuestDragFetch { drag_id } => dragout.fetch(drag_id),
+            Message::GuestDragEnd { .. } => dragout.end(),
 
-            Ok(Message::DropBegin { transfer_id, x, y, file_count }) => {
+            Message::DropBegin { transfer_id, x, y, file_count } => {
                 if let Err(e) = dnd.begin_drop(transfer_id, x, y, file_count) {
                     warn!("Could not begin drop operation: {}", e);
-                    let reply = Message::DropResult { success: false, message: e };
-                    if let Ok(mut writer) = stream_writer.lock() {
-                        let _ = write_frame(&mut *writer, &reply);
-                    }
+                    let _ = out.send(Message::DropResult { success: false, message: e });
                 }
             }
 
-            Ok(Message::DropFileStart { transfer_id, operation_id, filename, total_bytes }) => {
+            Message::DropFileStart { transfer_id, operation_id, filename, total_bytes } => {
                 if let Err(e) = dnd.start_file(transfer_id, &filename, total_bytes, operation_id) {
                     warn!("Could not start dropped file: {}", e);
-                    let reply = Message::DropResult { success: false, message: e };
-                    if let Ok(mut writer) = stream_writer.lock() {
-                        let _ = write_frame(&mut *writer, &reply);
-                    }
+                    let _ = out.send(Message::DropResult { success: false, message: e });
                 }
             }
 
-            Ok(Message::DropFileChunk { transfer_id, offset, data }) => {
+            Message::DropFileChunk { transfer_id, offset, data } => {
                 if let Err(e) = dnd.write_chunk(transfer_id, offset, &data) {
                     warn!("Dropped file chunk failed: {}", e);
                 }
             }
 
-            Ok(Message::DropFileFinish { transfer_id, success, error: _ }) => {
+            Message::DropFileFinish { transfer_id, success, error: _ } => {
                 let (ok, msg) = match dnd.finish_file(transfer_id, success) {
                     Ok(Some(message)) => (true, message),
                     Ok(None) => (true, "File received; waiting for remaining files".into()),
                     Err(e) => (false, e),
                 };
-                let reply = Message::DropResult { success: ok, message: msg };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
+                let _ = out.send(Message::DropResult { success: ok, message: msg });
             }
 
-            Ok(Message::DropText { text, x, y }) => {
+            Message::DropText { text, x, y } => {
                 let (ok, msg) = match dnd.handle_drop_text(&text, x, y) {
                     Ok(path) => (true, format!("Text saved to {}", path)),
                     Err(e) => (false, e),
                 };
-                let reply = Message::DropResult { success: ok, message: msg };
-                if let Ok(mut writer) = stream_writer.lock() {
-                    let _ = write_frame(&mut *writer, &reply);
-                }
-            }
-
-            Err(e) => {
-                warn!("Stream read error: {}, reconnecting...", e);
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = out.send(Message::DropResult { success: ok, message: msg });
             }
 
             _ => {}
@@ -380,9 +378,9 @@ fn main() {
 }
 
 /// Answers a `ClipFilesRequest`: streams the files of the newest guest copy to the host on a
-/// worker thread, so the message loop (Pong, status, drops) keeps running. The writer lock is
-/// taken per message only.
-fn spawn_files_sender(writer: Arc<Mutex<VirtioSerialStream>>, offer: Arc<GuestOffer>, clip_id: u32) {
+/// worker thread, so the message loop (Pong, status, drops) keeps running. Messages are handed
+/// to the transport one by one (a lane when shared memory is active, else the serial port).
+fn spawn_files_sender(out: Outgoing, offer: Arc<GuestOffer>, clip_id: u32) {
     let paths = match offer.claim(clip_id) {
         Ok(paths) => paths,
         Err(why) => {
@@ -395,10 +393,7 @@ fn spawn_files_sender(writer: Arc<Mutex<VirtioSerialStream>>, offer: Arc<GuestOf
         move || {
             info!("Host pastes: streaming {} copied path(s) of clip {}", paths.len(), clip_id);
             let started = std::time::Instant::now();
-            let mut send = |msg: Message| {
-                let mut writer = writer.lock().map_err(|e| e.to_string())?;
-                write_frame(&mut *writer, &msg).map_err(|e| e.to_string())
-            };
+            let mut send = |msg: Message| out.send(msg);
             let mut next_milestone = 25u64;
             let result = clip::send_files(clip_id, &paths, &mut send, |sent, total| {
                 if total > 0 && sent * 100 / total >= next_milestone {

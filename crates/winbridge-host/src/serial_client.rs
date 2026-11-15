@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -13,16 +13,61 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use winbridge_proto::async_io::{read_frame_async, write_frame_async};
 use winbridge_proto::clip::{self, ClipBundle};
+use winbridge_proto::ring::{Endpoint, Inbox, LinkConfig, Pop, Routed, REGION_LEN};
 use winbridge_proto::Message;
 
+use crate::shm::{HostShm, ShmSettings, OFFER_TIMEOUT};
+use crate::shmfile::{self, FileMapping};
 use crate::transfer::{self, Direction, Transfer};
 
 const DROP_CHUNK_SIZE: usize = 256 * 1024; // 256 KB file streaming chunks
 
+/// Outgoing path of the handle: a lane when shared memory is active, else the serial queue.
+/// With shared memory off every message takes the serial queue, as before.
+#[derive(Clone)]
+struct Tx {
+    serial: mpsc::Sender<Message>,
+    ep: Arc<Endpoint>,
+}
+
+impl Tx {
+    /// Queues without waiting; fails when the queue is full.
+    fn try_send(&self, msg: Message) -> Result<(), String> {
+        match self.ep.try_route(msg) {
+            Ok(Routed::Sent) => Ok(()),
+            Ok(Routed::Serial(m)) => self.serial.try_send(m).map_err(|e| e.to_string()),
+            Err(_) => Err("shared-memory queue full".to_string()),
+        }
+    }
+
+    /// Waits for room (call from a blocking thread, never from async code).
+    fn blocking_send(&self, msg: Message) -> Result<(), String> {
+        match self.ep.route(msg) {
+            Routed::Sent => Ok(()),
+            Routed::Serial(m) => self.serial.blocking_send(m).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Waits for room without blocking the runtime thread.
+    async fn send(&self, msg: Message) -> Result<(), String> {
+        let mut msg = msg;
+        loop {
+            match self.ep.try_route(msg) {
+                Ok(Routed::Sent) => return Ok(()),
+                Ok(Routed::Serial(m)) => return self.serial.send(m).await.map_err(|e| e.to_string()),
+                Err(back) => {
+                    msg = back;
+                    tokio::time::sleep(Duration::from_micros(250)).await;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct SerialClientHandle {
-    tx: mpsc::Sender<Message>,
+    tx: Tx,
     connected: Arc<AtomicBool>,
     /// [`now_ms`] of the last frame received from the agent (any message counts as an answer).
     last_rx_ms: Arc<AtomicU64>,
@@ -252,23 +297,117 @@ impl SerialClientHandle {
 
 pub struct SerialClient;
 
+/// Queues `m` on the serial path from an async task or a plain thread; never blocks the runtime.
+fn serial_send(tx: &mpsc::Sender<Message>, m: Message) {
+    match tx.try_send(m) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(m)) => {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(m).await;
+                });
+            } else {
+                let _ = tx.blocking_send(m);
+            }
+        }
+    }
+}
+
+type SharedShm = Arc<Mutex<HostShm<FileMapping>>>;
+
+fn lock_shm(shm: &SharedShm) -> std::sync::MutexGuard<'_, HostShm<FileMapping>> {
+    shm.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One message from the serial channel: negotiation first, then the dispatch queue. Transport
+/// messages (`ShmKick`, `ShmFallback`) never wait behind the queue.
+async fn incoming(ep: &Arc<Endpoint>, shm: &SharedShm, msg: Message) {
+    if let Message::StatusReply { os_description, .. } = &msg {
+        lock_shm(shm).on_status(os_description);
+    }
+    let answer = match ep.try_on_serial(msg) {
+        Ok(answer) => answer,
+        Err(msg) => {
+            // The serial queue is full: wait for room on a blocking thread, in order.
+            let ep = ep.clone();
+            tokio::task::spawn_blocking(move || ep.on_serial(msg)).await.unwrap_or(None)
+        }
+    };
+    match answer {
+        Some(Message::ShmReady { ok, reason }) => lock_shm(shm).on_ready(ok, &reason),
+        Some(other) => warn!("Unexpected message from the agent during negotiation: {:?}", other),
+        None => {}
+    }
+}
+
 impl SerialClient {
     /// Starts the background communication worker connecting to the VirtIO-serial socket.
+    /// `on_message` runs on one dispatcher thread (inside the Tokio runtime context), fed by the
+    /// serial reader and, when shared memory is active, by the lane readers. Needs a Tokio
+    /// runtime context.
     pub fn start<F>(
         socket_path: PathBuf,
+        shm_settings: ShmSettings,
         on_message: F,
     ) -> SerialClientHandle
     where
         F: Fn(Message) + Send + Sync + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<Message>(128);
+        let (serial_tx, mut rx) = mpsc::channel::<Message>(128);
         let connected = Arc::new(AtomicBool::new(false));
         let connected_clone = connected.clone();
         let last_rx_ms = Arc::new(AtomicU64::new(now_ms()));
         let last_rx_clone = last_rx_ms.clone();
-        let on_message = Arc::new(on_message);
 
+        let inbox = Inbox::new(256, 1024, 8);
+        let ep = Endpoint::new(
+            {
+                let tx = serial_tx.clone();
+                Arc::new(move |m| serial_send(&tx, m))
+            },
+            inbox.clone(),
+            LinkConfig::default(),
+        );
+        let path = shm_settings.path.clone();
+        let shm: SharedShm = Arc::new(Mutex::new(HostShm::new(
+            shm_settings.enabled,
+            ep.clone(),
+            Box::new(move || shmfile::open(&path, REGION_LEN)),
+            OFFER_TIMEOUT,
+        )));
+        if shm_settings.enabled {
+            info!("Shared-memory transport enabled (backing file {:?})", shm_settings.path);
+        }
+
+        // The single dispatcher: what the serial reader used to do inline.
+        let runtime = tokio::runtime::Handle::current();
+        let spawned = std::thread::Builder::new().name("wb-dispatch".into()).spawn(move || {
+            let _runtime = runtime.enter();
+            loop {
+                match inbox.pop(Duration::from_secs(1)) {
+                    Pop::Msg(msg) => on_message(msg),
+                    Pop::Timeout => {}
+                    Pop::Closed => break,
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            warn!("Cannot start the dispatcher thread: {}", e);
+        }
+
+        let shm_tick = shm.clone();
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                lock_shm(&shm_tick).tick(Instant::now());
+            }
+        });
+
+        let ep_loop = ep.clone();
+        tokio::spawn(async move {
+            let ep = ep_loop;
             loop {
                 info!("Attempting connection to VirtIO-serial socket at {:?}", socket_path);
                 match UnixStream::connect(&socket_path).await {
@@ -276,19 +415,23 @@ impl SerialClient {
                         info!("Connected to VirtIO-serial socket at {:?}", socket_path);
                         connected_clone.store(true, Ordering::SeqCst);
                         last_rx_clone.store(now_ms(), Ordering::SeqCst);
+                        // A new serial session: any earlier shared-memory link is left and the
+                        // agent's announcement in the reply below starts a new negotiation.
+                        lock_shm(&shm).new_session();
 
                         let (mut reader, mut writer) = stream.into_split();
                         // Ask the agent for its state: it only announces itself once at startup.
                         let _ = write_frame_async(&mut writer, &Message::QueryStatus).await;
-                        let on_msg_recv = on_message.clone();
                         let last_rx_reader = last_rx_clone.clone();
+                        let ep_reader = ep.clone();
+                        let shm_reader = shm.clone();
 
                         let mut read_task = tokio::spawn(async move {
                             loop {
                                 match read_frame_async(&mut reader).await {
                                     Ok(msg) => {
                                         last_rx_reader.store(now_ms(), Ordering::SeqCst);
-                                        on_msg_recv(msg);
+                                        incoming(&ep_reader, &shm_reader, msg).await;
                                     }
                                     Err(e) => {
                                         warn!("Serial reader disconnected: {}", e);
@@ -318,6 +461,7 @@ impl SerialClient {
                         }
 
                         connected_clone.store(false, Ordering::SeqCst);
+                        lock_shm(&shm).new_session();
                         warn!("VirtIO-serial connection closed, reconnecting in 2s...");
                     }
                     Err(e) => {
@@ -329,6 +473,10 @@ impl SerialClient {
             }
         });
 
-        SerialClientHandle { tx, connected, last_rx_ms }
+        SerialClientHandle {
+            tx: Tx { serial: serial_tx, ep },
+            connected,
+            last_rx_ms,
+        }
     }
 }

@@ -25,6 +25,7 @@ pub struct CliOverrides {
     pub qmp_socket: Option<PathBuf>,
     pub usb_bus: Option<String>,
     pub grab_keyboard: bool,
+    pub shm: bool,
 }
 
 /// Keys of `config.toml`. Unknown keys are rejected so typos do not pass silently.
@@ -38,6 +39,7 @@ struct FileConfig {
     qmp_socket: Option<PathBuf>,
     usb_bus: Option<String>,
     grab_keyboard: bool,
+    shm: bool,
 }
 
 /// Script the viewer runs as its child to start the VM.
@@ -59,6 +61,9 @@ pub struct Config {
     pub grab_keyboard: bool,
     /// `None` attaches to a QEMU that is already running.
     pub launch: Option<LaunchSpec>,
+    /// Opt-in shared-memory transport (`shm = true`, `--shm`); the serial channel stays the
+    /// handshake and fallback. Off by default.
+    pub shm: bool,
 }
 
 /// Loads `config.toml` (when present) and applies command-line overrides on top of it.
@@ -101,6 +106,7 @@ pub fn load(cli: CliOverrides) -> Result<Config, String> {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_QMP_SOCKET)),
         usb_bus: cli.usb_bus.or(file.usb_bus),
         grab_keyboard: cli.grab_keyboard || file.grab_keyboard,
+        shm: cli.shm || file.shm,
         launch,
     })
 }
@@ -141,4 +147,16 @@ fn xdg_dir(variable: &str, home_relative: &str) -> Option<PathBuf> {
             .filter(|p| p.is_absolute())
             .map(|home| home.join(home_relative))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shm_is_off_unless_asked_for() {
+        assert!(!toml::from_str::<FileConfig>("").unwrap().shm);
+        assert!(toml::from_str::<FileConfig>("shm = true").unwrap().shm);
+        assert!(!CliOverrides::default().shm);
+    }
 }

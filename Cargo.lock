@@ -1640,6 +1640,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winbridge-proto",
+ "winbridge-shm",
  "windows",
  "windows-core",
  "windows-sys 0.59.0",
@@ -1706,6 +1707,8 @@ dependencies = [
  "gdk4-x11",
  "gtk4",
  "ksni",
+ "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tokio",
@@ -1713,6 +1716,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winbridge-proto",
+ "winbridge-shm",
  "x11-dl",
  "zbus",
 ]
@@ -1725,6 +1729,8 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "tracing",
+ "winbridge-shm",
 ]
 
 [[package]]

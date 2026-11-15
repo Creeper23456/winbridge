@@ -95,6 +95,7 @@ All communication occurs as discrete, length-prefixed binary frames:
   - `current_height: u32`: Active screen height in pixels.
   - `current_dpi: u32`: Current active DPI percentage (e.g., `100`).
   - `os_description: String`: Guest OS build information.
+  - The agent appends the capability token described in section 3.2 to `os_description` (for example `Windows 11 x64 [wb-shm=1:0badcafe]`). Hosts that do not know it treat the whole string as free text.
 
 ---
 
@@ -228,3 +229,67 @@ A drag that starts in Windows and ends on a Linux application. The host notices 
 #### `GuestDragEnd`
 - **Direction:** Host $\to$ Agent
 - **Fields:** `drag_id: u32`. The host drag finished (dropped or cancelled); the agent hides its probe window. The host releases the guest's left button itself over the display channel.
+
+---
+
+## 3. Shared-memory transport (optional)
+
+Design and measurements: `docs/IVSHMEM-TRANSPORT.md`. This section is the wire-level contract. The transport is **opt-in** (`shm = true` in the viewer's `config.toml` or `--shm`; the launch script adds the device with `WINBRIDGE_SHM=1`) and **off by default**: without it, every message in section 2 travels over virtio-serial exactly as described there, byte for byte.
+
+### 3.1 What moves
+
+Every `Message` keeps its encoding (section 1 frame: magic, length, `bincode` payload). On the shared-memory transport the **whole frame** is the payload of one ring record, so a record decodes with the same code as a serial frame (`winbridge_proto::decode_frame`, which requires the record to hold exactly one frame). The virtio-serial channel stays in use for the handshake, for the four negotiation messages below, for wake-up kicks and as the fallback.
+
+### 3.2 Capability gating
+
+`bincode` is positional: a message variant an agent does not know cannot be decoded by it. The four `Shm*` variants were therefore **appended at the end of `Message`** (the order of existing variants must never change), and the host sends `ShmOffer` **only to an agent that announced the capability**. The agent announces it in the free-text `os_description` of its `StatusReply` (the first reply after it starts, and every reply to `QueryStatus`) as a trailing token:
+
+```
+Windows 11 x64 [wb-shm=1:0badcafe]
+```
+
+`1` is the shared-memory protocol generation (`caps::SHM_PROTOCOL`), `0badcafe` a random id of the agent process. An old agent never emits the token and an old host only displays the text, so mixed versions fall back to serial without any new message. A host that sees a different id in a later reply knows the agent restarted and offers again. (`winbridge_proto::caps::announce` / `parse`.)
+
+### 3.3 Negotiation messages (always on the serial channel)
+
+| Message | Direction | Fields | Meaning |
+|---|---|---|---|
+| `ShmOffer` | Host $\to$ Agent | `shm_version: u32`, `region_len: u64` | The host created the region (`winbridge-shm` layout version, length of the BAR). The host keeps using serial until `ShmReady`. |
+| `ShmReady` | Agent $\to$ Host | `ok: bool`, `reason: String` | `true`: the agent mapped the device (cached, DACL hardened), attached and validated the header and started its lane threads. `false`: `reason` says why; the session stays on serial. |
+| `ShmKick` | either | none | Wake the peer's ring consumer: sent by a producer that found the ring empty and the consumer's `sleeping` flag set. Carries no data and is coalesced. |
+| `ShmFallback` | either | `reason: String` | The sender leaves the rings (corruption, stalled peer, shutdown, serial reconnect, agent restart); both ends return to serial. |
+
+Sequence: the agent's `StatusReply` carries the token; the host (enabled, backing file present, correct size, owned by the user, not world-writable, not a symlink) maps the file, creates the region (`Region::create`, a **new generation on every serial session**; the file content persists across guest reboots, so an old region is never reused) and sends `ShmOffer`; the agent calls `ivshmem::map_device(region_len)`, `Region::attach` and replies; on `ok` both sides switch their outgoing path to the lanes. The host waits **5 s** for `ShmReady` and then stays on serial (and sends `ShmFallback` so a late agent leaves again). `ok = false`, a missing capability, a missing or unsuitable backing file, or a link that ends later all leave the rest of the session on serial; the next serial session (reconnect) offers again. A repeated `ShmOffer` makes the agent leave its current link and map again.
+
+### 3.4 Region and lanes
+
+One `ivshmem-plain` device, 256 MiB, backing file `/dev/shm/winbridge-ctl` (mode 0600). Header page and ring layout are defined by `winbridge-shm`; the high half of the header capability word holds the session generation.
+
+| Lane id | Direction | Priority | Ring data | Record cap |
+|---|---|---|---|---|
+| 1 | host $\to$ guest | control | 1 MiB | 256 KiB |
+| 2 | guest $\to$ host | control | 1 MiB | 256 KiB |
+| 3 | host $\to$ guest | bulk | 64 MiB | 56 MiB |
+| 4 | guest $\to$ host | bulk | 64 MiB | 56 MiB |
+
+Record tag `0` is a message frame, tag `1` a **bulk credit** (control lanes only). Bulk records may carry flag `0x0001` (end of a scheduling block); the flag bit `0x8000` is reserved by the ring. Any other tag or flag is an invalid record.
+
+Scheduling (one writer thread per direction): control is strict priority; bulk is sent in blocks of at most 1 MiB with a credit window of 16 blocks in flight. The last record of a block carries the end flag, and the consumer returns one credit per block through the reverse control lane (tag `1`, `winbridge_shm::sched::encode_credit`). A bulk lane that has pending data and credit and was not served for 50 ms goes first (minimum progress), so a transfer and its 30 s no-progress watchdog stay meaningful. A control record therefore waits at most one bulk record.
+
+### 3.5 Lane mapping
+
+`Message::is_bulk()` decides. **Bulk lane:** `ClipboardOffer`, `ClipboardItem`, `ClipFilesManifest` (a clipboard snapshot is one ordered stream; items can be tens of MiB), `FilesBegin`, `FileEntry`, `FileChunk`, `FilesEnd`, `DropBegin`, `DropFileStart`, `DropFileChunk`, `DropFileFinish`. **Control lane:** everything else (`Ping`, `Pong`, resolution, DPI, status, `DropText`, `DropResult`, `ClipFilesRequest`, all `Guest*` drag messages). The four `Shm*` messages never use a lane.
+
+Messages of one stream always share one lane, so their order is kept. **The order between a control message and a bulk message is not guaranteed** on this transport and no code may rely on it (for example a `ClipFilesRequest` can overtake the `ClipboardOffer` it refers to; both sides treat an unknown or stale `clip_id` as an error they already handle). A control message larger than the control record cap (for example a huge `DropText`) is sent over serial.
+
+### 3.6 Validation, limits, fallback
+
+Every byte of the region is untrusted. `winbridge-shm` checks indexes, record lengths and the lane directory (a violation closes the lane: `LaneError::Corrupt`). On top of that each reader copies the record out and checks: tag, flags, exactly one frame, a decodable message, and that the message belongs on this lane (`is_bulk` against the lane class; negotiation messages never). An invalid record is logged and counted; the link ends after **8** of them. Credit returned beyond what is outstanding ends the link.
+
+The link also ends when a lane stays full or credit stays outstanding for **10 s** (the peer stopped reading) or the peer closes it. The end of a link always follows the same steps: the detecting side sends `ShmFallback` over serial, followed by the messages it had queued for the lanes but not yet written, and routes everything over serial from then on. The receiver of `ShmFallback` stops writing, keeps draining the rings for up to 2 s and holds back messages that arrive over serial until the drain is over, so records written before the fallback are dispatched before later serial traffic. Records inside a corrupt ring are lost; a file stream that loses data ends through its existing error path (offset check, `FilesEnd { success: false }`, the 30 s watchdog), it never hangs on the transport. An agent restart or a serial reconnect also leaves the lanes (`ShmFallback`) and the next session negotiates again.
+
+### 3.7 Threads and back-pressure
+
+Per end: one writer thread, one reader thread per consumer lane, a small kick thread. A reader hands decoded messages to the owner's dispatch queue (separate bounded queues for control lane, serial and bulk lane, served in that priority order); a full queue blocks only that lane's reader, so a slow consumer of file data back-pressures the bulk ring and never the serial reader or the control lane. The serial reader runs on its own thread in the agent and never waits for a lane.
+
+One exception keeps keepalives independent of the dispatcher: the agent answers a `Ping` that arrives on the control lane on the lane's own reader thread (`Endpoint::set_fast_path`), because the dispatch loop can be inside a slow disk write for a file chunk (measured without it, build VM, 1 GiB host-to-guest stream: Pong round trip p50 0.19 ms but p99 21.6 ms and max 41.7 ms; the cause is presumably write throttling of the guest disk **[INFERENCE]**). Other control messages wait for the dispatcher, but they are served before any queued bulk message, so they wait for at most the chunk being handled.
