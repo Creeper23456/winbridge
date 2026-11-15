@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/winbridge-proto",
+    "crates/winbridge-host",
+    "crates/winbridge-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Creeper23456 <Creeper23456@outlook.com>"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Creeper23456/winbridge"
