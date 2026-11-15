@@ -137,6 +137,9 @@ fn main() -> glib::ExitCode {
                     "Guest status: {}x{} @ {}% DPI ({})",
                     current_width, current_height, current_dpi, os_description
                 );
+                glib::idle_add_once(move || {
+                    with_viewer(|v| v.on_guest_status(current_width, current_height, current_dpi));
+                });
             }
             _ => {}
         });
@@ -167,6 +170,9 @@ fn main() -> glib::ExitCode {
                 Ok(conn) => {
                     info!("Connected to QEMU D-Bus Display");
                     *dbus_conn_clone.lock().unwrap() = Some(conn);
+                    glib::idle_add_once(|| {
+                        with_viewer(|v| v.on_display_connected());
+                    });
                 }
                 Err(e) => {
                     warn!(
@@ -178,5 +184,6 @@ fn main() -> glib::ExitCode {
         });
     });
 
-    app.run()
+    // Arguments are already parsed by clap; do not let GApplication reject them.
+    app.run_with_args::<&str>(&[])
 }

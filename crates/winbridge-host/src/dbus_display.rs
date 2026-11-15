@@ -9,6 +9,16 @@ use tracing::{error, info};
 use zbus::zvariant::OwnedFd;
 use zbus::{connection, proxy};
 
+/// Guest mouse cursor image pushed by QEMU (premultiplied BGRA, little-endian ARGB32).
+#[derive(Clone)]
+pub struct CursorSprite {
+    pub width: i32,
+    pub height: i32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub data: Vec<u8>,
+}
+
 /// Shared framebuffer storing the current guest display scanout.
 #[derive(Clone)]
 pub struct Framebuffer {
@@ -16,6 +26,12 @@ pub struct Framebuffer {
     pub height: u32,
     pub stride: u32,
     pub data: Vec<u8>,
+    /// Latest guest cursor image, if the guest uses a hardware cursor.
+    pub cursor: Option<CursorSprite>,
+    /// Whether the guest currently shows its cursor.
+    pub cursor_on: bool,
+    /// Bumped whenever `cursor` or `cursor_on` changes.
+    pub cursor_gen: u64,
 }
 
 impl Default for Framebuffer {
@@ -30,6 +46,9 @@ impl Default for Framebuffer {
             height,
             stride,
             data,
+            cursor: None,
+            cursor_on: true,
+            cursor_gen: 0,
         }
     }
 }
@@ -43,6 +62,7 @@ impl Default for Framebuffer {
 )]
 pub trait Console {
     fn register_listener(&self, listener: OwnedFd) -> zbus::Result<()>;
+    #[zbus(name = "SetUIInfo")]
     fn set_ui_info(
         &self,
         width_mm: u16,
@@ -123,15 +143,37 @@ impl DisplayListener {
         (self.on_update)();
     }
 
-    fn mouse_set(&self, _x: i32, _y: i32, _on: i32) {}
-    fn cursor_define(
-        &self,
-        _width: i32,
-        _height: i32,
-        _hot_x: i32,
-        _hot_y: i32,
-        _data: Vec<u8>,
-    ) {
+    fn mouse_set(&self, _x: i32, _y: i32, on: i32) {
+        let changed = match self.fb.lock() {
+            Ok(mut fb) => {
+                let on = on != 0;
+                if fb.cursor_on != on {
+                    fb.cursor_on = on;
+                    fb.cursor_gen += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
+        if changed {
+            (self.on_update)();
+        }
+    }
+
+    fn cursor_define(&self, width: i32, height: i32, hot_x: i32, hot_y: i32, data: Vec<u8>) {
+        if let Ok(mut fb) = self.fb.lock() {
+            fb.cursor = Some(CursorSprite {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                data,
+            });
+            fb.cursor_gen += 1;
+        }
+        (self.on_update)();
     }
     fn disable(&self) {}
 }

@@ -144,6 +144,8 @@ impl SerialClient {
                         connected_clone.store(true, Ordering::SeqCst);
 
                         let (mut reader, mut writer) = stream.into_split();
+                        // Ask the agent for its state: it only announces itself once at startup.
+                        let _ = write_frame_async(&mut writer, &Message::QueryStatus).await;
                         let on_msg_recv = on_message.clone();
 
                         let mut read_task = tokio::spawn(async move {

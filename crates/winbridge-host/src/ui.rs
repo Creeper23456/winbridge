@@ -8,13 +8,13 @@ use crate::serial_client::SerialClientHandle;
 use gtk4::cairo::{Context, Format, ImageSurface};
 use gtk4::gdk::{self, DragAction};
 use gtk4::gio;
-use gtk4::glib::{self, clone};
+use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, DrawingArea, DropTarget, EventControllerKey,
     EventControllerMotion, GestureClick, HeaderBar, Label, Orientation,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,9 @@ pub struct ViewerWindow {
     dbus_conn: Arc<Mutex<Option<DbusDisplayConnection>>>,
     last_guest_clipboard: Arc<Mutex<String>>,
     transfer_counter: Arc<AtomicU32>,
+    status_label: Label,
+    /// (QEMU display connected, latest guest agent status text)
+    status: RefCell<(bool, Option<String>)>,
 }
 
 impl ViewerWindow {
@@ -70,12 +73,18 @@ impl ViewerWindow {
             dbus_conn: dbus_conn.clone(),
             last_guest_clipboard: Arc::new(Mutex::new(String::new())),
             transfer_counter: Arc::new(AtomicU32::new(1)),
+            status_label: status_label.clone(),
+            status: RefCell::new((false, None)),
         });
 
         // Set up Cairo drawing routine
         let fb_for_draw = fb.clone();
-        drawing_area.set_draw_func(move |_area, cr, width, height| {
+        // The Linux pointer is hidden over the canvas; the guest cursor takes its place.
+        drawing_area.set_cursor_from_name(Some("none"));
+        let last_cursor_gen = Cell::new(u64::MAX);
+        drawing_area.set_draw_func(move |area, cr, width, height| {
             render_framebuffer(&fb_for_draw, cr, width as f64, height as f64);
+            apply_guest_cursor(area, &fb_for_draw, &last_cursor_gen);
         });
 
         // Mouse motion controller
@@ -174,53 +183,76 @@ impl ViewerWindow {
         });
         window.add_controller(key_ctrl);
 
-        // Window resize debounce timer
+        // Guest sync (size + DPI). Window size and scale changes are debounced into one request.
+        // The guest runs at the canvas' physical pixel size with Windows scaling set to the Linux
+        // factor, so UI elements end up the same size as on the Linux side.
         let resize_debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        let serial_for_resize = serial.clone();
-
-        drawing_area.connect_resize(clone!(
-            #[strong]
-            resize_debounce,
-            move |_area, width, height| {
-                if width <= 100 || height <= 100 {
+        let request_sync: Rc<dyn Fn(i32, i32, i32)> = Rc::new({
+            let resize_debounce = resize_debounce.clone();
+            let serial = serial.clone();
+            let dbus_conn = dbus_conn.clone();
+            move |logical_w: i32, logical_h: i32, factor: i32| {
+                if logical_w <= 100 || logical_h <= 100 {
                     return;
                 }
 
-                // Debounce resolution change requests by 150 ms
                 if let Some(source_id) = resize_debounce.borrow_mut().take() {
                     source_id.remove();
                 }
 
-                let serial_clone = serial_for_resize.clone();
-                let w = width as u32;
-                let h = height as u32;
+                let scale = factor.max(1) as u32;
+                let w = logical_w as u32 * scale;
+                let h = logical_h as u32 * scale;
+                let scale_percent = scale * 100;
+                let mm_w = (logical_w as f64 * 25.4 / 96.0).round() as u16;
+                let mm_h = (logical_h as f64 * 25.4 / 96.0).round() as u16;
+
+                let serial_clone = serial.clone();
+                let dbus_inner = dbus_conn.clone();
+                let debounce_slot = resize_debounce.clone();
 
                 let id = glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                    info!("Window resized, requesting guest resolution: {}x{}", w, h);
-                    serial_clone.send_resolution(w, h);
+                    // The source is gone once it fires: drop the stored id so a later
+                    // change does not try to remove it again.
+                    debounce_slot.borrow_mut().take();
+                    info!("Syncing guest: {}x{} px at {}% DPI", w, h, scale_percent);
+                    // Tell QEMU first: the guest GPU driver derives its custom mode from the
+                    // host display info, and only a mode it advertises can be applied.
+                    let console = dbus_inner
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|c| c.console.clone());
+                    tokio::spawn(async move {
+                        if let Some(console) = console {
+                            if let Err(e) = console.set_ui_info(mm_w, mm_h, 0, 0, w, h).await {
+                                warn!("QEMU SetUIInfo failed: {}", e);
+                            }
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                        }
+                        serial_clone.send_resolution(w, h);
+                        // Windows caps the scale by the resolution, so apply it after the resolution.
+                        serial_clone.send_dpi_scale(scale_percent);
+                    });
                 });
 
                 *resize_debounce.borrow_mut() = Some(id);
             }
-        ));
+        });
 
-        // Window / Monitor DPI scale synchronization
-        let serial_for_scale = serial.clone();
-        let last_scale = Rc::new(RefCell::new(0u32));
-        window.connect_scale_factor_notify(clone!(
-            #[strong]
-            last_scale,
+        drawing_area.connect_resize({
+            let request_sync = request_sync.clone();
+            move |area, width, height| request_sync(width, height, area.scale_factor())
+        });
+
+        window.connect_scale_factor_notify({
+            let request_sync = request_sync.clone();
+            let area = drawing_area.clone();
             move |win| {
-                let factor = win.scale_factor();
-                let scale_percent = (factor * 100) as u32;
-
-                if *last_scale.borrow() != scale_percent {
-                    *last_scale.borrow_mut() = scale_percent;
-                    info!("GTK scale factor changed to {}x ({}%), requesting guest DPI scale", factor, scale_percent);
-                    serial_for_scale.send_dpi_scale(scale_percent);
-                }
+                info!("GTK scale factor changed to {}x", win.scale_factor());
+                request_sync(area.width(), area.height(), win.scale_factor())
             }
-        ));
+        });
 
         // Clipboard sharing: monitor host clipboard
         let gdk_display = gdk::Display::default().expect("Failed to get default GDK display");
@@ -278,12 +310,6 @@ impl ViewerWindow {
         });
         drawing_area.add_controller(drop_target);
 
-        // Initial DPI sync trigger
-        let factor = window.scale_factor();
-        let scale_percent = (factor * 100) as u32;
-        *last_scale.borrow_mut() = scale_percent;
-        serial.send_dpi_scale(scale_percent);
-
         window.present();
         viewer
     }
@@ -302,6 +328,29 @@ impl ViewerWindow {
         let clipboard = gdk_display.clipboard();
         clipboard.set_text(&text);
         info!("Updated host clipboard from guest ({} chars)", text.chars().count());
+    }
+
+    /// Marks the QEMU D-Bus display as connected.
+    pub fn on_display_connected(&self) {
+        self.status.borrow_mut().0 = true;
+        self.refresh_status();
+    }
+
+    /// Records the guest agent's reported state (resolution, DPI).
+    pub fn on_guest_status(&self, width: u32, height: u32, dpi: u32) {
+        self.status.borrow_mut().1 = Some(format!("Guest {}x{} @ {}%", width, height, dpi));
+        self.refresh_status();
+    }
+
+    fn refresh_status(&self) {
+        let (display, guest) = self.status.borrow().clone();
+        let text = match (display, guest) {
+            (true, Some(g)) => format!("Display connected - Agent connected - {}", g),
+            (true, None) => "Display connected - waiting for guest agent...".to_string(),
+            (false, Some(g)) => format!("Waiting for QEMU display - Agent connected - {}", g),
+            (false, None) => "Connecting to QEMU Display & VirtIO-Serial...".to_string(),
+        };
+        self.status_label.set_text(&text);
     }
 }
 
@@ -338,4 +387,43 @@ fn render_framebuffer(
         let _ = cr.paint();
         cr.restore().unwrap();
     }
+}
+
+/// Shows the guest cursor (hardware cursor sprite from QEMU) instead of the Linux pointer.
+/// With no sprite, or while the guest hides its cursor, the canvas shows no host pointer at all
+/// (a software cursor drawn into the guest frame stays visible in the frame itself).
+fn apply_guest_cursor(area: &DrawingArea, fb: &Arc<Mutex<Framebuffer>>, last_gen: &Cell<u64>) {
+    let (generation, on, sprite) = {
+        let fb = fb.lock().unwrap();
+        if last_gen.get() == fb.cursor_gen {
+            return;
+        }
+        (fb.cursor_gen, fb.cursor_on, fb.cursor.clone())
+    };
+    last_gen.set(generation);
+
+    let none = gdk::Cursor::from_name("none", None);
+    let cursor = match sprite {
+        Some(s)
+            if on && s.width > 0 && s.height > 0 && s.data.len() >= (s.width * s.height * 4) as usize =>
+        {
+            let stride = (s.width * 4) as usize;
+            let bytes = glib::Bytes::from_owned(s.data);
+            let texture = gdk::MemoryTexture::new(
+                s.width,
+                s.height,
+                gdk::MemoryFormat::B8g8r8a8Premultiplied,
+                &bytes,
+                stride,
+            );
+            Some(gdk::Cursor::from_texture(
+                &texture,
+                s.hot_x,
+                s.hot_y,
+                none.as_ref(),
+            ))
+        }
+        _ => none,
+    };
+    area.set_cursor(cursor.as_ref());
 }
