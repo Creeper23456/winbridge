@@ -2,7 +2,7 @@
 
 # WinBridge GPU Forwarding Design (DXVK over virtio-serial)
 
-Status (2026-11-15): M0 and M1 are done and measured. The framing, the host dispatcher and a Windows ICD exist; in the Build VM the Windows Vulkan loader lists the WinBridge device and a mapped-buffer checksum round-trips through the host. **Nothing renders yet**: there is no swapchain, no command buffer or queue submission, no DXVK run. The injector (`gfx_inject.rs`) has never run in a VM; it is off by default and installs nothing while the hook DLL, which does not exist, is missing. Sections 3.6, 3.7 and 10 hold the measurements and the exact scope.
+Status (2026-11-15): M0, M1 and M2 are done and verified in the Build VM (sections 3.6, 3.7, 10). A Windows ICD forwards a generated subset of Vulkan to a host dispatcher; the Windows loader lists the WinBridge device; the probe triangle is bit-identical to an llvmpipe render; LunarG `vkcube` renders a rotating textured cube into its window. **Not done: M3 (DXVK / D3D11), compression, more than one Vulkan process per VM (port broker), reconnect.** The injector (`gfx_inject.rs`) has never run in a VM; it is off by default and installs nothing while the hook DLL, which does not exist, is missing.
 
 ## 1. Decision
 
@@ -271,9 +271,7 @@ VM acceptance (Build VM, Windows loader `vulkan-1.dll` 1.3.296, release build of
 - Through the ICD over the real port (NVIDIA, 2,000 `vkGetBufferMemoryRequirements` calls): p50 188.7 µs, p90 231.0 µs, p99 305.4 µs, max 834 µs (llvmpipe: 186.4 / 233.4 / 323.3 / 1,903 µs). One 8 MiB `vkFlushMappedMemoryRanges` ran at 565 MiB/s (llvmpipe 501), one 8 MiB `vkInvalidateMappedMemoryRanges` at 142 MiB/s (llvmpipe 237). For comparison, the same probe over the Unix-socket loopback on the host (debug build) measured 28.0 µs p50 per call. The 189 µs is about 110 µs above the raw echo round trip of section 3.6; it was not profiled.
 
 What M1 does not do (each of these is a fact about the code as tested):
-- Every command is a synchronous round trip; no batching, no asynchronous commands, the advertised receive window is not enforced.
-- No command buffers, queue submission, fences, images, pipelines, swapchain or surface: nothing can render. The ICD advertises Vulkan 1.3 and exposes 34 entry points (risk 11; `vulkaninfo --summary` crashes).
-- Host-visible memory is not coherent (risk 3). `vkMapMemory` does not know memory types, so mapping a non-host-visible allocation succeeds in the guest and fails on the first flush, which ends the connection.
+- (Superseded by the M2 result: calls that return nothing are batched; command buffers, queue submission, images, pipelines, swapchain and surface exist; host-visible memory is coherent by write-watch. M1 as tested did none of this.)
 - No instance extensions are exposed; the device extension list is the host's raw list although most extension commands are not implemented.
 - Unknown `pNext` structures are dropped by the serializer (as the specification allows); only the structures in `CHAIN_ALLOW` of `vkgen` are forwarded.
 - One Vulkan process per VM (risk 10); the ICD can only be found by elevated processes through the registry (section 3.7); no reconnect after a dead channel (every later call fails with `VK_ERROR_DEVICE_LOST`, `vkCreateInstance` with `VK_ERROR_INCOMPATIBLE_DRIVER`).
@@ -281,6 +279,16 @@ What M1 does not do (each of these is a fact about the code as tested):
 
 **M2 — vkcube presents**
 - VM acceptance: LunarG's Windows `vkcube` runs against the ICD and renders into the HWND. Host-side frame checksum equals a reference offscreen render of the same frame on llvmpipe, within a stated tolerance (exact match expected for deterministic output).
+
+**M2 result (2026-11-15): vkcube renders in the Build VM; exact-checksum acceptance holds for the triangle test, not for vkcube.**
+
+- Build: commands, images, render passes, framebuffers, pipelines, shaders, descriptors, fences and queue submit through the generated set; asynchronous batching (`OP_VK_BATCH`, 0.73–0.84 µs per recorded command, measured on the host loopback); `VK_KHR_surface`, `VK_KHR_win32_surface` (the ICD owns its Win32 surface objects: the loader's own surface object had no usable `VkIcdSurfaceBase` when handed to the ICD, so creating them in the ICD is what works) and `VK_KHR_swapchain`. Presentation is readback of the host image into the guest window (GDI `SetDIBitsToDevice`) with raw BGRA frames; no tile diff yet. Messages `OP_SC_*` in `winbridge-gfx-proto`.
+- Transport seam: `MessageTransport` / `StreamTransport` (section 12a).
+- Host test `presented_triangle_matches_the_llvmpipe_reference` (`cargo test -p winbridge-gfx-probe`): the probe's triangle (render pass + graphics pipeline, SPIR-V from `crates/winbridge-gfx-probe/shaders/tri.wgsl` via naga) presented through the ICD and the dispatcher is bit-identical to a direct llvmpipe render (320×240, FNV-1a `0x1d6064a832042f25`, 0 of 76,800 pixels differ). On the NVIDIA host the frame differs by at most 1 per channel (rounding), asserted with a 2-per-channel tolerance.
+- VM, same triangle on the llvmpipe host device: the frame the ICD wrote in the VM is byte-identical to that reference (`cmp`). VM, NVIDIA host device, 640×360 window in the interactive session, 900 presents: `frame_ms` p50 1.59 ms, max 24.78 ms (this measures the readback call, not display); screenshot taken with `vm shot` shows the triangle in the window.
+- VM, `vkcube.exe` (LunarG SDK 1.3.296, `--suppress_popups`), host NVIDIA: a window "Vulkan Cube" shows the textured rotating cube; two screenshots 6 s apart show different rotation angles and the process was still running at the end of the run. An earlier run with `--c 3000` exited with code 0. Exact frame checksum against llvmpipe is not possible for vkcube (it animates in real time); it was verified by screenshots only.
+- Conditions the VM run needed: the ICD process must be elevated (an unelevated `builder` process gets `Access is denied` opening the port, as predicted in section 3.7; the test task runs with `/rl highest`), and the ICD is registered under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`.
+- Not done: no frame-rate measurement of vkcube, no tile diff or compression, one Vulkan process per VM, no reconnect after a dead host.
 
 **M3 — DXVK d3d11 triangle**
 - Build: DXVK 2.x (master `71bf4bad` as cloned) with a small D3D11 triangle test app built on the guest side.
@@ -294,16 +302,16 @@ What M1 does not do (each of these is a fact about the code as tested):
 
 1. **Bandwidth and latency.** Measured in M0 (section 3.6): about 220–253 MiB/s host→guest, 76 µs minimum synchronous round trip. 720p30 raw fits, 1080p60 raw does not. Mitigation: tile diff; zstd; target resolution or fps reduction; batching of commands (small writes cost about 30 µs each).
 2. **Shadow memory cost.** DXVK's large upload blocks multiply guest RAM and copy traffic. Mitigation: lazy commit, device-local preference, measured in M1/M3.
-3. **Coherence correctness.** Flush-at-submit is conservative but can miss app patterns that read GPU results without a fence. Mitigation: invalidate on map and fence wait; test with DXVK's own staging paths. M1 has no write watch and no submit: it does not advertise `HOST_COHERENT` at all, so applications must flush and invalidate explicitly, which breaks the Vulkan requirement that a conformant implementation offers a host-visible, host-coherent memory type. Write watch plus flush at submit (section 7) is still to be built.
+3. **Coherence correctness.** Host-visible memory is offered as `HOST_COHERENT` by a write-watch shadow (`crates/winbridge-gfx-icd/src/shadow.rs`, `MEM_WRITE_WATCH` on Windows) flushed at queue submit and invalidated after waits; a non-coherent type is offered as well. The probe round-trips checksums on both types on NVIDIA and llvmpipe (host and VM). Not tested: applications that read GPU results without a fence, DXVK's staging patterns.
 4. **Injection mechanism.** IFEO's `Debugger` value redirects a launch; it does not inject a DLL by itself. The launcher must start the process suspended, then arrange DXVK and the ICD. Preferred: side-load DXVK DLLs from the app directory and select the ICD via the loader's `VK_DRIVER_FILES` override set by the launcher, instead of registering a global ICD. Measured since: the Windows loader ignores `VK_DRIVER_FILES` in a SYSTEM (high-integrity) process (section 3.7), so the override can only be relied on for unelevated launches, which was not tested. Owned by GfxInject; not validated here.
 5. **Anti-cheat and antivirus.** Injected DLLs and IFEO entries are flagged by some games and AV products. Out of scope for the protocol; a per-app allow-list is the mitigation.
 6. **Device loss and host crashes.** A host Vulkan device loss must become `VK_ERROR_DEVICE_LOST` in the guest; the ICD must recreate the host device on reconnect. Not designed in detail yet.
-7. **Host GPU variance.** NVIDIA and llvmpipe pass the required set; other vendors may not. The design says the ICD refuses device creation rather than degrading silently; that is not implemented (risk 12).
+7. **Host GPU variance.** NVIDIA and llvmpipe pass the required set; other vendors may not. The host refuses device creation with `VK_ERROR_FEATURE_NOT_PRESENT` instead of degrading silently (risk 12).
 8. **License.** gfxstream code, if copied, needs Apache-2.0 notices. gpu-mesh is unusable until its license is clarified.
 9. **Unverified Windows ICD in gfxstream and gpu-mesh.** Neither was run in this spike. Our design does not depend on either.
 10. **The port has one owner** (measured, section 3.7). Two Vulkan processes in the guest cannot both open `org.winbridge.gfx.0`; the second `CreateFileW` fails with access denied. A broker in the agent with per-process pipes is required before more than one Vulkan application can run; the M1 ICD opens the port directly.
-11. **The ICD claims more than it implements.** It reports Vulkan 1.3 but exposes 34 entry points (the 25 forwarded commands, 4 memory commands, 3 instance-level enumerations, `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`). `vulkaninfo --summary` (LunarG 1.3.296) crashes with 0xC0000005 after the ICD's `vkGetPhysicalDeviceImageFormatProperties`; the loader had just asked for many unimplemented commands (`vkQueueSubmit`, `vkCreateImage`, `vkCreateFence`, ...). Root cause not isolated ([INFERENCE]: a NULL entry point). Applications will fail the same way until the subset in section 9 covers what they call.
-12. **No refusal gate.** Section 3.1 says the ICD must refuse device creation when the host GPU lacks a DXVK-required feature. That check does not exist: `vkCreateDevice` is forwarded and the host driver decides.
+11. **ICD entry-point coverage (was: the ICD claims more than it implements).** The generated set now covers 206 of the 215 core 1.0–1.3 commands (`cargo run -p winbridge-gfx-vkgen -- --survey`); the other nine have shapes the generator does not handle (`vkMapMemory`, `vkUpdateDescriptorSetWithTemplate`, ...; the ones the ICD needs are written by hand). Observed in the Build VM: LunarG `vulkaninfo --summary` ran to `VULKANINFO_EXIT=0` listing the device (the earlier 0xC0000005 crash came with 34 entry points), and `vkcube` ran (M2 result). Not covered: extension commands beyond `VK_KHR_swapchain`/`VK_KHR_win32_surface`, ray tracing, mesh shaders.
+12. **Refusal gate.** `vkCreateDevice` on the host evaluates the 71 DXVK checks and returns `VK_ERROR_FEATURE_NOT_PRESENT` when one fails (`crates/winbridge-gfx/src/session.rs`). Found in the VM with vkcube: the host instance used the application's `apiVersion` (1.0), which hides the Vulkan 1.1+ feature structs, so the gate rejected a capable GPU. The host instance now asks for min(loader, 1.3); regression test `device_is_created_for_an_api_1_0_instance` (fails without the fix, checked). The refusal path itself (a GPU that really lacks a feature) has no test.
 
 ## 12. Reuse vs own
 
@@ -313,20 +321,17 @@ Recommendation: **own implementation**, generated from `vk.xml` for the DXVK sub
 
 Decision (user, 2026-11-15): stay on virtio-serial until a real application presents, then M3; ivshmem is a later step. No code exists for it. What is in place today is the boundary that makes it a swap: `winbridge_gfx_proto::frame::MessageTransport` (send one message, block for the next whole message). The ICD link (`HostLink`) and the host dispatcher (`serve`) use only that trait. Overlapped handles, the 30 s I/O timeout, the 1 MiB `ReadFile` cap and the 64 KiB fragmenting live in `StreamTransport` and `crates/winbridge-gfx-icd/src/transport.rs`. Opcodes, codecs and the dispatcher do not change with the transport.
 
-Planned shape:
+The ivshmem design (devices by trust domain, lanes, sizing, driver issues) is in `docs/IVSHMEM-TRANSPORT.md`; it is not duplicated here.
 
-- **Device:** QEMU `ivshmem-plain`, BAR2 backed by a host `/dev/shm` file, power-of-two size (for example 256 MiB). Windows side: an ivshmem driver (the signed one shipped with Looking Glass).
-- **Layout:** a single-producer single-consumer command ring per direction plus a resource pool in the same region. One region per client process, which would replace the single-handle broker of section 11 risk 10.
-- **Host-visible memory:** the host imports guest-written pool ranges with `VK_EXT_external_memory_host`. That also removes the non-coherent host-visible memory problem without the write-watch shadow of section 7.
-- **Scanout:** dmabuf from the host renderer to the viewer, instead of readback over the channel.
-- **Guest mapping is write-combined:** the guest should write and not read back; reads from it are slow.
-- **Untrusted shared memory:** the host must treat the region as attacker-controlled: copy a command out of the ring, then validate the copy (no time-of-check/time-of-use on shared bytes).
+Out of scope (user decision, 2026-11-15): any overlay or host-side display of guest frames. Presentation is only readback into the guest window; with ivshmem the return path is a frame ring read by the guest.
+
+Frame compression is bandwidth-adaptive, not canvas-size-based: per-tile mode (skip unchanged, lossless for text-UI tiles, block compression for picture tiles), a host controller that follows the measured link throughput, guest decode and blit time reported back in the frame ack, and a bounded number of frames in flight (credit-based, the newest frame wins, stale frames are dropped). The codec is not chosen yet: it waits for the `experiments/codecbench` data. The frame sink stays pluggable. Not implemented.
 
 ## 13. Open questions
 
 - ~~Confirm the guest loader honours the `VK_DRIVER_FILES` override in the Windows VM.~~ Answered in section 3.7 (measured): a process running as SYSTEM, i.e. at high integrity, does not (`ERROR_INCOMPATIBLE_DRIVER`, "Found no drivers"); registering the manifest under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` works. Not yet measured: the override in an unelevated process, which is what DXVK-using games are; it decides whether M4 can avoid a global registry entry.
 - Per-process access to the single-owner port (broker design, section 11 risk 10).
-- Does the ICD refuse device creation for hosts that lack DXVK's required features (section 11 risk 7)? Not implemented.
+- The refusal gate exists (section 11 risk 12) but only the pass path is tested; a host GPU that really lacks a feature is untested.
 - Decide whether IFEO is used only as a launch trigger (with a suspended-launch helper) or for direct injection; this belongs to the GfxInject design.
 - Obtain a license statement from gpu-mesh's author if its code is ever to be referenced beyond ideas.
 - Retry the AOSP googlesource clone of gfxstream to verify the guest Vulkan encoder.
