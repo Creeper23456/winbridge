@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// No console window when started at logon; see `logging`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! WinBridge Windows 11 Guest Agent.
 //!
 //! Bridges guest display resolution, DPI scaling, clipboard events, and file drop
@@ -9,6 +12,7 @@ mod channel;
 mod clipboard;
 mod display;
 mod dnd;
+mod logging;
 
 use channel::VirtioSerialStream;
 use clipboard::{write_clipboard_text, ClipboardWatcher};
@@ -20,6 +24,7 @@ use tracing::{error, info, warn};
 use winbridge_proto::{read_frame, write_frame, ClipboardFormat, Message};
 
 fn main() {
+    let has_console = logging::attach_console();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -61,13 +66,8 @@ fn main() {
         println!("PING_TEST_OK: WinBridge agent protocol verified!");
         return;
     }
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    logging::init(has_console);
+    display::init_dpi_awareness();
 
     info!("Starting WinBridge Windows Guest Agent v{}", env!("CARGO_PKG_VERSION"));
 
@@ -78,8 +78,8 @@ fn main() {
         .map(|s| s.as_str());
     let suppress_echo = Arc::new(AtomicBool::new(false));
 
-    let stream = VirtioSerialStream::open(port_arg);
-    let stream_writer = Arc::new(Mutex::new(stream));
+    let mut reader = VirtioSerialStream::open(port_arg);
+    let stream_writer = Arc::new(Mutex::new(reader.clone()));
     let writer_for_clipboard = stream_writer.clone();
 
     // Start clipboard monitoring thread
@@ -118,13 +118,8 @@ fn main() {
 
     loop {
         // Read incoming frame from host
-        let msg = {
-            let mut writer = match stream_writer.lock() {
-                Ok(w) => w,
-                Err(_) => break,
-            };
-            read_frame(&mut *writer)
-        };
+        // Reads use their own clone of the port handle: they must never hold the write lock.
+        let msg = read_frame(&mut reader);
 
         match msg {
             Ok(Message::Ping { seq, timestamp_ms }) => {

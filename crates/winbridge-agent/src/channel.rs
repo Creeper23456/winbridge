@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! VirtIO serial channel communication abstraction.
+//!
+//! The port handle is opened for overlapped I/O: a synchronous handle serialises every call per
+//! file object, so a thread blocked in `ReadFile` would stall all writes (clipboard, replies).
+//! Clones share one handle; each read/write uses its own event, so one reader thread and any
+//! number of (externally serialised) writers run concurrently.
 
 use std::io::{self, Read, Write};
 #[allow(unused_imports)]
@@ -10,17 +15,37 @@ use tracing::{error, info, warn};
 pub mod sys {
     use super::*;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+    use std::sync::Arc;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
-    pub struct VirtioSerialStream {
-        handle: HANDLE,
+    struct PortHandle(HANDLE);
+
+    unsafe impl Send for PortHandle {}
+    unsafe impl Sync for PortHandle {}
+
+    impl Drop for PortHandle {
+        fn drop(&mut self) {
+            if self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
     }
 
-    unsafe impl Send for VirtioSerialStream {}
-    unsafe impl Sync for VirtioSerialStream {}
+    /// Cloneable handle to the VirtIO serial port.
+    #[derive(Clone)]
+    pub struct VirtioSerialStream {
+        handle: Arc<PortHandle>,
+    }
 
     impl VirtioSerialStream {
         /// Opens the Windows VirtIO serial port, retrying until available.
@@ -31,40 +56,33 @@ pub mod sys {
             let wide_primary: Vec<u16> = primary.encode_utf16().chain(std::iter::once(0)).collect();
             let wide_secondary: Vec<u16> = secondary.encode_utf16().chain(std::iter::once(0)).collect();
 
-            loop {
-                let handle = unsafe {
-                    CreateFileW(
-                        wide_primary.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        ptr::null(),
-                        OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
-                        ptr::null_mut(),
-                    )
-                };
+            let open_path = |path: &Vec<u16>| unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    ptr::null_mut(),
+                )
+            };
 
+            loop {
+                let handle = open_path(&wide_primary);
                 if handle != INVALID_HANDLE_VALUE {
                     info!("Successfully opened VirtIO serial port at {}", primary);
-                    return Self { handle };
+                    return Self {
+                        handle: Arc::new(PortHandle(handle)),
+                    };
                 }
 
-                // Try secondary path
-                let handle_sec = unsafe {
-                    CreateFileW(
-                        wide_secondary.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        ptr::null(),
-                        OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
-                        ptr::null_mut(),
-                    )
-                };
-
+                let handle_sec = open_path(&wide_secondary);
                 if handle_sec != INVALID_HANDLE_VALUE {
                     info!("Successfully opened VirtIO serial port at {}", secondary);
-                    return Self { handle: handle_sec };
+                    return Self {
+                        handle: Arc::new(PortHandle(handle_sec)),
+                    };
                 }
 
                 warn!("VirtIO serial port not available yet, retrying in 1s...");
@@ -73,59 +91,69 @@ pub mod sys {
         }
     }
 
+    /// Runs one overlapped operation to completion with a private event.
+    fn overlapped_io(
+        handle: HANDLE,
+        start: impl FnOnce(*mut OVERLAPPED) -> i32,
+    ) -> io::Result<usize> {
+        let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event;
+
+        let started = start(&mut overlapped);
+        let pending = started == 0 && unsafe { GetLastError() } == ERROR_IO_PENDING;
+
+        let result = if started != 0 || pending {
+            let mut transferred: u32 = 0;
+            if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) } != 0 {
+                Ok(transferred as usize)
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        } else {
+            Err(io::Error::last_os_error())
+        };
+
+        unsafe {
+            CloseHandle(event);
+        }
+        result
+    }
+
     impl Read for VirtioSerialStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut bytes_read = 0;
-            let success = unsafe {
+            let handle = self.handle.0;
+            overlapped_io(handle, |ov| unsafe {
                 ReadFile(
-                    self.handle,
+                    handle,
                     buf.as_mut_ptr() as _,
                     buf.len() as u32,
-                    &mut bytes_read,
                     ptr::null_mut(),
+                    ov,
                 )
-            };
-
-            if success == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(bytes_read as usize)
-            }
+            })
         }
     }
 
     impl Write for VirtioSerialStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut bytes_written = 0;
-            let success = unsafe {
+            let handle = self.handle.0;
+            overlapped_io(handle, |ov| unsafe {
                 WriteFile(
-                    self.handle,
+                    handle,
                     buf.as_ptr() as _,
                     buf.len() as u32,
-                    &mut bytes_written,
                     ptr::null_mut(),
+                    ov,
                 )
-            };
-
-            if success == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(bytes_written as usize)
-            }
+            })
         }
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
-        }
-    }
-
-    impl Drop for VirtioSerialStream {
-        fn drop(&mut self) {
-            if self.handle != INVALID_HANDLE_VALUE {
-                unsafe {
-                    CloseHandle(self.handle);
-                }
-            }
         }
     }
 }
@@ -134,6 +162,7 @@ pub mod sys {
 pub mod sys {
     use super::*;
 
+    #[derive(Clone)]
     pub struct VirtioSerialStream;
 
     impl VirtioSerialStream {

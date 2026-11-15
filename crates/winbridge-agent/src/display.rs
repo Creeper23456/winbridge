@@ -10,9 +10,15 @@ mod imp {
     use tracing::{error, info, warn};
     use windows_sys::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-        QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO,
-        DISPLAYCONFIG_PATH_INFO, QDC_ONLY_ACTIVE_PATHS,
+        QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
+        QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
+        SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
     };
+    /// DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE (not exported by windows-sys): the source/target
+    /// mode indices of a path are packed into 16-bit halves.
+    const DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE: u32 = 0x8;
+
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Graphics::Gdi::{
         ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_RESET, CDS_UPDATEREGISTRY, DEVMODEW,
@@ -24,6 +30,12 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, SM_CXSCREEN,
         SM_CYSCREEN, WM_SETTINGCHANGE,
+    };
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+    use windows_sys::Win32::UI::HiDpi::{
+        GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        MDT_EFFECTIVE_DPI,
     };
 
     // Standard Windows display DPI scale percentage tiers.
@@ -47,8 +59,89 @@ mod imp {
         scale_rel: i32,
     }
 
-    /// Sets the screen resolution using Win32 ChangeDisplaySettingsExW.
+    /// Sets the screen resolution. The virtio-gpu driver only accepts a mode after the host has
+    /// announced it (QEMU SetUIInfo), so retry for a short while on DISP_CHANGE_BADMODE.
     pub fn set_resolution(width: u32, height: u32) -> Result<(), String> {
+        let mut last = String::new();
+        for _ in 0..15 {
+            match set_resolution_once(width, height) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Err(last)
+    }
+
+    /// Applies the size through the CCD API, the way the virtio-win helper does it. Windows only
+    /// offers a fixed mode list to ChangeDisplaySettings, while the GPU driver's custom mode
+    /// (taken from the host window size) is accepted as a supplied display configuration.
+    fn set_resolution_ccd(width: u32, height: u32) -> Result<(), String> {
+        let mut path_count: u32 = 0;
+        let mut mode_count: u32 = 0;
+        let status = unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        };
+        if status != 0 || path_count == 0 {
+            return Err(format!("GetDisplayConfigBufferSizes failed with code {}", status));
+        }
+
+        let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> =
+            vec![unsafe { std::mem::zeroed() }; path_count as usize];
+        let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> =
+            vec![unsafe { std::mem::zeroed() }; mode_count as usize];
+        let status = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(format!("QueryDisplayConfig failed with code {}", status));
+        }
+        paths.truncate(path_count as usize);
+        modes.truncate(mode_count as usize);
+
+        let path = &paths[0];
+        let raw = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+        let idx = if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
+            (raw >> 16) & 0xFFFF
+        } else {
+            raw
+        } as usize;
+        if idx >= modes.len() || modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+            return Err(format!("source mode index {} is not a source mode", idx));
+        }
+        modes[idx].Anonymous.sourceMode.width = width;
+        modes[idx].Anonymous.sourceMode.height = height;
+
+        let status = unsafe {
+            SetDisplayConfig(
+                path_count,
+                paths.as_ptr(),
+                mode_count,
+                modes.as_ptr(),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+            )
+        };
+        if status == 0 {
+            info!("SetDisplayConfig applied {}x{}", width, height);
+            Ok(())
+        } else {
+            Err(format!("SetDisplayConfig failed with code {}", status))
+        }
+    }
+
+    /// One attempt using Win32 ChangeDisplaySettingsExW.
+    fn set_resolution_once(width: u32, height: u32) -> Result<(), String> {
+        match set_resolution_ccd(width, height) {
+            Ok(()) => return Ok(()),
+            Err(e) => warn!("CCD resolution change failed ({}), trying ChangeDisplaySettingsExW", e),
+        }
         info!("Setting display resolution to {}x{}", width, height);
 
         let mut dm: DEVMODEW = unsafe { std::mem::zeroed() };
@@ -165,40 +258,97 @@ mod imp {
             return fallback_registry_dpi(scale_percent);
         }
 
-        // Calculate relative offset based on current index and relative value
-        // cur_scale_rel = cur_index - baseline_index => baseline_index = cur_index - cur_scale_rel
-        // In most environments curScaleRel is relative to recommended scale (index where scaleRel == 0)
-        let _cur_rel = get_packet.cur_scale_rel;
+        // Relative values are offsets from the recommended level, which is not necessarily the
+        // first one. The recommended index follows from the level that is active right now.
+        let cur_rel = get_packet.cur_scale_rel;
         let min_rel = get_packet.min_scale_rel;
         let max_rel = get_packet.max_scale_rel;
-
-        // Baseline index corresponding to rel == 0 is typically 0 (100%) on basic virtual displays
-        // Or computed from cur_index if known. Assume baseline index = 0 for standard 100% baseline.
-        let target_rel = (target_idx + min_rel).clamp(min_rel, max_rel);
-
-        let mut set_packet = DisplayConfigSetDpiScale {
-            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                r#type: DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE as _,
-                size: size_of::<DisplayConfigSetDpiScale>() as u32,
-                adapterId: adapter_id,
-                id: source_id,
-            },
-            scale_rel: target_rel,
+        let cur_idx = effective_dpi_percent().map(|p| nearest_level_idx(p));
+        let recommended_idx = match cur_idx {
+            Some(ci) => ci - cur_rel,
+            None => -min_rel,
         };
+        let target_rel = (target_idx - recommended_idx).clamp(min_rel, max_rel);
+        info!(
+            "DPI levels: cur_rel={} min_rel={} max_rel={} recommended_idx={} target_idx={} -> rel={}",
+            cur_rel, min_rel, max_rel, recommended_idx, target_idx, target_rel
+        );
 
-        let set_status = unsafe {
-            DisplayConfigSetDeviceInfo(&mut set_packet.header as *mut _)
-        };
+        let mut rel = target_rel;
+        for attempt in 0..2 {
+            let mut set_packet = DisplayConfigSetDpiScale {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE as _,
+                    size: size_of::<DisplayConfigSetDpiScale>() as u32,
+                    adapterId: adapter_id,
+                    id: source_id,
+                },
+                scale_rel: rel,
+            };
 
-        if set_status == 0 {
-            info!("CCD DisplayConfigSetDeviceInfo successfully applied scaleRel={}", target_rel);
-            // Also notify and update registry for consistency
-            let _ = fallback_registry_dpi(target_level);
-            Ok(())
-        } else {
-            warn!("DisplayConfigSetDeviceInfo failed with code {}, trying registry fallback", set_status);
-            fallback_registry_dpi(target_level)
+            let set_status = unsafe { DisplayConfigSetDeviceInfo(&mut set_packet.header as *mut _) };
+            if set_status != 0 {
+                warn!("DisplayConfigSetDeviceInfo failed with code {}, trying registry fallback", set_status);
+                return fallback_registry_dpi(target_level);
+            }
+
+            // The change lands asynchronously: wait for the effective DPI to follow.
+            for _ in 0..20 {
+                if effective_dpi_percent() == Some(target_level) {
+                    info!("Effective DPI is now {}%", target_level);
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            // Not there: the reported offset may have been stale. Correct by the observed difference.
+            match effective_dpi_percent() {
+                Some(effective) if attempt == 0 => {
+                    let corrected =
+                        (rel + target_idx - nearest_level_idx(effective)).clamp(min_rel, max_rel);
+                    if corrected == rel {
+                        break;
+                    }
+                    info!("DPI landed on {}%, retrying with rel={}", effective, corrected);
+                    rel = corrected;
+                }
+                _ => break,
+            }
         }
+        Err(format!(
+            "requested {}% but the effective DPI is {:?}% (Windows limits the scale for this resolution)",
+            target_level,
+            effective_dpi_percent()
+        ))
+    }
+
+    /// Makes the agent per-monitor DPI aware so it sees real pixel sizes and DPI values.
+    pub fn init_dpi_awareness() {
+        if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } == 0 {
+            warn!("SetProcessDpiAwarenessContext failed");
+        }
+    }
+
+    /// Effective DPI of the primary monitor as a scale percentage (96 dpi = 100%).
+    fn effective_dpi_percent() -> Option<u32> {
+        let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+        let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+        let hr = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+        if hr == 0 && dpi_x != 0 {
+            Some((dpi_x * 100 + 48) / 96)
+        } else {
+            None
+        }
+    }
+
+    /// Index in `DPI_LEVELS` closest to a scale percentage.
+    fn nearest_level_idx(percent: u32) -> i32 {
+        DPI_LEVELS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &l)| (l as i32 - percent as i32).abs())
+            .map(|(i, _)| i as i32)
+            .unwrap_or(0)
     }
 
     /// Registry fallback for DPI and broadcast notification.
@@ -243,13 +393,14 @@ mod imp {
     pub fn get_display_info() -> (u32, u32, u32) {
         let width = unsafe { GetSystemMetrics(SM_CXSCREEN) } as u32;
         let height = unsafe { GetSystemMetrics(SM_CYSCREEN) } as u32;
-        // Default standard DPI is 96 (100%)
-        (width, height, 100)
+        (width, height, effective_dpi_percent().unwrap_or(100))
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn init_dpi_awareness() {}
+
     pub fn set_resolution(width: u32, height: u32) -> Result<(), String> {
         tracing::info!("[Mock] Set resolution to {}x{}", width, height);
         Ok(())
