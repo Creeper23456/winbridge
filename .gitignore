@@ -1,0 +1,17 @@
+# Rust build artifacts
+target/
+dist/
+*.exe
+**/*.rs.bk
+
+# Archives and logs
+*.tar
+*.tar.gz
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
