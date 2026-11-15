@@ -9,6 +9,18 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read, Write};
 
+/// One offered file or directory (see [`Message::ClipFilesManifest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// `/`-separated, starting with the top-level name; the same value `FileEntry` carries.
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+pub mod clip;
+pub mod files;
+
 /// Wire framing constants.
 pub const MAGIC: [u8; 4] = *b"WB01";
 pub const HEADER_LEN: usize = 8; // 4 bytes magic + 4 bytes payload len
@@ -23,8 +35,12 @@ pub enum ClipboardFormat {
     Png,
     /// Windows DIB / BMP formatted image data.
     Bmp,
-    /// List of file names/paths (null or newline separated).
+    /// Files and directories, carried by a file stream.
     FileList,
+    /// HTML document (UTF-8), without the Windows CF_HTML header.
+    Html,
+    /// Rich Text Format bytes.
+    Rtf,
 }
 
 impl fmt::Display for ClipboardFormat {
@@ -34,6 +50,8 @@ impl fmt::Display for ClipboardFormat {
             Self::Png => write!(f, "Png"),
             Self::Bmp => write!(f, "Bmp"),
             Self::FileList => write!(f, "FileList"),
+            Self::Html => write!(f, "Html"),
+            Self::Rtf => write!(f, "Rtf"),
         }
     }
 }
@@ -86,23 +104,18 @@ pub enum Message {
         os_description: String,
     },
 
-    /// Either party announces clipboard formats are currently available.
-    ClipboardAnnounce {
-        formats: Vec<ClipboardFormat>,
-    },
-    /// Request specific clipboard format data.
-    ClipboardRequest {
-        format: ClipboardFormat,
-    },
-    /// Send clipboard format data payload.
-    ClipboardPayload {
-        format: ClipboardFormat,
-        data: Vec<u8>,
-    },
 
+    /// Start one drag-and-drop operation at guest screen coordinates.
+    DropBegin {
+        transfer_id: u32,
+        x: u32,
+        y: u32,
+        file_count: u32,
+    },
     /// Initiate drag-and-drop file transfer into guest.
     DropFileStart {
         transfer_id: u32,
+        operation_id: u32,
         filename: String,
         total_bytes: u64,
     },
@@ -118,14 +131,97 @@ pub enum Message {
         success: bool,
         error: Option<String>,
     },
-    /// Send dropped plain text.
+    /// Send dropped plain text at guest screen coordinates.
     DropText {
         text: String,
+        x: u32,
+        y: u32,
     },
     /// Acknowledge drag-and-drop operation.
     DropResult {
         success: bool,
         message: String,
+    },
+
+    /// Offers one clipboard snapshot. Every format except `FileList` follows as a
+    /// `ClipboardItem`. `FileList` means files were copied: they are NOT streamed with the offer,
+    /// the pasting side fetches them with `ClipFilesRequest` at the moment of the paste.
+    ClipboardOffer {
+        clip_id: u32,
+        formats: Vec<ClipboardFormat>,
+    },
+    /// One non-file clipboard format of the snapshot `clip_id`.
+    ClipboardItem {
+        clip_id: u32,
+        format: ClipboardFormat,
+        data: Vec<u8>,
+    },
+
+    /// Starts a file stream: `entries` entries (files and directories) follow.
+    FilesBegin {
+        stream_id: u32,
+        entries: u32,
+        total_bytes: u64,
+    },
+    /// Announces one entry. `rel_path` uses `/` separators and starts with a top-level name.
+    FileEntry {
+        stream_id: u32,
+        index: u32,
+        rel_path: String,
+        is_dir: bool,
+        size: u64,
+    },
+    /// File content of entry `index`, in order.
+    FileChunk {
+        stream_id: u32,
+        index: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Ends a file stream.
+    FilesEnd {
+        stream_id: u32,
+        success: bool,
+        error: Option<String>,
+    },
+
+    /// Host -> guest: the pointer left the canvas with the left button held; is a guest
+    /// drag-and-drop running at these guest pixels?
+    GuestDragProbe {
+        x: u32,
+        y: u32,
+    },
+    /// Guest -> host: a drag started in the guest. `names` are the top-level file names (empty for
+    /// a text drag), `text` the dragged text if any.
+    GuestDragOffer {
+        drag_id: u32,
+        names: Vec<String>,
+        total_bytes: u64,
+        text: Option<String>,
+    },
+    /// Guest -> host: no drag was found.
+    GuestDragNone,
+    /// Host -> guest: a Linux application asked for the dragged files; stream them as a file
+    /// stream with `stream_id == drag_id`.
+    GuestDragFetch {
+        drag_id: u32,
+    },
+    /// Host -> guest: the drag is over (dropped or cancelled).
+    GuestDragEnd {
+        drag_id: u32,
+    },
+    /// Either direction: the user pasted files from the snapshot `clip_id` this side was offered.
+    /// The offering side answers with a file stream (`FilesBegin`...`FilesEnd`) whose
+    /// `stream_id` is `clip_id`.
+    ClipFilesRequest {
+        clip_id: u32,
+    },
+    /// Sender -> receiver, right after a `ClipboardOffer` that lists `FileList`: names and sizes
+    /// of the offered entries in stream order, so the receiver can present the files (virtual
+    /// files) without transferring anything. The data still only follows a `ClipFilesRequest`.
+    ClipFilesManifest {
+        clip_id: u32,
+        entries: Vec<ManifestEntry>,
     },
 }
 
@@ -299,18 +395,47 @@ mod tests {
                 current_dpi: 125,
                 os_description: "Windows 11 Pro 23H2".to_string(),
             },
-            Message::ClipboardAnnounce {
-                formats: vec![ClipboardFormat::Text, ClipboardFormat::Png],
+            Message::ClipboardOffer {
+                clip_id: 7,
+                formats: vec![ClipboardFormat::Text, ClipboardFormat::Html, ClipboardFormat::FileList],
             },
-            Message::ClipboardRequest {
-                format: ClipboardFormat::Text,
-            },
-            Message::ClipboardPayload {
+            Message::ClipboardItem {
+                clip_id: 7,
                 format: ClipboardFormat::Text,
                 data: "Hello from Linux host!".as_bytes().to_vec(),
             },
+            Message::FilesBegin { stream_id: 7, entries: 2, total_bytes: 4 },
+            Message::FileEntry { stream_id: 7, index: 0, rel_path: "dir".into(), is_dir: true, size: 0 },
+            Message::FileEntry { stream_id: 7, index: 1, rel_path: "dir/a.bin".into(), is_dir: false, size: 4 },
+            Message::FileChunk { stream_id: 7, index: 1, offset: 0, data: vec![1, 2, 3, 4] },
+            Message::FilesEnd { stream_id: 7, success: true, error: None },
+            Message::GuestDragProbe { x: 1900, y: 400 },
+            Message::GuestDragOffer {
+                drag_id: 9,
+                names: vec!["a.txt".into()],
+                total_bytes: 12,
+                text: Some("a.txt".into()),
+            },
+            Message::GuestDragNone,
+            Message::GuestDragFetch { drag_id: 9 },
+            Message::GuestDragEnd { drag_id: 9 },
+            Message::ClipFilesRequest { clip_id: 3 },
+            Message::ClipFilesManifest {
+                clip_id: 3,
+                entries: vec![
+                    ManifestEntry { rel_path: "dir".into(), is_dir: true, size: 0 },
+                    ManifestEntry { rel_path: "dir/a.bin".into(), is_dir: false, size: 4 },
+                ],
+            },
+            Message::DropBegin {
+                transfer_id: 1,
+                x: 640,
+                y: 360,
+                file_count: 1,
+            },
             Message::DropFileStart {
                 transfer_id: 1,
+                operation_id: 1,
                 filename: "document.pdf".to_string(),
                 total_bytes: 1024,
             },
@@ -326,6 +451,8 @@ mod tests {
             },
             Message::DropText {
                 text: "Pasted text from host".to_string(),
+                x: 640,
+                y: 360,
             },
             Message::DropResult {
                 success: true,
@@ -368,6 +495,8 @@ mod tests {
         };
         let msg3 = Message::DropText {
             text: "Hello".into(),
+            x: 100,
+            y: 200,
         };
 
         let mut stream = Vec::new();

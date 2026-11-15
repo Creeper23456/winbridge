@@ -2,6 +2,7 @@
 
 //! QEMU D-Bus Display (`org.qemu.Display1`) interface integration.
 
+use crate::input::InputPipeline;
 use std::os::fd::OwnedFd as StdOwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,10 @@ pub trait Mouse {
     fn release(&self, button: u32) -> zbus::Result<()>;
     fn set_abs_position(&self, x: u32, y: u32) -> zbus::Result<()>;
     fn rel_motion(&self, dx: i32, dy: i32) -> zbus::Result<()>;
+    /// True while QEMU's active pointing device is absolute (usb-tablet); `RelMotion` is then
+    /// refused, and `SetAbsPosition` is refused when it is false.
+    #[zbus(property)]
+    fn is_absolute(&self) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -182,8 +187,9 @@ impl DisplayListener {
 #[allow(dead_code)]
 pub struct DbusDisplayConnection {
     pub mouse: MouseProxy<'static>,
-    pub keyboard: KeyboardProxy<'static>,
     pub console: ConsoleProxy<'static>,
+    /// Every pointer and key event for the guest goes through this one ordered queue.
+    pub input: InputPipeline,
 }
 
 impl DbusDisplayConnection {
@@ -238,10 +244,12 @@ impl DbusDisplayConnection {
             }
         });
 
+        let input = InputPipeline::spawn(mouse.clone(), keyboard);
+
         Ok(Self {
             mouse,
-            keyboard,
             console,
+            input,
         })
     }
 }

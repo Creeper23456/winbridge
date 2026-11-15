@@ -44,6 +44,11 @@ pub fn attach_console() -> bool {
 
 /// Installs the global tracing subscriber.
 pub fn init(has_console: bool) {
+    init_as(has_console, "agent.log");
+}
+
+/// Like [`init`], logging to `file_name` below `%LOCALAPPDATA%\WinBridge` when there is no console.
+pub fn init_as(has_console: bool, file_name: &str) {
     if has_console {
         tracing_subscriber::fmt()
             .with_ansi(false)
@@ -60,7 +65,7 @@ pub fn init(has_console: bool) {
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("agent.log"))
+        .open(dir.join(file_name))
     {
         Ok(file) => tracing_subscriber::fmt()
             .with_ansi(false)

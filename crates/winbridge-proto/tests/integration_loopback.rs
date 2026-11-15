@@ -142,8 +142,14 @@ async fn test_drag_and_drop_chunking_stream() {
         loop {
             let msg = read_frame_async(&mut server_read).await.unwrap();
             match msg {
-                Message::DropFileStart { transfer_id, filename, total_bytes } => {
+                Message::DropBegin { transfer_id, x, y, file_count } => {
                     assert_eq!(transfer_id, 1);
+                    assert_eq!((x, y), (320, 200));
+                    assert_eq!(file_count, 1);
+                }
+                Message::DropFileStart { transfer_id, operation_id, filename, total_bytes } => {
+                    assert_eq!(transfer_id, 1);
+                    assert_eq!(operation_id, 1);
                     assert_eq!(filename, "test.bin");
                     assert_eq!(total_bytes, payload_for_server.len() as u64);
                 }
@@ -178,8 +184,21 @@ async fn test_drag_and_drop_chunking_stream() {
         let chunk_size = 16 * 1024;
         write_frame_async(
             &mut client_write,
+            &Message::DropBegin {
+                transfer_id: 1,
+                x: 320,
+                y: 200,
+                file_count: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        write_frame_async(
+            &mut client_write,
             &Message::DropFileStart {
                 transfer_id: 1,
+                operation_id: 1,
                 filename: "test.bin".into(),
                 total_bytes: test_payload.len() as u64,
             },
@@ -235,7 +254,8 @@ async fn test_clipboard_payload_exchange() {
         let msg = read_frame_async(&mut server_read).await.unwrap();
         assert_eq!(
             msg,
-            Message::ClipboardPayload {
+            Message::ClipboardItem {
+                clip_id: 1,
                 format: ClipboardFormat::Text,
                 data: "Hello from host".as_bytes().to_vec(),
             }
@@ -243,7 +263,8 @@ async fn test_clipboard_payload_exchange() {
 
         write_frame_async(
             &mut server_write,
-            &Message::ClipboardPayload {
+            &Message::ClipboardItem {
+                clip_id: 1,
                 format: ClipboardFormat::Text,
                 data: "Hello from guest".as_bytes().to_vec(),
             },
@@ -255,7 +276,8 @@ async fn test_clipboard_payload_exchange() {
     let client_task = tokio::spawn(async move {
         write_frame_async(
             &mut client_write,
-            &Message::ClipboardPayload {
+            &Message::ClipboardItem {
+                clip_id: 1,
                 format: ClipboardFormat::Text,
                 data: "Hello from host".as_bytes().to_vec(),
             },
@@ -266,7 +288,8 @@ async fn test_clipboard_payload_exchange() {
         let reply = read_frame_async(&mut client_read).await.unwrap();
         assert_eq!(
             reply,
-            Message::ClipboardPayload {
+            Message::ClipboardItem {
+                clip_id: 1,
                 format: ClipboardFormat::Text,
                 data: "Hello from guest".as_bytes().to_vec(),
             }

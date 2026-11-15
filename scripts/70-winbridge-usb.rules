@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Gives the active local seat user access to USB device nodes so winbridge-host can pass
+# devices to the guest. Installed by scripts/install-host-udev.sh.
+#
+# Keyboards and mice: any interface with class 03 (HID) and protocol 01 (keyboard) or 02 (mouse),
+# any subclass, composite devices included. These devices are skipped and never get this ACL.
+# Matching is on the USB device node's ID_USB_INTERFACES, set by the usb_id builtin.
+# This does not cover /dev/input/* or /dev/hidraw*; those are outside this rule.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:03??01:*", GOTO="winbridge_usb_end"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:03??02:*", GOTO="winbridge_usb_end"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", TAG+="uaccess"
+LABEL="winbridge_usb_end"
