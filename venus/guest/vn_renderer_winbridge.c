@@ -444,13 +444,17 @@ static const GUID wbvn_ivshmem_guid = { 0xdf576976, 0x569d, 0x4672,
 #define WBVN_IOCTL_RELEASE WBVN_IOCTL(0x803)
 #define WBVN_CACHE_CACHED 1
 
-/* IVSHMEM_MMAP */
+/* IVSHMEM_MMAP as the driver fills it. The driver checks the output buffer length against the size
+ * of its own struct for the caller's bitness: 32 bytes for 64-bit code, 24 for a 32-bit process
+ * (measured with tests/ivshmem-probe.c), which is what a native struct gives in both. */
 struct wbvn_ivshmem_mmap {
    uint16_t peer_id;
    uint64_t size;
    void *ptr;
    uint16_t vectors;
 };
+_Static_assert(sizeof(struct wbvn_ivshmem_mmap) == (sizeof(void *) == 8 ? 32 : 24),
+               "IVSHMEM_MMAP has the size the driver expects");
 
 #define SLOT_LD32(bar, off) \
    __atomic_load_n((const uint32_t *)((bar) + WBVN_SLOT_BLOCK + (off)), __ATOMIC_ACQUIRE)
@@ -546,11 +550,15 @@ wbvn_try_device(struct wbvn *w, const wchar_t *path, bool *sized, bool *retry)
    const HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, NULL);
-   if (h == INVALID_HANDLE_VALUE)
+   if (h == INVALID_HANDLE_VALUE) {
+      vn_log(w->instance, "cannot open %ls (error %lu)", path, GetLastError());
       return "cannot open an ivshmem device";
+   }
    uint64_t size = 0;
    if (!DeviceIoControl(h, WBVN_IOCTL_SIZE, NULL, 0, &size, sizeof(size), &got, NULL) ||
        size != WBVN_SLOT_LEN) {
+      vn_log(w->instance, "ivshmem size query of %ls: error %lu, size %llu", path,
+             GetLastError(), (unsigned long long)size);
       CloseHandle(h);
       return "no ivshmem device has the size of a Venus slot";
    }
@@ -559,11 +567,12 @@ wbvn_try_device(struct wbvn *w, const wchar_t *path, bool *sized, bool *retry)
    uint8_t mode = WBVN_CACHE_CACHED;
    if (!DeviceIoControl(h, WBVN_IOCTL_MMAP, &mode, sizeof(mode), &m, sizeof(m), &got, NULL) ||
        !m.ptr) {
+      vn_log(w->instance, "ivshmem mapping of %ls: error %lu, ptr %p", path, GetLastError(), m.ptr);
       CloseHandle(h);
       return "every Venus slot is in use by another process";
    }
    w->bar_dev = h;
-   w->bar = m.ptr;
+   w->bar = (uint8_t *)m.ptr;
 
    uint64_t lane[2][2];
    const char *why = slot_check(w->bar, m.size, lane);
