@@ -103,9 +103,30 @@ struct Cli {
     #[arg(long)]
     shm: bool,
 
+    /// Let GTK pace the canvas redraws with the desktop's compositor. Some desktops then draw at
+    /// half their refresh rate; without this flag redraws follow the guest's updates
+    #[arg(long)]
+    vsync: bool,
+
     /// Run in headless self-test mode without opening GTK window
     #[arg(long)]
     headless_test: bool,
+}
+
+/// `GDK_DEBUG` with `no-vsync` added: GTK then repaints when asked instead of waiting for the
+/// compositor's frame sync. On the measured X11 GNOME session (60 Hz) that wait let a canvas draw
+/// only every second frame (30 Hz), whatever the guest delivered; the update rate of the guest
+/// (60 a second on the desktop, 64 Hz) is what the canvas should follow. Redraws are still only
+/// asked for when QEMU reports a change, so the "100% CPU" of the flag (continuous animation)
+/// does not apply.
+fn with_no_vsync(current: &str) -> String {
+    if current.split([':', ' ']).any(|flag| flag == "no-vsync") {
+        current.to_string()
+    } else if current.is_empty() {
+        "no-vsync".to_string()
+    } else {
+        format!("{}:no-vsync", current)
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -122,6 +143,10 @@ fn main() -> glib::ExitCode {
     if cli.headless_test {
         info!("Running in headless self-test mode: OK");
         return glib::ExitCode::SUCCESS;
+    }
+
+    if !cli.vsync {
+        std::env::set_var("GDK_DEBUG", with_no_vsync(&std::env::var("GDK_DEBUG").unwrap_or_default()));
     }
 
     if cli.stats {
@@ -345,4 +370,17 @@ fn main() -> glib::ExitCode {
     drop(_guard);
     rt.shutdown_timeout(Duration::from_secs(2));
     exit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_no_vsync;
+
+    #[test]
+    fn no_vsync_is_added_once_and_the_rest_kept() {
+        assert_eq!(with_no_vsync(""), "no-vsync");
+        assert_eq!(with_no_vsync("frames"), "frames:no-vsync");
+        assert_eq!(with_no_vsync("frames:no-vsync"), "frames:no-vsync");
+        assert_eq!(with_no_vsync("no-vsync opengl"), "no-vsync opengl");
+    }
 }
