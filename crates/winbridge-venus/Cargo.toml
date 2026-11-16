@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "winbridge-venus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host side of the WinBridge Venus channel: runs the guest's Venus context on virglrenderer"
+
+[lib]
+name = "winbridge_venus"
+
+[[bin]]
+name = "winbridge-venus"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
