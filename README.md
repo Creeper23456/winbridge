@@ -4,7 +4,7 @@
 
 **A Linux GTK4 viewer and guest agent for Windows 11 on QEMU/KVM.**
 
-WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync: the guest resolution follows the window size (no letterboxing), the guest DPI scale follows the Linux scale factor, the clipboard (text, HTML, RTF, images, files) is shared both ways, and files/text can be dragged between the two sides. The guest cursor replaces the Linux pointer while it is over the canvas.
+WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync: the guest resolution follows the window size (no letterboxing), the guest DPI scale follows the Linux scale factor, the clipboard (text, HTML, RTF, images, files) is shared both ways, and files, folders and text can be dragged between the two sides. The guest cursor replaces the Linux pointer while it is over the canvas. Programs in the guest can use the host GPU for Vulkan, Direct3D 9/10/11 and OpenGL ([3D acceleration](#3d-acceleration)), and the control and bulk traffic can move to shared memory instead of virtio-serial.
 
 It exists because QEMU's own GTK window cannot drive the resolution of a Windows guest using the virtio-gpu (`viogpudo`) driver: the driver learns the new size but nothing applies it. WinBridge asks QEMU for the new size and applies it itself from inside the guest.
 
@@ -25,6 +25,20 @@ It exists because QEMU's own GTK window cannot drive the resolution of a Windows
 - **Resolution**: the viewer calls `SetUIInfo` with the canvas size in physical pixels (logical size x scale factor), then asks the agent to apply it with `SetDisplayConfig` (the same call the virtio-win helper uses). `ChangeDisplaySettings` is only a fallback: Windows offers it a fixed mode list.
 - **DPI**: sent after the resolution (Windows caps the scale by the resolution). The agent reads the effective DPI back and reports the real outcome.
 - **Channel**: versioned, length-prefixed frames on a dedicated virtio-serial port, `org.winbridge.0` ([protocol](docs/PROTOCOL.md), [architecture](docs/ARCHITECTURE.md)). It does not touch `org.qemu.guest_agent.0`.
+- **Shared memory (optional, `shm = true`)**: an `ivshmem` device carries the control and bulk lanes (clipboard, drops, file streams) with priorities, so a large paste cannot queue control messages behind it. virtio-serial stays the handshake and the fallback ([design and measurements](docs/IVSHMEM-TRANSPORT.md)).
+- **Display path**: when QEMU offers it (`Listener.Unix.Map`), the viewer maps the guest's scanout memory read-only and draws from it, so no pixel is sent or copied; GTK redraws are paced by updates, not by the compositor (see [Speed and diagnostics](#speed-and-diagnostics)).
+
+## 3D acceleration
+
+Programs in the guest can use the host GPU. WinBridge ports Mesa's **Venus**, a Vulkan serialization layer, to Windows: the guest driver `vulkan_virtio.dll` encodes every Vulkan call into a command stream, the stream crosses to the host through shared memory, and `winbridge-venus` runs it on the host GPU with virglrenderer's Venus renderer. The design, the alternatives that were rejected and every measurement are in [ADR 0001](docs/adr/0001-venus-as-serialization-layer.md); build, install and run are in [`venus/README.md`](venus/README.md).
+
+- **What runs**: Vulkan programs; Direct3D 9, 10 and 11 through DXVK; OpenGL 4.6 through Zink (put Mesa's `opengl32.dll` and `libgallium_wgl.dll` next to the program); 32-bit programs with the x86 build of the same DLLs; FurMark 2's Vulkan mode.
+- **Measured** (Windows 11 LTSC guest, 4 vCPU, RTX 3060 Ti host, normal user token): a D3D11 triangle takes 1.9 ms a frame, the teapot scene 2.0 ms at 1280x720 (about 500 frames a second); a 16-minute run showed no leak and no host warning; FurMark's Vulkan mode runs at about 100 FPS. Direct3D 10 (2.35 ms) and 9, and the 32-bit builds (2.5 to 3.2 ms for the triangles and the teapot), ran too.
+- **No broker**: every Vulkan process gets one *slot*, a 64 MiB `ivshmem-plain` device plus a virtio-serial wake-up port, and one `winbridge-venus` process serves it. The launch script example starts them with `WINBRIDGE_VENUS=N`.
+- **Host needs**: a virglrenderer with the patches in `venus/patches/virglrenderer` (two of them are needed on NVIDIA 550) and its render server.
+- **Build from Linux**: `WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh` cross-compiles the driver, the OpenGL DLLs and the x86 builds with `clang-cl`; nothing is built inside the guest. `scripts/install-venus-icd.ps1` registers the driver (it needs the ivshmem driver).
+- **Cost**: the host's `winbridge-venus` busy-polls one core on purpose. During the teapot scene at 720p a 15 s sample showed the viewer at 45% of a core, QEMU at 202% and the Venus thread at 100%.
+- **Limits**: one Vulkan instance per slot. A program that leaves the OpenGL swap interval at 1 is paced to about 14.7 ms a frame. Applications other than the test programs and FurMark were not run. Without `winbridge-venus` a Vulkan program waits up to 30 s for the host.
 
 ## Status
 
@@ -40,6 +54,10 @@ Verified end to end (Windows 11 LTSC 2024 guest, virtio-win 0.1.285 GPU driver, 
 | Drag and drop of text onto the window | works (UTF-8 verified) |
 | Clipboard HTML, RTF, images, files; drag from Windows to Linux | implemented, **not yet verified end to end** |
 | Guest cursor instead of Linux pointer | the Linux pointer is hidden over the canvas; a guest hardware-cursor sprite is shown if the guest sends one |
+| 3D: Vulkan, Direct3D 9/10/11 (DXVK), OpenGL (Zink), x64 and x86, FurMark 2 Vulkan | works in the LTSC VM with the test programs and FurMark; other applications not run |
+| Shared-memory transport (`shm = true`) for control and bulk traffic | works; in the build VM 2.0-3.4 GiB/s host to guest against 239 MiB/s over virtio-serial, and control round trips stay at p50 135-150 us while a bulk stream saturates it (serial: p50 4.2 ms) |
+| Display from shared-memory scanout, no copy in the viewer | works (framebuffer copy 12.5 ms -> 0.0 ms; about 60 display updates a second with GDI and with Vulkan programs) |
+| Folder drag and drop as one zip, both directions | implemented and unit-tested; the end-to-end run in the VM is being checked, so treat it as unverified |
 
 Known limitations:
 
@@ -90,6 +108,14 @@ The agent is linked with the static CRT (`.cargo/config.toml`), so it runs on a 
 The agent **must run in the logged-in user's session with administrator rights** (the installer registers a highest-privilege task at logon). Opening `\\.\Global\org.winbridge.0` needs administrator rights; a limited-token process retries silently forever. The viewer and the agent can be restarted independently of each other.
 
 The guest needs the virtio-win drivers (`viogpudo`, `vioser`). Run the agent with `RUST_LOG=info` to see what it does.
+
+### Speed and diagnostics
+
+- `--shm` (or `shm = true`) turns on the shared-memory transport. It needs the ivshmem device (`WINBRIDGE_SHM=1` in `scripts/launch-qemu-winbridge.sh`), the ivshmem driver in the guest and the agent installed with it; without them nothing changes.
+- The viewer sets `GDK_DEBUG=no-vsync` before GTK starts. On the measured X11 GNOME session (monitors at 75 and 60 Hz) GTK's frame clock ran at a median of 33 ms and a guest that delivered 60 updates a second was shown at 30. `--vsync` restores GTK's pacing.
+- `--stats` logs once a second what the display path costs (updates, time in the handler, draws, framebuffer copy time, how far apart the updates arrive) and, while you use the mouse or keyboard, how many input calls went to QEMU and how long QEMU took to answer them.
+- `winbridge-venus --stats` logs its loop and how many bytes of guest memory it compared, split into rings, other shared memory and device memory.
+- Examples that play the viewer against a real agent without GTK: `shme2e` (transport throughput and latency) and `folderdnd` (one folder drop), in `crates/winbridge-host/examples/`. The viewer must not be connected while they run.
 
 ### Launch script and lifecycle
 
