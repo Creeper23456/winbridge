@@ -186,7 +186,8 @@ stage_mesa() {
         say "patch $(basename "$p")"
         git -C "$src" apply --whitespace=nowarn "$p"
     done
-    cp "$repo/venus/guest/vn_renderer_winbridge.c" "$repo/venus/guest/wbvn_proto.h" "$src/src/virtio/vulkan/"
+    cp "$repo/venus/guest/vn_renderer_winbridge.c" "$repo/venus/guest/wbvn_proto.h" \
+        "$repo/venus/guest/wbvn_ring.h" "$src/src/virtio/vulkan/"
 }
 
 stage_build() {

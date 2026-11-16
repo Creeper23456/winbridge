@@ -20,7 +20,7 @@ The work directory is `~/.cache/winbridge-venus-build` unless `WBVN_BUILD_DIR` s
 
 | Item | Pin |
 |---|---|
-| Mesa | `0a6fa60abb73` (mesa-26.3.0); the patches in `../patches/0*.patch` are applied in order, then `../guest/vn_renderer_winbridge.c` and `wbvn_proto.h` are copied in |
+| Mesa | `0a6fa60abb73` (mesa-26.3.0); the patches in `../patches/0*.patch` are applied in order, then `../guest/vn_renderer_winbridge.c`, `wbvn_proto.h` and `wbvn_ring.h` are copied in |
 | Wrapped subprojects | whatever that Mesa commit's `subprojects/*.wrap` name: venus-protocol v1.1.3, DirectX-Headers v1.619.1, zlib 1.3.1 |
 | Compiler | LLVM 19 (built with Debian's 19.1.7) |
 | Python | meson 1.12.1 and the packages listed in `PY_PACKAGES` |
