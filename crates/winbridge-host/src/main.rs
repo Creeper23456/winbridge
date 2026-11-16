@@ -23,6 +23,7 @@ mod refresh;
 mod router;
 mod serial_client;
 mod shm;
+mod stats;
 mod theme;
 mod transfer;
 mod tray;
@@ -84,6 +85,10 @@ struct Cli {
     #[arg(long)]
     usb_bus: Option<String>,
 
+    /// Log what the display path costs once a second (updates from QEMU, canvas redraws)
+    #[arg(long)]
+    stats: bool,
+
     /// Actively grab the keyboard while the pointer is over the VM canvas (off by default: a
     /// grab takes keys from the rest of the session, including other apps' input methods)
     #[arg(long)]
@@ -119,6 +124,10 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
+    if cli.stats {
+        stats::enable();
+    }
+
     let overrides = config::CliOverrides {
         launch_script: cli.launch_script,
         socket: cli.socket,
@@ -145,6 +154,7 @@ fn main() -> glib::ExitCode {
 
     clipboard::purge_staging();
     let _guard = rt.enter();
+    stats::start();
 
     let app = Application::builder()
         .application_id("org.winbridge.viewer")

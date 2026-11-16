@@ -3,6 +3,7 @@
 //! QEMU D-Bus Display (`org.qemu.Display1`) interface integration.
 
 use crate::input::InputPipeline;
+use crate::stats;
 use std::os::fd::OwnedFd as StdOwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -110,12 +111,14 @@ pub struct DisplayListener {
 #[zbus::interface(name = "org.qemu.Display1.Listener")]
 impl DisplayListener {
     fn scanout(&self, width: u32, height: u32, stride: u32, _pixman_format: u32, data: Vec<u8>) {
+        let t = stats::begin();
         if let Ok(mut fb) = self.fb.lock() {
             fb.width = width;
             fb.height = height;
             fb.stride = stride;
             fb.data = data;
         }
+        stats::scanout(t);
         (self.on_update)();
     }
 
@@ -129,6 +132,8 @@ impl DisplayListener {
         _pixman_format: u32,
         data: Vec<u8>,
     ) {
+        let t = stats::begin();
+        let (pixels, bytes) = (width.max(0) as u64 * height.max(0) as u64, data.len() as u64);
         if let Ok(mut fb) = self.fb.lock() {
             let fb_stride = fb.stride as usize;
             let src_stride = stride as usize;
@@ -145,6 +150,7 @@ impl DisplayListener {
                 }
             }
         }
+        stats::update(t, pixels, bytes);
         (self.on_update)();
     }
 

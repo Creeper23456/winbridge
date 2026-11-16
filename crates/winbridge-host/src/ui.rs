@@ -6,6 +6,7 @@ use crate::capture::Capture;
 use crate::dbus_display::{DbusDisplayConnection, Framebuffer};
 use crate::router::InputRouter;
 use crate::serial_client::SerialClientHandle;
+use crate::stats;
 use crate::transfer::{self, Direction, Transfer};
 use crate::config::{launch_log_path, Config};
 use crate::launch::LaunchOutcome;
@@ -1358,10 +1359,12 @@ mod tests {
         assert_eq!(p.update(t0 + PROBE_WINDOW, true, true, false), ProbeAction::GiveUp);
         assert_eq!(p.update(t0 + PROBE_WINDOW + Duration::from_secs(1), true, true, false), ProbeAction::Idle);
     }
+    let t = stats::begin();
 
     #[test]
     fn stops_on_release_reentry_or_host_drag_and_restarts() {
         let t0 = Instant::now();
+    let copy_ns = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
         for (down, outside, host) in [(false, true, false), (true, false, false), (true, true, true)] {
             let mut p = ProbeState::default();
             assert_eq!(p.update(t0, true, true, false), ProbeAction::Probe);
@@ -1377,3 +1380,4 @@ mod tests {
         assert_eq!(p.update(t0 + PROBE_WINDOW, true, true, false), ProbeAction::Probe);
     }
 }
+    stats::draw(t, copy_ns);
