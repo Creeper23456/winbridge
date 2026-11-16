@@ -9,7 +9,8 @@ The design and its measured evidence are in `docs/adr/0001-venus-as-serializatio
 
 ```
 Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_renderer_winbridge.c)
-        -> virtio-serial org.winbridge.venus.0 (WBVN, see wbvn_proto.h)
+        -> two lanes in an ivshmem device the process owns (WBVN, wbvn_proto.h, wbvn_ring.h)
+           + a wake-up byte over virtio-serial org.winbridge.venus.N when a side sleeps
         -> winbridge-venus (host) -> virglrenderer vkr / render server -> host Vulkan driver
 ```
 
@@ -17,9 +18,11 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 
 | Path | Content |
 |---|---|
-| `guest/vn_renderer_winbridge.c`, `guest/wbvn_proto.h` | The `vn_renderer` backend and the WBVN wire protocol. Copy them into `src/virtio/vulkan/` of the Mesa tree. |
+| `guest/vn_renderer_winbridge.c`, `guest/wbvn_proto.h`, `guest/wbvn_ring.h` | The `vn_renderer` backend, the WBVN wire protocol with the slot layout, and the guest's ring code (the same layout as `crates/winbridge-shm`). Copy them into `src/virtio/vulkan/` of the Mesa tree. |
 | `guest/venus-probe.c` | Loads the driver directly and runs instance, device, submit and a buffer copy through the GPU. |
-| `patches/0001`-`0009` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply in order (`build/build.sh` does). |
+| `tests/ring_peer.c` | The guest end of the ring interoperability test of `crates/winbridge-venus`. |
+| `tests/d3d/` | The D3D programs (`tri11`, `teapot11` for D3D11 and `tri9` for D3D9) the driver is accepted with, run through DXVK. |
+| `patches/0001`-`0011` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply in order (`build/build.sh` does). |
 | `patches/virglrenderer/` | Patches to virglrenderer for the host: `0001` and `0002` are needed on NVIDIA 550, `0003` is the command trace. |
 | `tools/compare-command-traces.py` | Compares command traces of the Windows and the Linux driver. |
 | `build/` | The reproducible build of `vulkan_virtio.dll` from Linux: `build.sh`, the pins, the compiler flags. See `build/README.md`. |
@@ -31,14 +34,31 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 
 ## Run
 
-Host: start the VM with `-chardev socket,id=wv0,path=SOCK,server=on,wait=off -device
-virtserialport,chardev=wv0,name=org.winbridge.venus.0`, then `winbridge-venus --socket SOCK
---virgl-lib LIBVIRGLRENDERER --render-server VIRGL_RENDER_SERVER`. The bridge sets
-`VKR_DEBUG=opaque,nofenceexport` when `VKR_DEBUG` is unset; both flags come from the virglrenderer
-patches and are needed on NVIDIA 550.
+Host: a *slot* is one 64 MiB `ivshmem-plain` device plus one virtio-serial port. Create the
+backing file once (`/dev/shm/winbridge-venus0`, mode 0600, exactly 64 MiB) and start the VM with
 
-Guest: run `powershell -ExecutionPolicy Bypass -File scripts/install-venus-icd.ps1 -SourceDll vulkan_virtio.dll` from an elevated
-PowerShell. Applications then find the driver through the Vulkan loader.
+```
+-object memory-backend-file,id=wbv0,mem-path=/dev/shm/winbridge-venus0,size=64M,share=on
+-device ivshmem-plain,memdev=wbv0
+-chardev socket,id=wv0,path=SOCK,server=on,wait=off
+-device virtserialport,chardev=wv0,name=org.winbridge.venus.0
+```
+
+then `winbridge-venus --shm /dev/shm/winbridge-venus0 --socket SOCK --virgl-lib LIBVIRGLRENDERER
+--render-server VIRGL_RENDER_SERVER`. The process serves the slot for ever: each guest that claims
+it gets a fresh Venus context, and the slot is reset when the guest closes it, exits or stops
+showing signs of life for 10 s. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when `VKR_DEBUG` is
+unset; both flags come from the virglrenderer patches and are needed on NVIDIA 550.
+
+The slot's number (`--slot N`, default 0) is written into it and names the serial port, so slot N
+needs the port `org.winbridge.venus.N`. A guest Vulkan process maps one device for itself, so one
+slot serves one Vulkan instance at a time; a second one fails to initialise cleanly (within
+`WBVN_CONNECT_MS`, 5 s by default).
+
+Guest: the ivshmem driver must be installed (`docs/IVSHMEM-TRANSPORT.md` section 8), then run
+`powershell -ExecutionPolicy Bypass -File scripts/install-venus-icd.ps1 -SourceDll vulkan_virtio.dll` from an elevated
+PowerShell. Applications then find the driver through the Vulkan loader. `WBVN_SPIN_US` (default
+150) is how long the driver's reader polls for the host before it sleeps.
 
 ## Measuring
 

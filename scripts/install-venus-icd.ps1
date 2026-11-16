@@ -7,8 +7,8 @@ Installs and registers the WinBridge Venus Vulkan driver in Windows 11.
 Copies vulkan_virtio.dll (the Mesa Venus driver with the WinBridge renderer backend) to
 Program Files, writes its Vulkan ICD manifest next to it and registers the manifest under
 HKLM\SOFTWARE\Khronos\Vulkan\Drivers, which is where the Vulkan loader looks for drivers.
-The driver talks to the host through the virtio-serial port org.winbridge.venus.0, so the VM
-must be started with that port and the host must run winbridge-venus.
+The driver talks to the host through an ivshmem device and the virtio-serial port org.winbridge.venus.N, so the VM
+must be started with that device and port and the host must run winbridge-venus (venus/README.md).
 
 Run it from an elevated PowerShell. -Uninstall removes the registration and the files.
 #>

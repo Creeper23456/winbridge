@@ -2,7 +2,7 @@
 
 # WinBridge Shared-Memory Transport (ivshmem) Design
 
-Status (2026-11-16): **the control/bulk transport is implemented and measured end to end in a build VM; it stays opt-in (`shm = true`, default off) until it has run on the user's LTSC guest.** `crates/winbridge-shm` is the ring core, `winbridge-proto::ring` the message link (`docs/PROTOCOL.md` section 3), `winbridge-agent/src/ivshmem.rs` the guest device access. Results are in section 12. Not done: the graphics channel on the lanes, the guest broker (8a), the Venus port. Statements marked **[UNVERIFIED]** are not settled by a measurement yet; everything marked (measured) comes from `experiments/shmprobe/RESULTS.md` or section 12. Sizes are starting values.
+Status (2026-11-16): **the control/bulk transport is implemented and measured end to end in a build VM; it stays opt-in (`shm = true`, default off) until it has run on the user's LTSC guest.** `crates/winbridge-shm` is the ring core, `winbridge-proto::ring` the message link (`docs/PROTOCOL.md` section 3), `winbridge-agent/src/ivshmem.rs` the guest device access. Results are in section 12. **The Venus channel runs on the lanes** (section 8b, measured in a build VM), but without the broker of 8a: each Vulkan process maps a device of its own. Not done: the graphics broker (8a) as designed. Statements marked **[UNVERIFIED]** are not settled by a measurement yet; everything marked (measured) comes from `experiments/shmprobe/RESULTS.md` or section 12. Sizes are starting values.
 
 **Direction (user decision, 2026-11-16):** the measurements show the shared-memory path is two orders of magnitude faster than virtio-serial (6.6/7.7 GB/s end to end, 0.2 us ping-pong), so shared memory becomes the primary transport for control and bulk traffic as well as graphics, once the end-to-end test in the build VM confirms it with real agent code. virtio-serial remains only the handshake, the wake-up (kick) and the fallback. Shared memory stays opt-in (`shm = true`) until that test and a deployment to the user's guest have passed.
 
@@ -124,6 +124,24 @@ Because each device can be mapped by one process only, **the elevated agent (or 
 - **One extra guest-side memcpy** (client section to BAR, and BAR to client section for returned frames) in cached ordinary RAM, which is fast; zero-copy is therefore end to end only between broker and host. `VK_EXT_external_memory_host` import still works on the host side from the BAR.
 - **The broker replaces the single-handle graphics-port broker** already identified in `docs/GFX-DESIGN.md` risk 10 and must never run on the agent's control reader loop: separate threads, bounded queues, and a hard rule that a stuck client cannot stall control traffic.
 - The broker is a guest-side attack surface: it parses client input, so it validates client sections the same way the host validates the BAR.
+
+## 8b. Venus client slots: no broker, one device per Vulkan process (implemented 2026-11-16)
+
+The Venus channel (`venus/README.md`, `docs/adr/0001-venus-as-serialization-layer.md`) does not use the broker of 8a. A guest Vulkan process maps an ivshmem device **for itself**; the device is its *slot*. What decided it:
+
+- The one-mapping rule that forces a broker also gives a natural claim: the process whose `REQUEST_MMAP` succeeds owns the device until its handle closes (process exit and kill included, measured in `experiments/shmprobe/RESULTS.md`). No arbitration code is needed.
+- A broker adds a hop, a copy and a wake-up between the Vulkan process and the host on a 4-vCPU guest, for traffic whose latency is the product. With slots the driver writes records straight into the lane the host reads.
+- The cost is that N concurrent Vulkan processes need N devices and N serial ports. A Vulkan *instance* in the same process as another also needs its own slot, because a process cannot map one device twice.
+
+**Layout.** A slot is a 64 MiB device (not the control size, so the agent tells them apart by `IOCTL_SIZE`) with a `winbridge-shm` region of two lanes of 16 MiB each, guest to host (id 1) and host to guest (id 2), `Role::GuestClient`, capability bit 0 (`venus`). The header page carries a slot block at offset 0x800 (`crates/winbridge-venus/src/slot.rs`, mirrored in `venus/guest/wbvn_proto.h`): magic, version, the slot id, a state (free, claimed, closed), the claimant's nonce and a heartbeat. The records of a lane are pieces of one byte stream of WBVN messages.
+
+**Lifecycle.** The host lays the region out, publishes the slot block last (a guest that sees no magic waits), and polls the state. A guest claims a free slot with a compare-and-swap. If it finds the slot claimed, the owner is dead (this process holds the only mapping), so it sets the state to closed; the host sees the close, ends the session, lays the region out again and frees the slot. A guest that exits closes its slot (`DllMain`); one that is killed leaves it claimed, and the host frees it when the heartbeat (a counter the guest's reader increments every 100 ms) has not moved for 10 s [UNVERIFIED: a VM that was paused for longer than that loses its session when it resumes].
+
+**Wake-ups.** Both sides poll for a short time, then publish `sleeping` on the lane they read and wait; the producer that finds the flag set and the lane empty sends one byte over the slot's virtio-serial port `org.winbridge.venus.<id>` (section 5). The guest's polling time is `WBVN_SPIN_US` (150 us by default). A sleeping guest reader wakes on that byte or after 20 ms, whichever comes first.
+
+**Security.** The host treats the region as hostile, as in section 7 (the `winbridge-shm` consumer copies and validates). The slot devices are **not** hardened like the control device: the agent's `harden_devices` only touches devices of the control size, because the Vulkan processes that claim slots run as the interactive user, whose filtered token has the Administrators SID deny-only. A slot therefore keeps the driver's default DACL (Everyone), and any local process can claim a free slot, with the same reach as any process that loads the Vulkan driver: it can run commands on the host GPU through virglrenderer. [UNVERIFIED: that a standard user can open and map a slot device while the control device stays closed to that user.]
+
+**Measured** (build VM, 4 vCPUs): `PING` round trip of the WBVN channel, serial against lanes, minimum: 16 B 96-122 us against 2 us, 4 KiB 113-138 us against 18 us, 64 KiB 410-567 us against 143 us, 1 MiB 4.9-5.9 ms against 0.62 ms. Frame time of DXVK triangle and teapot did **not** follow, see section 3.8 of the ADR.
 
 
 ## 9. Verification plan

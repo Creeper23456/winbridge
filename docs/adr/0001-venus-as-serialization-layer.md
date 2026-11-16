@@ -18,8 +18,8 @@ Mesa's Venus driver (`src/virtio/vulkan`, MIT) generates the encoding of the who
 2. Host = `crates/winbridge-venus` on virglrenderer `vkr` (render-server process), fed from the mirrored ring.
 3. **Memory (amended 2026-11-16, replaces "no blob").** Shmem (command rings, command-stream pools) and `VkDeviceMemory` are *mirrored* between guest and host by copy, not shared: the guest copy is a `VirtualAlloc(MEM_WRITE_WATCH)` region diffed against a snapshot, pushed at submit/flush; GPU writes come back when a fence retires. Host-visible `VkDeviceMemory` is a mappable HOST3D blob on the host, mapped by the bridge. NVIDIA 550 exports dma-bufs it cannot mmap, so the host runs a virglrenderer patch (`VKR_DEBUG=opaque`, `venus/patches/virglrenderer/0001`) that exports an opaque fd instead. Guest event, semaphore and query feedback are disabled (`VN_PERF=no_event_feedback,no_semaphore_feedback,no_query_feedback`) because they would poll mapped device memory.
 4. **Sync fences are created without sync-fd export** (`VKR_DEBUG=nofenceexport`, patch `0002`). Evidence: replaying a recorded guest session (`--record`/`--replay`) segfaulted at a fixed offset in `libnvidia-glcore.so.550.163.01` in the `vkr-queue` thread (`vkWaitForFences`) on every run; with `VK_EXPORT_FENCE_CREATE_INFO` removed the same replay and the VM probe both pass. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when the variable is unset. Cause inside the driver is not known.
-5. **The hand-written ICD is removed** (user decision, 2026-11-16): `winbridge-gfx-icd`, `winbridge-gfx-vk`, `winbridge-gfx-vkgen`, `winbridge-gfx`, `winbridge-gfx-proto` and `winbridge-gfx-probe` no longer exist in the tree. There is no fallback; the D3D11 test programs moved to `venus/tests/d3d11/`.
-6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus nine local patches (`venus/patches/`) cross-compiles clean and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
+5. **The hand-written ICD is removed** (user decision, 2026-11-16): `winbridge-gfx-icd`, `winbridge-gfx-vk`, `winbridge-gfx-vkgen`, `winbridge-gfx`, `winbridge-gfx-proto` and `winbridge-gfx-probe` no longer exist in the tree. There is no fallback; the D3D programs moved to `venus/tests/d3d/`.
+6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus eleven local patches (`venus/patches/`) cross-compiles clean and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
 7. **Presentation uses Mesa's software WSI** (`wsi_common_win32.cpp`, the GDI path lavapipe and dzn use), enabled for Venus by patch `0007`: `VK_KHR_win32_surface` and `VK_KHR_swapchain` are exposed, swapchain images are linear host-visible images that the guest reads through the mirrored mapping and blits to the window. The backend reports `has_implicit_fencing = true` (no sync files exist); the software WSI waits on a fence before it reads an image and a bo is brought up to date when that fence retires. Fence imports with fd `-1` mean "already signaled", as upstream defines.
 8. **Only cached host-visible memory types are exposed** (patch `0008`). The host reads mirrored memory after every fence; on NVIDIA 550 the write-combined and BAR host-visible types are uncached for CPU reads, and one fence retire that scanned about 10 MiB of them took about 490 ms (measured through host-side phase timing in a replay of a recorded session). Non-cached types keep their index but lose `HOST_VISIBLE` and `HOST_COHERENT`.
 
@@ -87,7 +87,7 @@ Limit: this covers the basic call sequence only. A draw, memory and presentation
 
 ### 3.6 Teapot-class scene on both paths (measured 2026-11-16)
 
-`venus/tests/d3d11/teapot11.cpp` draws a procedural pot (lathe body, lid, knob, spout, handle) and a ground plane with a depth buffer, two indexed draws, a sampled 64x64 checker texture with a wrap sampler and a constant buffer updated between the draws (640x360, frame 59 of a fixed rotation), through DXVK 3.1.1 d3d11:
+`venus/tests/d3d/teapot11.cpp` draws a procedural pot (lathe body, lid, knob, spout, handle) and a ground plane with a depth buffer, two indexed draws, a sampled 64x64 checker texture with a wrap sampler and a constant buffer updated between the draws (640x360, frame 59 of a fixed rotation), through DXVK 3.1.1 d3d11:
 
 | Path | Result |
 |---|---|
@@ -106,6 +106,7 @@ Both sides count what they do: `WBVN_STATS=<file>` in the guest (a line of count
 | The pump yields to threads that want its locks | 5.61 | 5.10 |
 | One write per message and per flush with its submit; block-wise host scan | 3.24 | 4.55 |
 | A renderer wait flushes first; the pump stays awake while anything flushes | 3.27 (300-frame repeats 3.29, 3.78, 4.55) | 4.87 (300-frame repeats 4.83, 5.07) |
+| Venus channel on ivshmem lanes; the ring is pushed when its tail is published; the pump sweeps once per tick (600 frames; 3 runs each, tri11 1.77-1.92, teapot 2.11-2.20) | 1.86 | 2.16 |
 | Hand-written ICD | 1.56 | fails (3.6) |
 
 The frames stayed bit-identical (tri11 against the hand-written ICD's frame; teapot between versions), and the probe and 5 repeat runs passed with no host error, no crash dump and no segfault in `dmesg`.
@@ -144,6 +145,6 @@ Not done: fewer renderer waits per frame (what in DXVK and the software presenta
 ## 7. Not verified
 
 - Venus on a driver of 570.86 or later (not tried).
-- Frame time of the Venus path: 3.3 ms against 1.56 ms for the hand-written ICD on the triangle (about 2.1 times), 4.5 to 5 ms for the teapot, which the hand-written ICD cannot draw. The remainder is mostly renderer fence latency, about five round trips a frame (section 3.7). Bos above 2 MiB are not host-scanned.
-- Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`).
+- Frame time of the Venus path: 1.86 ms against 1.56 ms for the hand-written ICD on the triangle (the 1.56 is over 1200 frames, the 1.86 over 600; not run side by side), 2.2 ms for the teapot, which the hand-written ICD cannot draw. With the pump polling for 4000 rounds after traffic, the same DLL took 5.3 to 6.3 ms for the teapot; the table row above changes the channel, the ring push and the pump together, and only the pump's share was measured by itself (A/B runs of 600 frames, two to five per variant). Bos above 2 MiB are not host-scanned.
+- Idle CPU cost of the guest pump thread: one wake-up per timer tick (4.4 to 6.3 ms in this guest); the CPU use itself was not measured.
 - Container tooling: docker was unusable without root, so the Linux side of the comparison ran natively in a user prefix, not in a container.
