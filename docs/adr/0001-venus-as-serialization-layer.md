@@ -67,10 +67,10 @@ Mesa Venus `vulkan_virtio.dll` installed with `scripts/install-venus-icd.ps1`, h
 | Test | Result |
 |---|---|
 | `venus-probe.exe`: instance, device, empty submit, buffer copy through the GPU | Pass, exit 0 |
-| DXVK 3.1.1 d3d11 triangle (`tri11.exe`, 640x360, 120 frames), three runs | Pass 3 of 3; frame **bit-identical** to the frame the hand-written ICD produced (0 of 230400 pixels differ); avg 37.3, 41.0, 43.2 ms per frame, first frame 330-420 ms |
-| Hand-written ICD, same program | avg 4.48 ms per frame |
+| DXVK 3.1.1 d3d11 triangle (`tri11.exe`, 640x360, 120 frames), three runs | Pass 3 of 3; frame **bit-identical** to the frame the hand-written ICD produced (0 of 230400 pixels differ); avg 37.3, 41.0, 43.2 ms per frame, first frame 330-420 ms (before the fixes of section 3.7) |
+| Hand-written ICD, same program | avg 4.48 ms per frame over 120 frames including start-up; 1.56 ms over 1200 frames (section 3.7) |
 
-The Venus path is about nine times slower per frame than the hand-written ICD. Causes not yet separated: round trips through the pump thread, fence retire and copy-back of the swapchain image, serial throughput. Defects found and fixed on the way, each with its evidence in the commit history: `Sleep(1)` lasting 15.6 ms (timer resolution), uncached memory scan (8), sync-file semantics (7), ring tail pushed ahead of its commands (the guest read the tail after the write-watch list, so a tail could arrive without the page behind it; one in several runs ended in `vkUpdateDescriptorSets resulted in CS error`).
+The first Venus runs were about nine times slower per frame than the hand-written ICD (120 frames each, start-up included); where the time went and what fixed it is section 3.7. Defects found and fixed on the way, each with its evidence in the commit history: `Sleep(1)` lasting 15.6 ms (timer resolution), uncached memory scan (8), sync-file semantics (7), ring tail pushed ahead of its commands (the guest read the tail after the write-watch list, so a tail could arrive without the page behind it; one in several runs ended in `vkUpdateDescriptorSets resulted in CS error`).
 
 ### 3.5 Command streams compared with Mesa's Linux driver (measured 2026-11-16)
 
@@ -95,6 +95,27 @@ Limit: this covers the basic call sequence only. A draw, memory and presentation
 | Hand-written ICD | Fail: `sc->Present` returns `E_FAIL`; the dispatcher logs `unknown VkSampler handle id 36` and closes the session, DXVK reports `VK_ERROR_DEVICE_LOST` from `vkCreateDescriptorPool`. The cause was not investigated. |
 
 There is no second frame to compare against, so the pixel check for this scene is the visual one; a bit-for-bit comparison is only available where both paths render, as for the triangle (3.4). The frame was not compared against any third renderer.
+
+### 3.7 Where the frame time went (measured 2026-11-16)
+
+Both sides count what they do: `WBVN_STATS=<file>` in the guest (a line of counter deltas per second, a total at the end, and the channel's ping round trips at start-up), `--stats` on `winbridge-venus` (the serve loop by phase, messages, `submit_cmd`, fence latency, writes); `--replay` accepts `--stats` too. `VKR_CMD_TRACE` gave the command mix. DXVK d3d11 triangle and teapot, 640x360, build VM, average ms per frame (the first row is over 120 frames including start-up, the others over 1200):
+
+| State | tri11 | teapot11 |
+|---|---|---|
+| Before tracing | 55.0 | 41.4 |
+| The pump yields to threads that want its locks | 5.61 | 5.10 |
+| One write per message and per flush with its submit; block-wise host scan | 3.24 | 4.55 |
+| A renderer wait flushes first; the pump stays awake while anything flushes | 3.27 (300-frame repeats 3.29, 3.78, 4.55) | 4.87 (300-frame repeats 4.83, 5.07) |
+| Hand-written ICD | 1.56 | fails (3.6) |
+
+The frames stayed bit-identical (tri11 against the hand-written ICD's frame; teapot between versions), and the probe and 5 repeat runs passed with no host error, no crash dump and no segfault in `dmesg`.
+
+1. **The 55 ms.** In the first traces the guest pump's flush loop took 86% of the time (46,000 flushes of 18 us a second) and a submit took 3 ms on average, although the writes in it took 0.11 ms: the pump held `push_lock` and `mu` almost all the time and other threads waited for them. Making the pump stand aside while a thread wants either lock took a submit to 0.28 ms (0.13 ms after the later changes) and the frame to 5.6 ms. That an SRW lock does not hand over to a thread that has not run yet is why I believe the pump starved them; the before and after counters are the evidence, the lock internals were not examined.
+2. **What is left is waiting for the renderer.** A 300-frame command trace shows about 5 `vkWaitRingSeqnoMESA` and `vkSubmitVirtqueueSeqnoMESA` pairs and about 4 `vkQueueSubmit2` per frame: every queue submit that carries a fence or semaphore becomes a renderer fence, and the guest waits for them. A guest renderer wait lasted 0.55 ms on average in a 3.27 ms run, and the host's measure of a fence from `create_fence` to retire was 0.54 ms on average in a 3.24 ms run, so a frame is mostly the fences' latency. [INFERENCE: with about 5 waits of 0.55 ms the frame's 3.3 ms is mostly that; the number of waits per frame is estimated from the trace and not counted per frame.]
+3. **The host alone is faster.** Replaying the recorded guest stream into the host without a guest gives fences of 0.19 to 0.33 ms on average. Why the live run sees 0.54 to 0.7 ms was not investigated.
+4. **The channel.** With nothing else running, a 16-byte ping takes 0.11 to 0.12 ms at the least (0.18 on average), 64 KiB 0.5 ms, and 1 MiB out and back 4.9 to 5.9 ms. `Sleep(1)` lasts 4.4 to 6.3 ms in this guest even with a 0.5 ms timer resolution requested, and a high-resolution waitable timer lasted as long (5.4 to 6.4 ms), so nothing on the hot path may depend on a timed sleep. The timer was tried and removed again.
+
+Not done: fewer renderer waits per frame (what in DXVK and the software presentation path causes them, and which of them Mesa could skip), an in-process virglrenderer without the render-server hops, and the cause of the difference in 3. The run-to-run spread (3.24 to 4.55 ms for the same binary) was not explained either.
 
 ## 4. Options considered
 
@@ -123,6 +144,6 @@ There is no second frame to compare against, so the pixel check for this scene i
 ## 7. Not verified
 
 - Venus on a driver of 570.86 or later (not tried).
-- Frame time of the Venus path (about 40 ms against 4.5 ms) is measured but its causes are not separated; bos above 2 MiB are not host-scanned.
+- Frame time of the Venus path: 3.3 ms against 1.56 ms for the hand-written ICD on the triangle (about 2.1 times), 4.5 to 5 ms for the teapot, which the hand-written ICD cannot draw. The remainder is mostly renderer fence latency, about five round trips a frame (section 3.7). Bos above 2 MiB are not host-scanned.
 - Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`).
 - Container tooling: docker was unusable without root, so the Linux side of the comparison ran natively in a user prefix, not in a container.
