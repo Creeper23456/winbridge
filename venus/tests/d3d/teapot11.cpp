@@ -3,7 +3,9 @@
 // ground plane, drawn with a depth buffer, an indexed draw, a sampled texture and a constant buffer
 // that is updated between two draws. The geometry is procedural; frame i uses a fixed angle, so
 // the frame written by --dump is the same on every path. Run with DXVK's d3d11.dll and dxgi.dll
-// next to the exe. Usage: teapot11 [--frames N] [--hold-ms N] [--dump PATH.ppm] [--size WxH]
+// next to the exe. Usage: teapot11 [--frames N] [--hold-ms N] [--dump PATH.ppm] [--size WxH] [--resize WxH]
+// (--frames 0 runs until the window is closed; --resize changes the swapchain to that size half way
+// through, which frees and creates its images). The window title shows the frame number and rate.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -15,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include "hud.h"
 
 struct Vec3 { float x, y, z; };
 static Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
@@ -96,12 +99,13 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("RESULT: FAIL: %s = 0x%08lx\n", #x, (unsigned long)hr_); return 1; } } while (0)
 
 int main(int argc, char **argv) {
-    int frames = 120, hold = 0, W = 640, H = 360; const char *dump = 0;
+    int frames = 120, hold = 0, W = 640, H = 360, W2 = 0, H2 = 0; const char *dump = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc) hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--size") && i + 1 < argc && sscanf(argv[++i], "%dx%d", &W, &H) != 2) { fprintf(stderr, "bad --size\n"); return 2; }
+        else if (!strcmp(argv[i], "--resize") && i + 1 < argc && sscanf(argv[++i], "%dx%d", &W2, &H2) != 2) { fprintf(stderr, "bad --resize\n"); return 2; }
     }
     WNDCLASSW wc = {0}; wc.lpfnWndProc = proc; wc.hInstance = GetModuleHandleW(0);
     wc.lpszClassName = L"teapot11"; wc.hCursor = LoadCursorW(0, (LPCWSTR)IDC_ARROW);
@@ -118,9 +122,10 @@ int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL fl;
     CHECK(D3D11CreateDeviceAndSwapChain(0, D3D_DRIVER_TYPE_HARDWARE, 0, 0, 0, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx));
     printf("feature_level: 0x%x\n", (unsigned)fl);
-    IDXGIDevice *dd = 0; IDXGIAdapter *ad = 0; DXGI_ADAPTER_DESC adesc;
+    IDXGIDevice *dd = 0; IDXGIAdapter *ad = 0; DXGI_ADAPTER_DESC adesc = {};
     if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dd)) && SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&adesc)))
         printf("adapter: %ls\n", adesc.Description);
+    Hud hud; hud.init(hwnd, L"teapot11", adesc.Description, W, H, frames);
 
     // geometry: the pot first, the ground after it
     std::vector<Vtx> vs; std::vector<uint32_t> is;
@@ -187,34 +192,49 @@ int main(int argc, char **argv) {
     sm.MaxLOD = D3D11_FLOAT32_MAX; sm.ComparisonFunc = D3D11_COMPARISON_NEVER;
     ID3D11SamplerState *samp = 0; CHECK(dev->CreateSamplerState(&sm, &samp));
 
-    ID3D11Texture2D *bb = 0; CHECK(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb));
-    ID3D11RenderTargetView *rtv = 0; CHECK(dev->CreateRenderTargetView(bb, 0, &rtv));
-    D3D11_TEXTURE2D_DESC dd2 = {0};
-    dd2.Width = W; dd2.Height = H; dd2.MipLevels = 1; dd2.ArraySize = 1; dd2.Format = DXGI_FORMAT_D32_FLOAT;
-    dd2.SampleDesc.Count = 1; dd2.Usage = D3D11_USAGE_DEFAULT; dd2.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    ID3D11Texture2D *depth = 0; ID3D11DepthStencilView *dsv = 0;
-    CHECK(dev->CreateTexture2D(&dd2, 0, &depth));
-    CHECK(dev->CreateDepthStencilView(depth, 0, &dsv));
+    ID3D11Texture2D *bb = 0, *depth = 0, *stage = 0;
+    ID3D11RenderTargetView *rtv = 0; ID3D11DepthStencilView *dsv = 0;
     D3D11_DEPTH_STENCIL_DESC dsd = {0}; dsd.DepthEnable = TRUE; dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; dsd.DepthFunc = D3D11_COMPARISON_LESS;
     ID3D11DepthStencilState *dss = 0; CHECK(dev->CreateDepthStencilState(&dsd, &dss));
     D3D11_RASTERIZER_DESC rd = {}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
     ID3D11RasterizerState *rs = 0; CHECK(dev->CreateRasterizerState(&rd, &rs));
 
-    ID3D11Texture2D *stage = 0;
-    if (dump) {
-        D3D11_TEXTURE2D_DESC st; bb->GetDesc(&st); st.Usage = D3D11_USAGE_STAGING; st.BindFlags = 0;
-        st.CPUAccessFlags = D3D11_CPU_ACCESS_READ; st.MiscFlags = 0;
-        CHECK(dev->CreateTexture2D(&st, 0, &stage));
-    }
-
-    D3D11_VIEWPORT vp = {0, 0, (float)W, (float)H, 0, 1};
+    D3D11_VIEWPORT vp = {}; Mat proj;
+    // everything that depends on the size of the back buffer
+    auto makeTargets = [&]() -> HRESULT {
+        HRESULT hr;
+        if (FAILED(hr = sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&bb))) return hr;
+        if (FAILED(hr = dev->CreateRenderTargetView(bb, 0, &rtv))) return hr;
+        D3D11_TEXTURE2D_DESC dd2 = {0};
+        dd2.Width = W; dd2.Height = H; dd2.MipLevels = 1; dd2.ArraySize = 1; dd2.Format = DXGI_FORMAT_D32_FLOAT;
+        dd2.SampleDesc.Count = 1; dd2.Usage = D3D11_USAGE_DEFAULT; dd2.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(hr = dev->CreateTexture2D(&dd2, 0, &depth))) return hr;
+        if (FAILED(hr = dev->CreateDepthStencilView(depth, 0, &dsv))) return hr;
+        if (dump) {
+            D3D11_TEXTURE2D_DESC st; bb->GetDesc(&st); st.Usage = D3D11_USAGE_STAGING; st.BindFlags = 0;
+            st.CPUAccessFlags = D3D11_CPU_ACCESS_READ; st.MiscFlags = 0;
+            if (FAILED(hr = dev->CreateTexture2D(&st, 0, &stage))) return hr;
+        }
+        vp = {0, 0, (float)W, (float)H, 0, 1};
+        proj = perspective(0.8f, (float)W / H, 0.1f, 50.0f);
+        return S_OK;
+    };
+    CHECK(makeTargets());
     Mat view = lookAt({0, 2.4f, -6.5f}, {0, 0.9f, 0}, {0, 1, 0});
-    Mat proj = perspective(0.8f, (float)W / H, 0.1f, 50.0f);
     Vec3 ld = norm({-0.4f, -0.8f, 0.5f});
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
     double worst = 0, sum = 0;
-    for (int i = 0; i < frames; i++) {
-        MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    for (int i = 0; frames <= 0 || i < frames; i++) {
+        if (W2 && frames > 0 && i == frames / 2) {
+            ctx->OMSetRenderTargets(0, 0, 0); ctx->ClearState();
+            rtv->Release(); dsv->Release(); depth->Release(); bb->Release(); rtv = 0; dsv = 0; depth = 0; bb = 0;
+            if (stage) { stage->Release(); stage = 0; }
+            W = W2; H = H2;
+            CHECK(sc->ResizeBuffers(0, W, H, DXGI_FORMAT_UNKNOWN, 0));
+            CHECK(makeTargets());
+            printf("resized to %dx%d\n", W, H); hud.w = W; hud.h = H;
+        }
+        if (!hud.pump()) break;
         QueryPerformanceCounter(&t0);
         float clear[4] = {0.05f, 0.10f, 0.20f, 1.0f};
         ctx->OMSetRenderTargets(1, &rtv, dsv); ctx->OMSetDepthStencilState(dss, 0); ctx->RSSetState(rs); ctx->RSSetViewports(1, &vp);
@@ -251,9 +271,9 @@ int main(int argc, char **argv) {
         CHECK(sc->Present(1, 0));
         QueryPerformanceCounter(&t1);
         double ms_ = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-        sum += ms_; if (ms_ > worst) worst = ms_;
+        sum += ms_; if (ms_ > worst) worst = ms_; hud.frame(ms_);
     }
-    printf("frames: %d avg_ms: %.2f max_ms: %.2f\n", frames, sum / frames, worst);
+    printf("frames: %lld avg_ms: %.2f max_ms: %.2f\n", hud.frames, sum / (hud.frames ? hud.frames : 1), worst);
     DWORD end = GetTickCount() + hold;
     while ((int)(end - GetTickCount()) > 0) { MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(10); }
     printf("RESULT: PASS\n");

@@ -2,6 +2,7 @@
 // D3D11 triangle for the M3 test: window, swapchain, HLSL compiled at run time with D3DCompile.
 // Built in the Build VM with MSVC (cl). With DXVK's d3d11.dll/dxgi.dll next to the exe, the frames
 // go through DXVK -> the WinBridge ICD. Usage: tri11 [--frames N] [--hold-ms N] [--dump PATH.ppm]
+// (--frames 0 runs until the window is closed; the window title shows the frame number and rate)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hud.h"
 
 static const char *kShader =
     "struct V { float4 p : SV_Position; float4 c : COLOR; };\n"
@@ -41,7 +43,7 @@ int main(int argc, char **argv) {
     HWND hwnd = CreateWindowExW(0, L"tri11", L"WinBridge D3D11 triangle", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 40, 40, r.right - r.left, r.bottom - r.top, 0, 0, wc.hInstance, 0);
 
-    DXGI_SWAP_CHAIN_DESC sd = {0};
+    DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 2; sd.BufferDesc.Width = W; sd.BufferDesc.Height = H;
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -49,9 +51,10 @@ int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL fl;
     CHECK(D3D11CreateDeviceAndSwapChain(0, D3D_DRIVER_TYPE_HARDWARE, 0, 0, 0, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx));
     printf("feature_level: 0x%x\n", (unsigned)fl);
-    IDXGIDevice *dd = 0; IDXGIAdapter *ad = 0; DXGI_ADAPTER_DESC adesc;
+    IDXGIDevice *dd = 0; IDXGIAdapter *ad = 0; DXGI_ADAPTER_DESC adesc = {};
     if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dd)) && SUCCEEDED(dd->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&adesc)))
         printf("adapter: %ls\n", adesc.Description);
+    Hud hud; hud.init(hwnd, L"tri11", adesc.Description, W, H, frames);
 
     ID3DBlob *vsb = 0, *psb = 0, *err = 0;
     if (FAILED(D3DCompile(kShader, strlen(kShader), 0, 0, 0, "vs", "vs_5_0", 0, 0, &vsb, &err))) { printf("RESULT: FAIL: vs compile: %s\n", err ? (char *)err->GetBufferPointer() : "?"); return 1; }
@@ -72,8 +75,8 @@ int main(int argc, char **argv) {
     D3D11_VIEWPORT vp = {0, 0, (float)W, (float)H, 0, 1};
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
     double worst = 0, sum = 0;
-    for (int i = 0; i < frames; i++) {
-        MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    for (int i = 0; frames <= 0 || i < frames; i++) {
+        if (!hud.pump()) break;
         QueryPerformanceCounter(&t0);
         float clear[4] = {0.05f, 0.10f, 0.20f, 1.0f};
         ctx->OMSetRenderTargets(1, &rtv, 0); ctx->RSSetViewports(1, &vp);
@@ -94,9 +97,9 @@ int main(int argc, char **argv) {
         CHECK(sc->Present(1, 0));
         QueryPerformanceCounter(&t1);
         double ms_ = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-        sum += ms_; if (ms_ > worst) worst = ms_;
+        sum += ms_; if (ms_ > worst) worst = ms_; hud.frame(ms_);
     }
-    printf("frames: %d avg_ms: %.2f max_ms: %.2f\n", frames, sum / frames, worst);
+    printf("frames: %lld avg_ms: %.2f max_ms: %.2f\n", hud.frames, sum / (hud.frames ? hud.frames : 1), worst);
     DWORD end = GetTickCount() + hold;
     while ((int)(end - GetTickCount()) > 0) { MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(10); }
     printf("RESULT: PASS\n");

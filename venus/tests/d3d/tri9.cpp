@@ -4,6 +4,7 @@
 // vertices, so no shaders are needed), presented once per frame. Frame i uses a fixed angle, so the
 // frame written by --dump is the same on every path. Run with DXVK's d3d9.dll next to the exe.
 // Usage: tri9 [--frames N] [--hold-ms N] [--dump PATH.ppm] [--size WxH]
+// (--frames 0 runs until the window is closed; the window title shows the frame number and rate)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hud.h"
 
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -42,7 +44,13 @@ int main(int argc, char **argv) {
     pp.BackBufferWidth = W; pp.BackBufferHeight = H; pp.hDeviceWindow = hwnd; pp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
     IDirect3DDevice9 *dev = 0;
     CHECK(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &dev));
-    D3DADAPTER_IDENTIFIER9 id; if (SUCCEEDED(d3d->GetAdapterIdentifier(0, 0, &id))) printf("adapter: %s\n", id.Description);
+    wchar_t adapter[128] = L"";
+    D3DADAPTER_IDENTIFIER9 id;
+    if (SUCCEEDED(d3d->GetAdapterIdentifier(0, 0, &id))) {
+        printf("adapter: %s\n", id.Description);
+        MultiByteToWideChar(CP_ACP, 0, id.Description, -1, adapter, 128);
+    }
+    Hud hud; hud.init(hwnd, L"tri9", adapter, W, H, frames);
 
     IDirect3DSurface9 *stage = 0;
     if (dump) CHECK(dev->CreateOffscreenPlainSurface(W, H, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &stage, 0));
@@ -50,8 +58,8 @@ int main(int argc, char **argv) {
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
     double worst = 0, sum = 0;
     const float cx = W * 0.5f, cy = H * 0.5f, rad = (H < W ? H : W) * 0.4f;
-    for (int i = 0; i < frames; i++) {
-        MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    for (int i = 0; frames <= 0 || i < frames; i++) {
+        if (!hud.pump()) break;
         QueryPerformanceCounter(&t0);
         Vtx v[3];
         const DWORD col[3] = {0xffff3030u, 0xff30ff30u, 0xff3030ffu};
@@ -82,9 +90,9 @@ int main(int argc, char **argv) {
         CHECK(dev->Present(0, 0, 0, 0));
         QueryPerformanceCounter(&t1);
         double ms_ = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-        sum += ms_; if (ms_ > worst) worst = ms_;
+        sum += ms_; if (ms_ > worst) worst = ms_; hud.frame(ms_);
     }
-    printf("frames: %d avg_ms: %.2f max_ms: %.2f\n", frames, sum / frames, worst);
+    printf("frames: %lld avg_ms: %.2f max_ms: %.2f\n", hud.frames, sum / (hud.frames ? hud.frames : 1), worst);
     DWORD end = GetTickCount() + hold;
     while ((int)(end - GetTickCount()) > 0) { MSG m; while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(10); }
     printf("RESULT: PASS\n");
