@@ -138,7 +138,25 @@ Three things stood in the way, all in the guest or the host, none in the encoder
 
 Clipboard with the shared-memory transport active: a text goes both ways, and 1 MiB of text from the host to the guest arrived with the same SHA-256. It took about 40 s from the host's copy to the viewer's "clipboard changed" line for 1 MiB when the owner was GTK 3 or `xclip`; why was not investigated (the viewer reads in 64 KiB pieces). Drag and drop and the dark colour scheme were not tried on this VM (the desktop's `color-scheme` is `default`; testing it means changing the user's desktop setting).
 
-Not verified here: Direct3D 10 programs, applications other than the three test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
+Direct3D 10: `tri10.exe` (DXVK's `d3d10core.dll`) ran 120 frames at 2.35 ms on average with the same 41,472 pixels as `tri11`; the first start of the program crashed once with 0xC0000409 and the crash did not come back (the pixel dump of the program did not check `fopen`, which is the suspected cause, not confirmed).
+
+Not verified here: applications other than the test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
+
+### 3.9 OpenGL through Zink (measured 2026-11-16, LTSC VM, normal user token)
+
+Mesa's Zink (OpenGL on Vulkan) and its WGL frontend are in the same Mesa tree, so OpenGL needs no new transport and no injection: `opengl32.dll` next to the program loads `libgallium_wgl.dll` (21.7 MB), Zink loads `vulkan-1.dll` and talks to the Venus driver through the loader. The build is the same script with `-Dgallium-drivers=zink -Dopengl=true` (flex and bison on the host; one fix for the flex-generated lexers, `isatty` in `windows_compat.h`; no Mesa patch).
+
+| Program | Result |
+|---|---|
+| `gltri.exe`, 3.3 core context, GLSL | Renderer `zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 3060 Ti) (MESA_VENUS))`, `4.6 (Core Profile) Mesa 26.3.0`. 120 frames, `glError` 0. |
+| `gltri.exe --legacy`, compatibility context, `glBegin` | `4.6 (Compatibility Profile)`; 120 frames, `glError` 0. Its dump is byte-identical to the core run's (same md5). |
+| Picture | 41,472 of 230,400 pixels differ from the background, the count of the D3D triangle; orange apex on top, blue left, green right. The dump was not compared pixel by pixel with `tri11`'s. |
+| `--interval 0`, 600 frames | 1.34 ms a frame (max 6.41), compatibility 1.48 ms; `tri11` in the same session 1.90 ms. |
+| Swap interval 1 (the default), 600 frames | 14.66 ms (max 28.9) in the core run, 14.69 ms with no option; the window title reads about 68 fps. |
+
+The 14.7 ms of the default is a wait in the present path, not work: the Venus counters per second (submits, fences, flushes) are the same with and without it. Where it comes from (Zink's FIFO present mode through the software WSI, the guest display's cadence) was not investigated; DXVK's `Present(1, 0)` in the same session shows no such wait.
+
+Not verified: real OpenGL applications, extension coverage and conformance (no test suite was run), the default choice between Zink and the software renderer (the tests set `GALLIUM_DRIVER=zink`), resize, several contexts, OpenGL and Vulkan in one process, a system-wide `opengl32.dll`, and `vulkan_virtio.dll` as built with the Zink configuration (the guest ran the DLL of the Vulkan-only configuration; `build.sh` produced a new one that has not run).
 
 ## 4. Options considered
 

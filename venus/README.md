@@ -22,6 +22,7 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 | `guest/venus-probe.c` | Loads the driver directly and runs instance, device, submit and a buffer copy through the GPU. |
 | `tests/ring_peer.c` | The guest end of the ring interoperability test of `crates/winbridge-venus`. |
 | `tests/d3d/` | The D3D programs (`tri11`, `teapot11` for D3D11, `tri10` for D3D10 and `tri9` for D3D9) the driver is accepted with, run through DXVK. |
+| `tests/gl/gltri.cpp` | The same triangle through WGL: a 3.3 core context with GLSL, or `--legacy` with `glBegin`. Run it with Mesa's `opengl32.dll` next to it (see OpenGL below). |
 | `patches/0001`-`0011` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply in order (`build/build.sh` does). |
 | `patches/virglrenderer/` | Patches to virglrenderer for the host: `0001` and `0002` are needed on NVIDIA 550, `0003` is the command trace. |
 | `tools/compare-command-traces.py` | Compares command traces of the Windows and the Linux driver. |
@@ -31,6 +32,14 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 ## Build
 
 `WBVN_ACCEPT_MS_LICENSE=1 build/build.sh` cross-compiles the driver with `clang-cl` and `lld-link` (LLVM 19) against the MSVC runtime and Windows SDK that it downloads with xwin, and leaves `vulkan_virtio.dll` in the work directory. Nothing is built inside the guest. The result imports only KERNEL32, USER32, GDI32, the UCRT api-sets and VCRUNTIME140. What the script needs and pins is in `build/README.md`.
+
+## OpenGL
+
+OpenGL runs on the same driver through Zink, Mesa's OpenGL-on-Vulkan driver. `build/build.sh` also builds Mesa's Windows OpenGL: `opengl32.dll` (a small stub) loads `libgallium_wgl.dll` (WGL, the GLSL compiler, Zink), which needs `z-1.dll` and the VC runtime. Zink loads `vulkan-1.dll`, finds the driver through the registry like any Vulkan program, and creates its window surface through the driver's software WSI. No patch to Mesa was needed for it, and nothing is injected into other programs.
+
+Copy `opengl32.dll`, `libgallium_wgl.dll`, `z-1.dll`, the VC runtime DLLs and a `vulkan-1.dll` next to the program (the loader searches the program's directory first, so the system `opengl32.dll` is not touched). `GALLIUM_DRIVER=zink` was set in the tests; the default choice between Zink and the software renderer was not tried. `install-venus-icd.ps1` does not install the OpenGL DLLs: a system-wide `opengl32.dll` is not done.
+
+Programs that leave the swap interval at its default of 1 are paced to about 14.7 ms per frame (see section 3.9 of the ADR); a program that asks for interval 0 is not.
 
 ## Run
 
