@@ -1340,8 +1340,12 @@ wbvn_pump(LPVOID arg)
    return 0;
 }
 
-/* Asks for a 0.5 ms timer resolution while a renderer lives. In the Build VM guest Sleep(1) still
- * lasted 4.5 to 6 ms (WBVN_STATS measures it at start-up; the default tick is 15.6 ms) and so did
+/* Asks for a 1 ms timer resolution while a renderer lives, so the pump's Sleep(1) lasts about a
+ * millisecond instead of the default tick of 15.6 ms. 0.5 ms must not be asked for: with that
+ * resolution in force and any thread sleeping in a loop (a plain PowerShell Sleep(1), 2 or 4 ms
+ * loop shows it without this driver) the guest's display updates fell from 58 to 33 a second on
+ * the LTSC VM, for every program on the desktop. At 1 and 2 ms they stay at 58 to 60. In the
+ * Build VM guest Sleep(1) still lasted 4.5 to 6 ms (WBVN_STATS measures it at start-up) and so did
  * a high-resolution waitable timer, so nothing on the hot path may depend on a timed sleep. */
 static void
 wbvn_timer_resolution(bool fine)
@@ -1352,7 +1356,7 @@ wbvn_timer_resolution(bool fine)
       ntdll ? (set_resolution_fn)(void (*)(void))GetProcAddress(ntdll, "NtSetTimerResolution") : NULL;
    ULONG actual;
    if (set)
-      set(5000, fine, &actual);
+      set(10000, fine, &actual);
 }
 
 /* ---------- vn_renderer ops ---------------------------------------------------------- */

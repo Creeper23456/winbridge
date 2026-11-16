@@ -140,6 +140,8 @@ Clipboard with the shared-memory transport active: a text goes both ways, and 1 
 
 Direct3D 10: `tri10.exe` (DXVK's `d3d10core.dll`) ran 120 frames at 2.35 ms on average with the same 41,472 pixels as `tri11`; the first start of the program crashed once with 0xC0000409 and the crash did not come back (the pixel dump of the program did not check `fopen`, which is the suspected cause, not confirmed).
 
+The desktop's update rate (measured 2026-11-17, LTSC VM, one case at a time, 10 s each, the viewer's `--stats` `display:` lines): a GDI program alone makes the guest push 54 to 59 display updates a second. With the first driver build, any program that created a Vulkan instance on the Venus driver (`vkpresent --stage 1`, no window, no swapchain) brought the whole desktop to 33 a second. Cause: the driver asked for a 0.5 ms system timer resolution while its pump thread sleeps in a loop. The same drop appears without this driver, with a PowerShell process that requests 0.5 ms and sleeps 1, 2 or 4 ms in a loop (33 a second); a request without the loop (58), 1 ms (59) and 2 ms (60) with the loop do not drop. The driver now asks for 1 ms: stage 1 and stage 5 give 59.5 and 59.6 updates a second, and the frame time did not change (tri11 1.89 ms, teapot11 2.03 ms, 600 frames each). Why 0.5 ms and a sleeping thread slow the display driver was not investigated. Two earlier runs of this test overlapped with another task in the same VM and are not used.
+
 Not verified here: applications other than the test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
 
 ### 3.9 OpenGL through Zink (measured 2026-11-16, LTSC VM, normal user token)
