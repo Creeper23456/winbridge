@@ -2,13 +2,13 @@
 
 # ADR 0001: Venus as the Vulkan serialization layer on Windows guests
 
-- Status: **Proposed** (evidence gathered 2026-11-16; the Windows port runs a buffer-copy probe through NVIDIA 550 in the build VM; acceptance in section 5 is not complete)
+- Status: **Accepted** (2026-11-16, by the user, after the DXVK triangle and teapot-class scenes ran through it in the build VM; the hand-written ICD was removed the same day). Not verified in the user's LTSC VM; the guest driver has not been installed there.
 - Context owner: 3D acceleration (`docs/GFX-DESIGN.md`)
-- Related: `docs/IVSHMEM-TRANSPORT.md` (shared-memory transport), `docs/GFX-DESIGN.md` (current hand-written ICD)
+- Related: `docs/IVSHMEM-TRANSPORT.md` (shared-memory transport), `docs/GFX-DESIGN.md` (measurements and history of the removed hand-written ICD)
 
 ## 1. Context
 
-The guest ICD (`winbridge-gfx-icd`) is hand-written. It forwards Vulkan calls to the host dispatcher and emulates host-visible memory with command-driven readback (`docs/GFX-DESIGN.md`, "M3 result"). It renders a DXVK d3d11 triangle (avg 4.3 ms per frame in the build VM) but every new command has to be written, wired and tested by hand; known gaps are listed in that document.
+At the time of the decision the guest ICD (`winbridge-gfx-icd`) was hand-written. It forwarded Vulkan calls to a host dispatcher and emulated host-visible memory with command-driven readback (`docs/GFX-DESIGN.md`, "M3 result"). It rendered a DXVK d3d11 triangle (avg 4.3 ms per frame in the build VM) but every new command had to be written, wired and tested by hand; known gaps are listed in that document. It and its host side were removed on 2026-11-16 (decision 5); the comparisons below name it as "the hand-written ICD".
 
 Mesa's Venus driver (`src/virtio/vulkan`, MIT) generates the encoding of the whole Vulkan API from `vk.xml` (the venus-protocol repository), and virglrenderer's `vkr` (host side) decodes and executes it. The user's intent (2026-11-16): **use Venus only to solve the serialization problem.** Memory sharing, transport and presentation stay WinBridge's own (ivshmem lanes, readback into the guest window; no overlay).
 
@@ -18,8 +18,8 @@ Mesa's Venus driver (`src/virtio/vulkan`, MIT) generates the encoding of the who
 2. Host = `crates/winbridge-venus` on virglrenderer `vkr` (render-server process), fed from the mirrored ring.
 3. **Memory (amended 2026-11-16, replaces "no blob").** Shmem (command rings, command-stream pools) and `VkDeviceMemory` are *mirrored* between guest and host by copy, not shared: the guest copy is a `VirtualAlloc(MEM_WRITE_WATCH)` region diffed against a snapshot, pushed at submit/flush; GPU writes come back when a fence retires. Host-visible `VkDeviceMemory` is a mappable HOST3D blob on the host, mapped by the bridge. NVIDIA 550 exports dma-bufs it cannot mmap, so the host runs a virglrenderer patch (`VKR_DEBUG=opaque`, `venus/patches/virglrenderer/0001`) that exports an opaque fd instead. Guest event, semaphore and query feedback are disabled (`VN_PERF=no_event_feedback,no_semaphore_feedback,no_query_feedback`) because they would poll mapped device memory.
 4. **Sync fences are created without sync-fd export** (`VKR_DEBUG=nofenceexport`, patch `0002`). Evidence: replaying a recorded guest session (`--record`/`--replay`) segfaulted at a fixed offset in `libnvidia-glcore.so.550.163.01` in the `vkr-queue` thread (`vkWaitForFences`) on every run; with `VK_EXPORT_FENCE_CREATE_INFO` removed the same replay and the VM probe both pass. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when the variable is unset. Cause inside the driver is not known.
-5. The existing hand-written ICD stays as the fallback until Venus passes the acceptance in section 5.
-6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus eight local patches (`venus/patches/`) cross-compiles clean and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
+5. **The hand-written ICD is removed** (user decision, 2026-11-16): `winbridge-gfx-icd`, `winbridge-gfx-vk`, `winbridge-gfx-vkgen`, `winbridge-gfx`, `winbridge-gfx-proto` and `winbridge-gfx-probe` no longer exist in the tree. There is no fallback; the D3D11 test programs moved to `venus/tests/d3d11/`.
+6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus nine local patches (`venus/patches/`) cross-compiles clean and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
 7. **Presentation uses Mesa's software WSI** (`wsi_common_win32.cpp`, the GDI path lavapipe and dzn use), enabled for Venus by patch `0007`: `VK_KHR_win32_surface` and `VK_KHR_swapchain` are exposed, swapchain images are linear host-visible images that the guest reads through the mirrored mapping and blits to the window. The backend reports `has_implicit_fencing = true` (no sync files exist); the software WSI waits on a fence before it reads an image and a bo is brought up to date when that fence retires. Fence imports with fd `-1` mean "already signaled", as upstream defines.
 8. **Only cached host-visible memory types are exposed** (patch `0008`). The host reads mirrored memory after every fence; on NVIDIA 550 the write-combined and BAR host-visible types are uncached for CPU reads, and one fence retire that scanned about 10 MiB of them took about 490 ms (measured through host-side phase timing in a replay of a recorded session). Non-cached types keep their index but lose `HOST_VISIBLE` and `HOST_COHERENT`.
 
@@ -87,7 +87,7 @@ Limit: this covers the basic call sequence only. A draw, memory and presentation
 
 ### 3.6 Teapot-class scene on both paths (measured 2026-11-16)
 
-`crates/winbridge-gfx-probe/d3d11/teapot11.cpp` draws a procedural pot (lathe body, lid, knob, spout, handle) and a ground plane with a depth buffer, two indexed draws, a sampled 64x64 checker texture with a wrap sampler and a constant buffer updated between the draws (640x360, frame 59 of a fixed rotation), through DXVK 3.1.1 d3d11:
+`venus/tests/d3d11/teapot11.cpp` draws a procedural pot (lathe body, lid, knob, spout, handle) and a ground plane with a depth buffer, two indexed draws, a sampled 64x64 checker texture with a wrap sampler and a constant buffer updated between the draws (640x360, frame 59 of a fixed rotation), through DXVK 3.1.1 d3d11:
 
 | Path | Result |
 |---|---|
@@ -126,7 +126,7 @@ Not done: fewer renderer waits per frame (what in DXVK and the software presenta
 | C. Venus with upstream blob/dma-buf memory | Upstream behaviour | Needs host driver 570.86 or later (upgrade is the user's call); needs a dma-buf equivalent inside a VM guest that does not exist here |
 | D. Re-implement Venus natively without Mesa code | No third-party code in the guest | Largest effort; conformance with Mesa would need continuous proof |
 
-## 5. Acceptance before anything is pushed
+## 5. Acceptance
 
 1. Command-stream consistency with Mesa's own driver: the same Vulkan call sequence must produce the same Venus byte stream, and the same stream through virglrenderer must render the same image. **Done for the basic call sequence** (section 3.5); draw and presentation streams are covered by the decoder acceptance and the pixel result in 3.4, not by a Linux comparison.
 2. The DXVK d3d11 triangle runs through the new path in the build VM and matches the current ICD's result. **Done** (section 3.4).
