@@ -123,6 +123,25 @@ fn main() {
     display::init_dpi_awareness();
 
     info!("Starting WinBridge Windows Guest Agent v{}", env!("CARGO_PKG_VERSION"));
+    // The serial ports of the Venus slots are created for administrators only; the Vulkan
+    // processes of the interactive user must open them. The ports exist from boot, but the driver
+    // may still be starting, so a missing one is retried for a while.
+    #[cfg(windows)]
+    std::thread::spawn(|| {
+        for _ in 0..30 {
+            match ivshmem::open_venus_ports() {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                Ok(n) => {
+                    info!("Opened {} Venus slot port(s) to the interactive user", n);
+                    return;
+                }
+                Err(e) => {
+                    warn!("Venus slot ports: {}", e);
+                    return;
+                }
+            }
+        }
+    });
 
     let port_arg = args
         .iter()

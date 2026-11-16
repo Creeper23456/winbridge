@@ -427,6 +427,42 @@ pub fn harden_devices(len: u64) -> Result<usize, IvshmemError> {
     Ok(hardened)
 }
 
+/// DACL of a Venus slot's serial port. The virtio-serial driver creates the port for SYSTEM and
+/// Administrators only, which a UAC-filtered token of the interactive user (the Vulkan processes)
+/// cannot open: the Venus driver then finds no slot and enumerates no device. Added: the
+/// interactive users.
+const VENUS_PORT_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+const VENUS_PORT_PREFIX: &str = r"\\.\Global\org.winbridge.venus.";
+const VENUS_PORT_MAX: u32 = 64;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_SHARING_VIOLATION: u32 = 32;
+
+/// Opens the serial port of every Venus slot (`org.winbridge.venus.N`, N counting up from 0) to the
+/// interactive users and reads the DACL back. The port carries wake-up bytes only; the slot's
+/// memory keeps the driver's DACL. Like [`harden_devices`] the change is not persistent, so the
+/// elevated agent calls this on every start. A port that a process holds open is skipped: that
+/// process could open it. Returns the number of ports changed (0 when there is none).
+pub fn open_venus_ports() -> Result<usize, IvshmemError> {
+    let mut opened = 0;
+    for n in 0..VENUS_PORT_MAX {
+        let what = format!("Venus port {n}");
+        let h = match open_path(&format!("{VENUS_PORT_PREFIX}{n}"), READ_CONTROL | WRITE_DAC) {
+            Ok(h) => h,
+            Err(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => break,
+            Err(ERROR_SHARING_VIOLATION) => continue,
+            Err(e) => return Err(IvshmemError::Hardening(format!("{what}: open with WRITE_DAC failed, Win32 error {e} (is the agent elevated?)"))),
+        };
+        set_dacl(&h, VENUS_PORT_SDDL).map_err(|e| IvshmemError::Hardening(format!("{what}: SetKernelObjectSecurity failed, Win32 error {e}")))?;
+        let now = read_dacl(&h).map_err(|e| IvshmemError::Hardening(format!("{what}: reading the DACL back failed, Win32 error {e}")))?;
+        if !now.contains(";;;IU)") {
+            return Err(IvshmemError::Hardening(format!("{what}: DACL reads back as {now}, the interactive users are missing")));
+        }
+        opened += 1;
+    }
+    Ok(opened)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The mapping
 // ---------------------------------------------------------------------------------------------
