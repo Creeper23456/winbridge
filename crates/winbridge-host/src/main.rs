@@ -23,8 +23,9 @@ mod router;
 mod serial_client;
 mod shm;
 mod shmfile;
-mod tray;
+mod theme;
 mod transfer;
+mod tray;
 mod ui;
 
 use clap::Parser;
@@ -156,6 +157,7 @@ fn main() -> glib::ExitCode {
             with_viewer(|v| v.present());
             return;
         }
+        theme::follow_desktop();
         let fb = Arc::new(Mutex::new(Framebuffer::default()));
         let dbus_conn = Arc::new(Mutex::new(None));
 
