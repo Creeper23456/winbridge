@@ -2,7 +2,7 @@
 
 # WinBridge Shared-Memory Transport (ivshmem) Design
 
-Status (2026-11-16): **design plus a measured feasibility probe; the transport itself is not implemented.** `crates/winbridge-shm` (ring, lanes, scheduler, hostile-peer hardening; host-only tests) exists, and `experiments/shmprobe/RESULTS.md` holds the Windows driver and BAR measurements from a disposable build VM. Order of work: (1) vkcube and the DXVK triangle on the current virtio-serial path (`docs/GFX-DESIGN.md` M2/M3; M2 is done), (2) this transport, (3) the Venus port to Windows. Statements marked **[UNVERIFIED]** are not settled by a measurement yet; everything marked (measured) comes from `experiments/shmprobe/RESULTS.md`. Sizes are starting values.
+Status (2026-11-16): **the control/bulk transport is implemented and measured end to end in a build VM; it stays opt-in (`shm = true`, default off) until it has run on the user's LTSC guest.** `crates/winbridge-shm` is the ring core, `winbridge-proto::ring` the message link (`docs/PROTOCOL.md` section 3), `winbridge-agent/src/ivshmem.rs` the guest device access. Results are in section 12. Not done: the graphics channel on the lanes, the guest broker (8a), the Venus port. Statements marked **[UNVERIFIED]** are not settled by a measurement yet; everything marked (measured) comes from `experiments/shmprobe/RESULTS.md` or section 12. Sizes are starting values.
 
 **Direction (user decision, 2026-11-16):** the measurements show the shared-memory path is two orders of magnitude faster than virtio-serial (6.6/7.7 GB/s end to end, 0.2 us ping-pong), so shared memory becomes the primary transport for control and bulk traffic as well as graphics, once the end-to-end test in the build VM confirms it with real agent code. virtio-serial remains only the handshake, the wake-up (kick) and the fallback. Shared memory stays opt-in (`shm = true`) until that test and a deployment to the user's guest have passed.
 
@@ -150,3 +150,25 @@ Do these on the disposable build VM, never on the user's LTSC VM, before any lan
 - Whether 256 MiB for `wb-gfx` holds once DXVK runs (6).
 - Whether to relax the guest-input lock during transfers once lanes exist (3).
 - Polling cost on a 4-vCPU guest and the right spin/sleep thresholds (5).
+
+## 12. End-to-end results (build VM, 2026-11-16)
+
+Host: `shme2e` example (`crates/winbridge-host/examples/shme2e.rs`, plays the viewer against the real agent over `org.winbridge.0` and the ivshmem file); guest: the real `winbridge-agent`; one ivshmem device, one vCPU set of 4, hashes compared on both directions.
+
+| Measurement | virtio-serial | shared memory |
+|---|---|---|
+| host -> guest, chunks dropped by the agent (transport + decode only) | 239 MiB/s | 2.0 - 3.4 GiB/s (3 runs, 4 GiB each) |
+| host -> guest file drop, written to the guest disk | 220 MiB/s | 780 - 920 MiB/s (disk-bound) |
+| guest -> host file stream (clipboard files path) | 391 MiB/s | 1.6 GiB/s (page cache) |
+| control round trip, bulk idle | 93 - 110 us p50 | 150 - 160 us p50 |
+| control round trip, host -> guest bulk saturated | p50 4.2 ms, p99 97 ms | p50 135 - 150 us, p99 0.3 - 0.4 ms |
+| host-only ring + framing (no VM, 256 KiB chunks) | - | 7.9 - 11.3 GiB/s |
+
+Findings that changed the code:
+
+- The first VM run showed only ~700 MiB/s on the dropped-chunk path and 779 MiB/s on the host-only loop: `bincode` serialized `Vec<u8>` byte by byte. The chunk fields now use a bytes codec with identical wire bytes (a test pins this), which removed the limit for both transports and made the host-only loop ten times faster.
+- Shared memory is slower than serial at idle round trips (about 55 us more). [INFERENCE] The cause is polling with a sleep floor plus the kick that travels over serial; not measured separately. The latency win is under load, where serial queues control messages behind bulk data and the lanes do not.
+- A viewer that reconnects left the agent on a stale link: the next `QueryStatus` went unanswered. The agent now leaves the link when `QueryStatus` arrives on serial.
+- The remaining gap to the 6.6 GB/s raw ring is framing and copying (encode, ring, decode: [INFERENCE] about three copies of every chunk); the guest-side write to disk and the viewer's file reads dominate the file paths.
+
+Not measured: HVCI, the user's LTSC guest, graphics traffic on the lanes, kick cost on the doorbell variant of the device.
