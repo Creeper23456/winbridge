@@ -31,13 +31,15 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 
 ## Build
 
-`WBVN_ACCEPT_MS_LICENSE=1 build/build.sh` cross-compiles the driver with `clang-cl` and `lld-link` (LLVM 19) against the MSVC runtime and Windows SDK that it downloads with xwin, and leaves `vulkan_virtio.dll` in the work directory. Nothing is built inside the guest. The result imports only KERNEL32, USER32, GDI32, the UCRT api-sets and VCRUNTIME140. What the script needs and pins is in `build/README.md`.
+`WBVN_ACCEPT_MS_LICENSE=1 build/build.sh` cross-compiles the driver with `clang-cl` and `lld-link` (LLVM 19) against the MSVC runtime and Windows SDK that it downloads with xwin, and leaves `vulkan_virtio.dll`, `opengl32.dll` and `libgallium_wgl.dll` in the work directory. Nothing is built inside the guest. The DLLs use the static CRT and import only system libraries (KERNEL32, USER32, GDI32, SETUPAPI for the driver, and an api-set). What the script needs and pins is in `build/README.md`.
 
 ## OpenGL
 
-OpenGL runs on the same driver through Zink, Mesa's OpenGL-on-Vulkan driver. `build/build.sh` also builds Mesa's Windows OpenGL: `opengl32.dll` (a small stub) loads `libgallium_wgl.dll` (WGL, the GLSL compiler, Zink), which needs `z-1.dll` and the VC runtime. Zink loads `vulkan-1.dll`, finds the driver through the registry like any Vulkan program, and creates its window surface through the driver's software WSI. No patch to Mesa was needed for it, and nothing is injected into other programs.
+OpenGL runs on the same driver through Zink, Mesa's OpenGL-on-Vulkan driver. `build/build.sh` also builds Mesa's Windows OpenGL for x64: `opengl32.dll` (a small stub) loads `libgallium_wgl.dll` (WGL, the GLSL compiler, Zink). Both are self-contained (static CRT and zlib, system DLLs only). Zink loads the system's `vulkan-1.dll`, finds the driver through the registry like any Vulkan program, and creates its window surface through the driver's software WSI. No patch to Mesa was needed for it.
 
-Copy `opengl32.dll`, `libgallium_wgl.dll`, `z-1.dll`, the VC runtime DLLs and a `vulkan-1.dll` next to the program (the loader searches the program's directory first, so the system `opengl32.dll` is not touched). `GALLIUM_DRIVER=zink` was set in the tests; the default choice between Zink and the software renderer was not tried. `install-venus-icd.ps1` does not install the OpenGL DLLs: a system-wide `opengl32.dll` is not done.
+Put `opengl32.dll` and `libgallium_wgl.dll` next to the program's `.exe`: the loader searches the program's directory before System32, so only that program uses Mesa, and no other file is needed (the self-contained build was run this way with `gltri`; a copy of FurMark 2, which had said "OpenGL 1.1 detected", ran with OpenGL 4.6 compatibility profile on the Venus driver when the same two DLLs and their runtime files sat next to it). Only 64-bit programs: no 32-bit build exists. `GALLIUM_DRIVER` need not be set (Zink is the only driver in the build).
+
+It cannot be registered for all programs this way: `OpenGLDriverName`, `OpenGLVersion` and `OpenGLFlags` on the adapter's class key (`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\<n>`, the way vendor drivers register an ICD) made no difference for the virtio-gpu display-only adapter, with two value pairs: programs without the Mesa files kept `GDI Generic` 1.1. Replacing `C:\Windows\System32\opengl32.dll` is not done: it belongs to TrustedInstaller and the same Windows partitions also boot on the real GPU. `install-venus-icd.ps1` does not install the OpenGL DLLs.
 
 Programs that leave the swap interval at its default of 1 are paced to about 14.7 ms per frame (see section 3.9 of the ADR); a program that asks for interval 0 is not.
 
@@ -73,12 +75,11 @@ The slots' serial ports are created for administrators only. The elevated `winbr
 to the interactive users when it starts (`org.winbridge.venus.N`, live, not persistent), so a
 Vulkan process with a normal token can use them; without the agent only an elevated process can.
 
-The driver needs the Visual C++ runtime in the guest (`VCRUNTIME140.dll`; the test programs also
-`MSVCP140.dll` and, through it, `VCRUNTIME140_1.dll`). A Windows 11 install does not have it until some
-application brings it: without it the loader reports no driver and a program that links it
-dynamically stops with 0xC0000135. Install the Visual C++ Redistributable, or put the DLLs of
-Microsoft's `Microsoft.VC.<version>.CRT.Redist.X64.base` package next to the application and next to
-`vulkan_virtio.dll`.
+The driver itself needs no Visual C++ runtime: the DLLs are built with the static CRT (3.8 of the ADR
+describes the 0xC0000135 that the dynamic build ran into). A program that links the runtime
+dynamically, such as the D3D test programs, still needs `VCRUNTIME140.dll` (and `MSVCP140.dll` with
+`VCRUNTIME140_1.dll`) in the guest: install the Visual C++ Redistributable, or put the DLLs of
+Microsoft's `Microsoft.VC.<version>.CRT.Redist.X64.base` package next to that program.
 
 ## Measuring
 
