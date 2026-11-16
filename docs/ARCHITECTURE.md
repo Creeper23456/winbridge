@@ -78,7 +78,7 @@ To drive guest desktop resolution, DPI scaling, clipboard exchange, and drag-and
 ## 3. Threading & Event Loop Model
 
 ### Host Architecture (`winbridge-host`)
-1. **GTK Main Thread:** Runs the GTK4 application main loop (`glib::MainContext`), manages the window, handles pointer motion and key controllers, renders the Cairo scanout surface in a `GtkDrawingArea`, and processes drag-and-drop events via `GtkDropTarget`.
+1. **GTK Main Thread:** Runs the GTK4 application main loop (`glib::MainContext`), manages the window, handles pointer motion and key controllers, renders the Cairo scanout surface in a `GtkDrawingArea`, and processes drag-and-drop events via `GtkDropTarget`. Redraws are asked for only when QEMU reports a change. The viewer sets `GDK_DEBUG=no-vsync` before GTK starts (`--vsync` keeps GTK's own pacing): on the measured X11 GNOME session (two monitors, 75 and 60 Hz) GTK waited for the compositor's frame sync and any GTK4 window drew only every second frame (median 33 ms between frame clock ticks, with the cairo, gl and ngl renderers alike), so a guest that delivers 60 updates a second was shown at 30.
 2. **Tokio Async Worker:**
    - Connects to `/tmp/winbridge.sock` to service the guest agent channel.
    - Dispatches `SetResolution`, `SetDpiScale`, and file drop streams to the guest.
