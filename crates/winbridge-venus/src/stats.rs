@@ -35,7 +35,7 @@ struct Window {
     scan_msgs: u64,
     scan_bytes: u64,
     compare_calls: u64,
-    compare_bytes: u64,
+    compare_bytes: [u64; 3],
     mirror: [(u64, u64); 3],
     out_msgs: u64,
     out_bytes: u64,
@@ -118,10 +118,13 @@ impl Stats {
         self.w.mirror = now;
     }
 
-    /// A scan pass compared `bytes` of mirrored memory with its copy.
-    pub fn compared(&mut self, bytes: u64) {
+    /// A scan pass compared this many bytes of mirrored memory with its copy: rings, other
+    /// shmems, device memory.
+    pub fn compared(&mut self, bytes: [u64; 3]) {
         self.w.compare_calls += 1;
-        self.w.compare_bytes += bytes;
+        for (sum, b) in self.w.compare_bytes.iter_mut().zip(bytes) {
+            *sum += b;
+        }
     }
 
     pub fn sent(&mut self, bytes: usize, took: Duration) {
@@ -163,8 +166,8 @@ impl Stats {
         );
         info!(
             target: "stats",
-            "  out: {} msgs {:.0} KiB, write {:.1} ms total max {:.2} ms; {} scans made {} msgs {:.0} KiB; compared {} x {:.0} KiB",
-            w.out_msgs, kib(w.out_bytes), ms(w.send_time), ms(w.send_max), w.scans, w.scan_msgs, kib(w.scan_bytes), w.compare_calls, kib(w.compare_bytes)
+            "  out: {} msgs {:.0} KiB, write {:.1} ms total max {:.2} ms; {} scans made {} msgs {:.0} KiB; {} compare passes: rings {:.0} KiB, other shmem {:.0} KiB, device memory {:.0} KiB",
+            w.out_msgs, kib(w.out_bytes), ms(w.send_time), ms(w.send_max), w.scans, w.scan_msgs, kib(w.scan_bytes), w.compare_calls, kib(w.compare_bytes[0]), kib(w.compare_bytes[1]), kib(w.compare_bytes[2])
         );
         info!(
             target: "stats",

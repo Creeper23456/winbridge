@@ -33,8 +33,14 @@ const MAX_TIMELINES: u32 = 64;
 const BUSY_WINDOW: Duration = Duration::from_millis(5);
 const BUSY_POLL: Duration = Duration::from_micros(100);
 const IDLE_POLL: Duration = Duration::from_millis(2);
-/// A full scan runs at least this often even if nothing announced a change.
+/// A scan runs at least this often even if nothing announced a change.
 const SCAN_PERIOD: Duration = Duration::from_millis(5);
+/// Between two full scans, a shmem the renderer writes (the guest's reply pool is filled from
+/// its start upwards) is compared only up to this many words past the last word that ever
+/// changed. A reply written further out waits for the next full scan.
+const HOT_SLACK_WORDS: usize = 64 * 1024 / 8;
+/// How often every shmem is compared in full.
+const FULL_SCAN_PERIOD: Duration = Duration::from_millis(5);
 
 /// The Venus renderer: virglrenderer in production, a fake in the tests.
 pub trait Renderer {
@@ -74,6 +80,8 @@ struct Shm {
     ring: bool,
     /// The id `vkCreateRingMESA` names, for waking the ring.
     ring_id: u64,
+    /// One past the last word that ever changed on the host side.
+    hot: usize,
 }
 
 impl Shm {
@@ -93,7 +101,7 @@ impl Shm {
                 return Err(io::Error::last_os_error());
             }
             let snap = (size <= SCAN_MAX).then(|| vec![0u64; size / 8]);
-            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, bo: false })
+            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, hot: 0, bo: false })
         }
     }
 
@@ -101,7 +109,7 @@ impl Shm {
     /// multiple of 8 no larger than the mapping. The guest's copy starts out as it is on the
     /// host, so memory the application has not written is not sent.
     fn from_blob(map: *mut u8, size: usize) -> Shm {
-        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, bo: true };
+        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo: true };
         let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
         shm.snap = Some(words);
         shm
@@ -120,11 +128,13 @@ impl Shm {
         unsafe { &*self.map.add(off).cast::<AtomicU32>() }
     }
 
-    /// Appends the words the renderer changed since the last scan. Returns how many bytes it
-    /// compared.
-    fn scan(&mut self, res_id: u32, out: &mut PushBuilder) -> usize {
+    /// Appends the words the renderer changed since the last scan. Unless `full`, only the part
+    /// up to `HOT_SLACK_WORDS` past the last change ever seen is compared. Returns how many bytes
+    /// it compared.
+    fn scan(&mut self, res_id: u32, out: &mut PushBuilder, full: bool) -> usize {
         let Some(mut snap) = self.snap.take() else { return 0 };
-        let words = snap.len();
+        let total = snap.len();
+        let words = if full { total } else { total.min(self.hot + HOT_SLACK_WORDS) };
         let mut i = 0;
         let mut cur = vec![0u64; 0];
         // Most of a scanned shmem is unchanged between two scans, so equal 4 KiB blocks are
@@ -164,6 +174,7 @@ impl Shm {
             }
             cur.truncate(end - start);
             snap[start..end].copy_from_slice(&cur);
+            self.hot = self.hot.max(end);
             let bytes: Vec<u8> = cur.iter().flat_map(|w| w.to_le_bytes()).collect();
             out.add(res_id, (start * 8) as u32, &bytes);
             i = end;
@@ -215,6 +226,8 @@ pub struct Session<R: Renderer, C: Channel> {
     next_fence: u64,
     busy_until: Instant,
     last_scan: Instant,
+    /// The last scan that compared every shmem in full.
+    last_full: Instant,
     last_state: Instant,
     record: Option<(std::fs::File, Instant)>,
     stats: Stats,
@@ -226,7 +239,7 @@ const COALESCE_MAX: usize = 64 << 10;
 impl<R: Renderer, C: Channel> Session<R, C> {
     pub fn new(r: R, chan: C) -> Session<R, C> {
         let now = Instant::now();
-        Session { r, chan, rbuf: Vec::new(), rpos: 0, wbuf: Vec::new(), hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None, stats: Stats::new() }
+        Session { r, chan, rbuf: Vec::new(), rpos: 0, wbuf: Vec::new(), hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_full: now, last_state: now, record: None, stats: Stats::new() }
     }
 
     /// Appends everything the guest sends to `file` as `(microseconds, length, bytes)` records,
@@ -641,26 +654,32 @@ impl<R: Renderer, C: Channel> Session<R, C> {
     /// Sends every word the renderer changed: the other shmems first, the ring last. Device
     /// memory is only looked at when `include_bos` is set, which is when a fence retired.
     fn scan_and_push(&mut self, include_bos: bool) -> io::Result<()> {
-        self.last_scan = Instant::now();
+        let now = Instant::now();
+        self.last_scan = now;
+        let full = now.duration_since(self.last_full) >= FULL_SCAN_PERIOD;
+        if full {
+            self.last_full = now;
+        }
         let mut ring = PushBuilder::default();
         let mut others = PushBuilder::default();
-        let mut compared = 0usize;
+        // Bytes compared: the rings, the other shmems, device memory.
+        let mut compared = [0u64; 3];
         // The ring is read first: its head must never be newer than the data behind it.
         let mut ids: Vec<u32> = self.shms.keys().copied().collect();
         ids.sort_unstable();
         for &id in &ids {
             let s = self.shms.get_mut(&id).unwrap();
             if s.ring {
-                compared += s.scan(id, &mut ring);
+                compared[0] += s.scan(id, &mut ring, true) as u64;
             }
         }
         for &id in &ids {
             let s = self.shms.get_mut(&id).unwrap();
             if !s.ring && (include_bos || !s.bo) {
-                compared += s.scan(id, &mut others);
+                compared[if s.bo { 2 } else { 1 }] += s.scan(id, &mut others, full || s.bo) as u64;
             }
         }
-        self.stats.compared(compared as u64);
+        self.stats.compared(compared);
         if !ring.is_empty() || !others.is_empty() {
             debug!("push: {} other range(s), then {} ring range(s)", others.len(), ring.len());
         }
@@ -739,5 +758,42 @@ impl<T: Renderer + ?Sized> Renderer for &mut T {
     }
     fn unmap_blob(&mut self, res_id: u32) {
         (**self).unmap_blob(res_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(shm: &Shm, off: usize, v: u64) {
+        shm.word(off).store(v, Ordering::Relaxed);
+    }
+
+    fn scanned(shm: &mut Shm, full: bool) -> (usize, u32) {
+        let mut out = PushBuilder::default();
+        let bytes = shm.scan(1, &mut out, full);
+        (bytes, out.len())
+    }
+
+    #[test]
+    fn a_light_scan_stays_near_the_last_change_and_a_full_scan_finds_the_rest() {
+        let mut shm = Shm::create(1 << 20).unwrap();
+        // Nothing has changed yet: a light scan looks only at the first slack.
+        assert_eq!(scanned(&mut shm, false), (HOT_SLACK_WORDS * 8, 0));
+
+        // A reply near the start is found at once and moves the frontier.
+        write(&shm, 4096, 7);
+        assert_eq!(scanned(&mut shm, false).1, 1);
+        assert_eq!(shm.hot, 4096 / 8 + 1);
+
+        // A word far beyond the frontier is not found by a light scan, but a full scan has it.
+        write(&shm, 512 * 1024, 9);
+        assert_eq!(scanned(&mut shm, false).1, 0);
+        assert_eq!(scanned(&mut shm, true), (1 << 20, 1));
+        assert_eq!(shm.hot, 512 * 1024 / 8 + 1);
+
+        // Now that the frontier moved there, a light scan sees what follows it.
+        write(&shm, 512 * 1024 + 8192, 11);
+        assert_eq!(scanned(&mut shm, false).1, 1);
     }
 }
