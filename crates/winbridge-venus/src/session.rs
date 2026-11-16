@@ -179,6 +179,7 @@ struct Fence {
     id: u64,
     ring_idx: u32,
     syncs: Vec<(u32, u64)>,
+    submitted: Instant,
 }
 
 pub struct Session<R: Renderer> {
@@ -217,9 +218,16 @@ impl<R: Renderer> Session<R> {
 
     fn serve(&mut self) -> io::Result<()> {
         loop {
+            let mut phases = [Duration::ZERO; 5];
+            let mut mark = Instant::now();
+            let mut lap = |slot: &mut Duration| {
+                *slot = mark.elapsed();
+                mark = Instant::now();
+            };
             let ctx_fd = if self.hello { self.r.poll_fd(CTX) } else { -1 };
             let timeout = if Instant::now() < self.busy_until { BUSY_POLL } else { IDLE_POLL };
             self.wait_readable(ctx_fd, timeout)?;
+            lap(&mut phases[0]);
             if !self.read_available()? {
                 return Ok(());
             }
@@ -229,18 +237,25 @@ impl<R: Renderer> Session<R> {
                     return Ok(());
                 }
             }
+            lap(&mut phases[1]);
             if self.hello {
                 let retired = self.r.poll(CTX);
+                lap(&mut phases[2]);
                 if !retired.is_empty() {
                     self.retire(&retired)?;
                 }
+                lap(&mut phases[3]);
                 if self.ring_changed() || self.last_scan.elapsed() >= SCAN_PERIOD {
                     self.scan_and_push(false)?;
                 }
+                lap(&mut phases[4]);
                 if self.last_state.elapsed() >= Duration::from_secs(1) {
                     self.last_state = Instant::now();
                     self.log_rings();
                 }
+            }
+            if phases.iter().any(|p| *p >= Duration::from_millis(20)) {
+                debug!("slow loop iteration: wait {:?}, handle {:?}, poll {:?}, retire {:?}, scan {:?}", phases[0], phases[1], phases[2], phases[3], phases[4]);
             }
         }
     }
@@ -465,7 +480,12 @@ impl<R: Renderer> Session<R> {
     }
 
     fn run_submit(&mut self, sub: proto::Submit<'_>) -> io::Result<bool> {
-        if let Err(e) = self.r.submit(CTX, sub.cs) {
+        let started = Instant::now();
+        let submitted = self.r.submit(CTX, sub.cs);
+        if started.elapsed() >= Duration::from_millis(5) {
+            debug!("submit_cmd of {} byte(s) took {:?}", sub.cs.len(), started.elapsed());
+        }
+        if let Err(e) = submitted {
             error!("submit_cmd failed: {e}");
             self.send(proto::LOST, 0, 0, &[])?;
             return Ok(false);
@@ -478,7 +498,7 @@ impl<R: Renderer> Session<R> {
                 self.send(proto::LOST, 0, 0, &[])?;
                 return Ok(false);
             }
-            self.fences.push_back(Fence { id, ring_idx: sub.ring_idx, syncs: sub.syncs });
+            self.fences.push_back(Fence { id, ring_idx: sub.ring_idx, syncs: sub.syncs, submitted: Instant::now() });
         }
         Ok(true)
     }
@@ -541,6 +561,7 @@ impl<R: Renderer> Session<R> {
             self.fences.retain(|f| {
                 let done = f.ring_idx == ring_idx && f.id <= id;
                 if done {
+                    debug!("fence {} on ring {} retired {:?} after its submit", f.id, f.ring_idx, f.submitted.elapsed());
                     points.extend_from_slice(&f.syncs);
                 }
                 !done
