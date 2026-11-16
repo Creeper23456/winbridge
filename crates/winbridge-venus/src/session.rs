@@ -124,7 +124,22 @@ impl Shm {
         let mut i = 0;
         let mut cur = vec![0u64; 0];
         while i < words {
+        // Most of a scanned shmem is unchanged between two scans, so equal 4 KiB blocks are
+        // skipped with one memcmp, which is much faster than comparing word by word.
+        const BLOCK_WORDS: usize = 512;
             if self.word(i * 8).load(Ordering::Relaxed) == snap[i] {
+            if i % BLOCK_WORDS == 0 {
+                let n = BLOCK_WORDS.min(words - i);
+                // SAFETY: both ranges are in bounds (`snap` has `words` entries and the mapping is
+                // `words * 8` bytes). The renderer may write the mapping while it is compared; a
+                // block that differs is read again word by word below, so a torn read here only
+                // costs a second look.
+                let equal = unsafe { libc::memcmp(self.map.add(i * 8).cast(), snap.as_ptr().add(i).cast(), n * 8) } == 0;
+                if equal {
+                    i += n;
+                    continue;
+                }
+            }
                 i += 1;
                 continue;
             }
