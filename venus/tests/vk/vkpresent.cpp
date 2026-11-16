@@ -60,7 +60,11 @@ int main(int argc, char **argv) {
     }
     INST(vkEnumeratePhysicalDevices);
     uint32_t pc = 1; VkPhysicalDevice pd = 0;
-    CHECK(vkEnumeratePhysicalDevices(inst, &pc, &pd));
+    {
+        // One slot asked for: VK_INCOMPLETE only says there are more devices (the software renderer is the second).
+        VkResult e = vkEnumeratePhysicalDevices(inst, &pc, &pd);
+        if (e != VK_SUCCESS && e != VK_INCOMPLETE) { printf("RESULT: FAIL: vkEnumeratePhysicalDevices = %d\n", (int)e); return 1; }
+    }
     INST(vkGetPhysicalDeviceProperties);
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     printf("device: %s\n", props.deviceName);
