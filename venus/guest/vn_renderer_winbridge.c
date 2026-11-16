@@ -565,6 +565,20 @@ wbvn_pump(LPVOID arg)
    return 0;
 }
 
+/* A Sleep(1) lasts a whole 15.6 ms timer tick by default, and every wait for the host (the relax
+ * loop in vn_ring, the pump) pays that once per round trip. Ask for 0.5 ms while a renderer lives. */
+static void
+wbvn_timer_resolution(bool fine)
+{
+   typedef LONG(NTAPI * set_resolution_fn)(ULONG, BOOLEAN, PULONG);
+   const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+   const set_resolution_fn set =
+      ntdll ? (set_resolution_fn)(void (*)(void))GetProcAddress(ntdll, "NtSetTimerResolution") : NULL;
+   ULONG actual;
+   if (set)
+      set(5000, fine, &actual);
+}
+
 /* ---------- vn_renderer ops ---------------------------------------------------------- */
 
 static void
@@ -576,6 +590,7 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    if (w->pump) {
       WaitForSingleObject(w->pump, INFINITE);
       CloseHandle(w->pump);
+      wbvn_timer_resolution(false);
    }
    if (w->port != INVALID_HANDLE_VALUE) {
       /* unblocks the reader */
@@ -988,7 +1003,9 @@ wbvn_init(struct wbvn *w)
    info->has_dma_buf_import = false;
    info->has_external_sync = false;
    info->has_timeline_sync = true;
-   info->has_implicit_fencing = false;
+   /* There are no sync files or dma-bufs. The software WSI path waits on a fence before it reads
+    * an image, and a bo is brought up to date when that fence retires. */
+   info->has_implicit_fencing = true;
    info->has_guest_vram = false;
    info->wire_format_version = w->capset.wire_format_version;
    info->vk_xml_version = w->capset.vk_xml_version;
@@ -1026,6 +1043,7 @@ wbvn_init(struct wbvn *w)
    w->base.sync_ops.read = wbvn_sync_read;
    w->base.sync_ops.write = wbvn_sync_write;
 
+   wbvn_timer_resolution(true);
    w->pump = CreateThread(NULL, 0, wbvn_pump, w, 0, NULL);
    if (!w->pump)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
