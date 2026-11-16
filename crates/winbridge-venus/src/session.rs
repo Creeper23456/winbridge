@@ -50,10 +50,20 @@ pub trait Renderer {
     fn poll(&mut self, ctx: u32) -> Vec<(u32, u64)>;
     /// A descriptor that becomes readable when `poll` has work, or a negative number.
     fn poll_fd(&self, ctx: u32) -> RawFd;
+    /// Creates a mappable host3d blob for the device memory with venus object id `blob_id`
+    /// as resource `res_id` and attaches it to the context.
+    fn create_blob(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> Result<(), i32>;
+    /// Maps a blob. Returns the mapping and its size.
+    fn map_blob(&mut self, res_id: u32) -> Result<(*mut u8, u64), i32>;
+    fn unmap_blob(&mut self, res_id: u32);
 }
 
 struct Shm {
-    fd: OwnedFd,
+    /// The memfd behind a shmem; none for device memory the renderer mapped.
+    fd: Option<OwnedFd>,
+    /// Device memory: the renderer's GPU writes show up here, so it is scanned when a fence
+    /// retires instead of on every tick.
+    bo: bool,
     map: *mut u8,
     size: usize,
     /// What the guest has seen; only for scanned shmems.
@@ -80,8 +90,18 @@ impl Shm {
                 return Err(io::Error::last_os_error());
             }
             let snap = (size <= SCAN_MAX).then(|| vec![0u64; size / 8]);
-            Ok(Shm { fd, map: map.cast(), size, snap, ring: false, ring_id: 0 })
+            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, bo: false })
         }
+    }
+
+    /// Wraps device memory the renderer mapped for us. `size` is what the guest can see, a
+    /// multiple of 8 no larger than the mapping. The guest's copy starts out as it is on the
+    /// host, so memory the application has not written is not sent.
+    fn from_blob(map: *mut u8, size: usize) -> Shm {
+        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, bo: true };
+        let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
+        shm.snap = Some(words);
+        shm
     }
 
     fn word(&self, off: usize) -> &AtomicU64 {
@@ -147,8 +167,11 @@ impl Shm {
 
 impl Drop for Shm {
     fn drop(&mut self) {
-        // SAFETY: the mapping was created in `create` and is unmapped once.
-        unsafe { libc::munmap(self.map.cast(), self.size) };
+        // A blob's mapping belongs to the renderer and is released through `unmap_blob`.
+        if self.fd.is_some() {
+            // SAFETY: the mapping was created in `create` and is unmapped once.
+            unsafe { libc::munmap(self.map.cast(), self.size) };
+        }
     }
 }
 
@@ -169,12 +192,20 @@ pub struct Session<R: Renderer> {
     next_fence: u64,
     busy_until: Instant,
     last_scan: Instant,
+    last_state: Instant,
+    record: Option<(std::fs::File, Instant)>,
 }
 
 impl<R: Renderer> Session<R> {
     pub fn new(r: R, stream: UnixStream) -> Session<R> {
         let now = Instant::now();
-        Session { r, stream, rbuf: Vec::new(), rpos: 0, hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now }
+        Session { r, stream, rbuf: Vec::new(), rpos: 0, hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None }
+    }
+
+    /// Appends everything the guest sends to `file` as `(microseconds, length, bytes)` records,
+    /// for `replay` in `main.rs`.
+    pub fn record_to(&mut self, file: std::fs::File) {
+        self.record = Some((file, Instant::now()));
     }
 
     /// Serves the guest until it closes the channel or the renderer fails.
@@ -204,7 +235,11 @@ impl<R: Renderer> Session<R> {
                     self.retire(&retired)?;
                 }
                 if self.ring_changed() || self.last_scan.elapsed() >= SCAN_PERIOD {
-                    self.scan_and_push()?;
+                    self.scan_and_push(false)?;
+                }
+                if self.last_state.elapsed() >= Duration::from_secs(1) {
+                    self.last_state = Instant::now();
+                    self.log_rings();
                 }
             }
         }
@@ -249,6 +284,16 @@ impl<R: Renderer> Session<R> {
                 };
             }
             self.rbuf.extend_from_slice(&chunk[..n as usize]);
+            if let Some((file, start)) = self.record.as_mut() {
+                let mut rec = Vec::with_capacity(12 + n as usize);
+                rec.extend_from_slice(&(start.elapsed().as_micros() as u64).to_le_bytes());
+                rec.extend_from_slice(&(n as u32).to_le_bytes());
+                rec.extend_from_slice(&chunk[..n as usize]);
+                if let Err(e) = file.write_all(&rec) {
+                    warn!("cannot record the guest stream: {e}");
+                    self.record = None;
+                }
+            }
         }
     }
 
@@ -291,12 +336,10 @@ impl<R: Renderer> Session<R> {
             }
             proto::SHM_CREATE => self.on_shm_create(hdr, p)?,
             proto::SHM_DESTROY => {
-                if let Some(s) = self.shms.remove(&hdr.arg) {
-                    self.r.unref(hdr.arg);
-                    drop(s);
-                }
+                self.release(hdr.arg);
                 self.send(hdr.kind | proto::REPLY, hdr.req, 0, &[])?;
             }
+            proto::BO_CREATE => return self.on_bo_create(hdr, p),
             proto::SHM_ROLE => {
                 if let Some(s) = self.shms.get_mut(&hdr.arg) {
                     s.ring = true;
@@ -343,7 +386,7 @@ impl<R: Renderer> Session<R> {
         } else {
             match Shm::create(size as usize) {
                 Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
-                Ok(shm) => match self.r.attach_shmem(CTX, res_id, shm.fd.as_raw_fd(), size) {
+                Ok(shm) => match self.r.attach_shmem(CTX, res_id, shm.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd), size) {
                     Ok(()) => {
                         self.shms.insert(res_id, shm);
                         0
@@ -390,6 +433,7 @@ impl<R: Renderer> Session<R> {
         }
         let tail = s.word32(proto::RING_TAIL as usize).load(Ordering::SeqCst);
         let cs = proto::notify_ring_cs(s.ring_id, tail);
+        debug!("waking ring {res_id}: tail {tail}");
         if let Err(e) = self.r.submit(CTX, &cs) {
             warn!("cannot wake ring {res_id}: {e}");
         }
@@ -417,6 +461,10 @@ impl<R: Renderer> Session<R> {
             warn!("malformed SUBMIT");
             return Ok(false);
         };
+        self.run_submit(sub)
+    }
+
+    fn run_submit(&mut self, sub: proto::Submit<'_>) -> io::Result<bool> {
         if let Err(e) = self.r.submit(CTX, sub.cs) {
             error!("submit_cmd failed: {e}");
             self.send(proto::LOST, 0, 0, &[])?;
@@ -433,6 +481,55 @@ impl<R: Renderer> Session<R> {
             self.fences.push_back(Fence { id, ring_idx: sub.ring_idx, syncs: sub.syncs });
         }
         Ok(true)
+    }
+
+    fn on_bo_create(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
+        const HEAD: usize = 24;
+        if p.len() < HEAD {
+            warn!("malformed BO_CREATE");
+            return Ok(false);
+        }
+        let (size, blob_id, batch_len) = (proto::u64_at(p, 0), proto::u64_at(p, 8), proto::u32_at(p, 20) as usize);
+        let res_id = hdr.arg;
+        if HEAD + batch_len != p.len() || res_id == 0 || size == 0 || self.shms.contains_key(&res_id) {
+            warn!("invalid BO_CREATE for resource {res_id}");
+            self.send(hdr.kind | proto::REPLY, hdr.req, libc::EINVAL as u32, &[])?;
+            return Ok(true);
+        }
+        if batch_len > 0 {
+            // It makes the renderer's ring reach the allocation before the blob is created.
+            let Some(sub) = proto::parse_submit(&p[HEAD..]) else {
+                warn!("malformed batch in BO_CREATE");
+                return Ok(false);
+            };
+            if !self.run_submit(sub)? {
+                return Ok(false);
+            }
+        }
+        let status = self.create_bo(res_id, blob_id, size);
+        self.send(hdr.kind | proto::REPLY, hdr.req, status, &[])?;
+        Ok(true)
+    }
+
+    /// Creates the blob for a VkDeviceMemory and maps it. Returns the reply status.
+    fn create_bo(&mut self, res_id: u32, blob_id: u64, size: u64) -> u32 {
+        if let Err(e) = self.r.create_blob(CTX, res_id, blob_id, size) {
+            warn!("cannot create the blob for memory {blob_id} ({size} bytes): {e}");
+            return e.unsigned_abs().max(1);
+        }
+        match self.r.map_blob(res_id) {
+            Err(e) => {
+                warn!("cannot map the blob for memory {blob_id}: {e}");
+                self.r.unref(res_id);
+                e.unsigned_abs().max(1)
+            }
+            Ok((map, host_size)) => {
+                // The guest's copy is rounded up to whole pages.
+                let guest_size = (size + 4095) & !4095;
+                self.shms.insert(res_id, Shm::from_blob(map, (guest_size.min(host_size) & !7) as usize));
+                0
+            }
+        }
     }
 
     /// Completes the fences the renderer retired. Mirrored memory goes out first, so a waiter
@@ -452,8 +549,26 @@ impl<R: Renderer> Session<R> {
         if points.is_empty() {
             return Ok(());
         }
-        self.scan_and_push()?;
+        self.scan_and_push(true)?;
         self.send(proto::SYNC_SIGNAL, 0, 0, &proto::sync_signal_payload(&points))
+    }
+
+    /// Logs the head, tail and status of each ring, as the host memory has them, and the type of
+    /// the command the ring is at.
+    fn log_rings(&self) {
+        for (id, s) in self.shms.iter().filter(|(_, s)| s.ring) {
+            let head = s.word32(proto::RING_HEAD as usize).load(Ordering::Relaxed);
+            // The buffer follows the control words (192 bytes) and is followed by 4 bytes of extra.
+            let buf = s.size.saturating_sub(196).max(4);
+            let at = (192 + (head as usize % buf)) & !3;
+            let cmd = if at + 4 <= s.size { s.word32(at).load(Ordering::Relaxed) } else { 0 };
+            debug!(
+                "ring {id}: head {head} tail {} status {:#x} command type {cmd}, {} fence(s) pending",
+                s.word32(proto::RING_TAIL as usize).load(Ordering::Relaxed),
+                s.word32(proto::RING_STATUS as usize).load(Ordering::Relaxed),
+                self.fences.len()
+            );
+        }
     }
 
     /// True when a ring's head or status word changed since the guest last saw it.
@@ -466,8 +581,9 @@ impl<R: Renderer> Session<R> {
         })
     }
 
-    /// Sends every word the renderer changed: the other shmems first, the ring last.
-    fn scan_and_push(&mut self) -> io::Result<()> {
+    /// Sends every word the renderer changed: the other shmems first, the ring last. Device
+    /// memory is only looked at when `include_bos` is set, which is when a fence retired.
+    fn scan_and_push(&mut self, include_bos: bool) -> io::Result<()> {
         self.last_scan = Instant::now();
         let mut ring = PushBuilder::default();
         let mut others = PushBuilder::default();
@@ -482,7 +598,7 @@ impl<R: Renderer> Session<R> {
         }
         for &id in &ids {
             let s = self.shms.get_mut(&id).unwrap();
-            if !s.ring {
+            if !s.ring && (include_bos || !s.bo) {
                 s.scan(id, &mut others);
             }
         }
@@ -498,14 +614,24 @@ impl<R: Renderer> Session<R> {
         Ok(())
     }
 
+    /// Releases a resource: the mapping first if the renderer made it, then the resource.
+    fn release(&mut self, id: u32) {
+        if let Some(s) = self.shms.remove(&id) {
+            if s.bo {
+                self.r.unmap_blob(id);
+            }
+            self.r.unref(id);
+            drop(s);
+        }
+    }
+
     fn shutdown(&mut self) {
         debug!("ending the session");
         if self.hello {
             let ids: Vec<u32> = self.shms.keys().copied().collect();
             // Resources are released before the context goes, as the guest did.
             for id in ids {
-                self.shms.remove(&id);
-                self.r.unref(id);
+                self.release(id);
             }
             self.r.destroy_context(CTX);
             self.hello = false;
@@ -540,5 +666,14 @@ impl<T: Renderer + ?Sized> Renderer for &mut T {
     }
     fn poll_fd(&self, ctx: u32) -> RawFd {
         (**self).poll_fd(ctx)
+    }
+    fn create_blob(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> Result<(), i32> {
+        (**self).create_blob(ctx, res_id, blob_id, size)
+    }
+    fn map_blob(&mut self, res_id: u32) -> Result<(*mut u8, u64), i32> {
+        (**self).map_blob(res_id)
+    }
+    fn unmap_blob(&mut self, res_id: u32) {
+        (**self).unmap_blob(res_id)
     }
 }

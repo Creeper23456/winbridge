@@ -21,6 +21,8 @@ struct Inner {
     submits: Vec<Vec<u8>>,
     /// Runs on every submit: the fake renderer's "work".
     on_submit: Option<Box<dyn FnMut(&mut Inner) + Send>>,
+    /// The word new blobs are filled with: device memory starts out with whatever it holds.
+    blob_fill: u64,
 }
 
 impl Inner {
@@ -72,6 +74,26 @@ impl Renderer for Mock {
     fn poll_fd(&self, _: u32) -> RawFd {
         -1
     }
+    fn create_blob(&mut self, _: u32, res_id: u32, _blob_id: u64, size: u64) -> Result<(), i32> {
+        let size = ((size + 4095) & !4095) as usize;
+        // SAFETY: an anonymous shared mapping of our own.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        let mut g = self.0.lock().unwrap();
+        let fill = g.blob_fill;
+        for i in 0..size / 8 {
+            // SAFETY: in bounds and aligned.
+            unsafe { p.cast::<u64>().add(i).write(fill) };
+        }
+        g.maps.insert(res_id, Map(p.cast(), size));
+        Ok(())
+    }
+    fn map_blob(&mut self, res_id: u32) -> Result<(*mut u8, u64), i32> {
+        let g = self.0.lock().unwrap();
+        let m = &g.maps[&res_id];
+        Ok((m.0, m.1 as u64))
+    }
+    fn unmap_blob(&mut self, _: u32) {}
 }
 
 struct Guest(UnixStream);
@@ -246,6 +268,69 @@ fn a_pushed_tail_wakes_an_idle_ring_and_only_an_idle_one() {
     push_tail(&mut g, 2);
     let submits = mock.0.lock().unwrap().submits.clone();
     assert_eq!(submits, vec![proto::notify_ring_cs(0xabcd, 2).to_vec()]);
+    drop(g);
+    t.join().unwrap();
+}
+
+fn submit_payload(ring_idx: u32, syncs: &[(u32, u64)], cs: &[u8]) -> Vec<u8> {
+    let mut p = Vec::new();
+    for v in [ring_idx, syncs.len() as u32, cs.len() as u32, 0] {
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    for (id, v) in syncs {
+        p.extend_from_slice(&id.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&v.to_le_bytes());
+    }
+    p.extend_from_slice(cs);
+    p
+}
+
+#[test]
+fn device_memory_goes_down_on_push_and_comes_back_when_a_fence_retires() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mock = Mock::default();
+    mock.0.lock().unwrap().blob_fill = 0x5555;
+    let (mut g, t) = start(&mock);
+
+    // The batch runs before the blob exists; the blob is then created and mapped.
+    let batch = submit_payload(0, &[], &[9; 8]);
+    let mut p = Vec::new();
+    p.extend_from_slice(&0x2000u64.to_le_bytes());
+    p.extend_from_slice(&77u64.to_le_bytes());
+    p.extend_from_slice(&1u32.to_le_bytes());
+    p.extend_from_slice(&(batch.len() as u32).to_le_bytes());
+    p.extend_from_slice(&batch);
+    let (h, _) = g.request(proto::BO_CREATE, 3, &p);
+    assert_eq!(h.arg, 0);
+    assert_eq!(mock.0.lock().unwrap().submits, vec![vec![9u8; 8]]);
+
+    // The guest writes memory the GPU will read.
+    let mut b = PushBuilder::default();
+    b.add(3, 16, &0x1111_u64.to_le_bytes());
+    g.send(proto::PUSH, 0, 0, &b.finish());
+    create(&mut g, 2, 0x1000); // round trip: the push is handled first
+    assert_eq!(mock.0.lock().unwrap().word(3, 16).load(SeqCst), 0x1111);
+
+    // The GPU writes a word. Nothing is sent until a fence retires, and what the memory held
+    // when it was created is never sent.
+    mock.0.lock().unwrap().word(3, 64).store(0xBEEF, SeqCst);
+    assert!(g.recv(Duration::from_millis(80)).is_none(), "device memory was scanned without a fence");
+
+    g.send(proto::SUBMIT, 0, 0, &submit_payload(1, &[(5, 1)], &[0; 8]));
+    let mut pushes = Vec::new();
+    loop {
+        let (h, p) = g.recv(Duration::from_secs(2)).expect("push then signal");
+        if h.kind == proto::SYNC_SIGNAL {
+            break;
+        }
+        assert_eq!(h.kind, proto::PUSH);
+        pushes.extend(proto::parse_push(&p).iter().map(|r| (r.res_id, r.offset, u64::from_le_bytes(r.data[..8].try_into().unwrap()), r.data.len())));
+    }
+    assert_eq!(pushes, vec![(3, 64, 0xBEEF, 8)], "only the GPU's write comes back, before the signal");
+
+    let (h, _) = g.request(proto::SHM_DESTROY, 3, &[]);
+    assert_eq!(h.arg, 0);
     drop(g);
     t.join().unwrap();
 }

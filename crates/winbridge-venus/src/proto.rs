@@ -24,6 +24,7 @@ pub const SUBMIT: u32 = 6;
 pub const SYNC_SIGNAL: u32 = 7;
 pub const LOST: u32 = 8;
 pub const STATUS_CLEAR: u32 = 9;
+pub const BO_CREATE: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hdr {
