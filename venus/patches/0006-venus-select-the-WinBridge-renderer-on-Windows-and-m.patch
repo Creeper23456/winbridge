@@ -1,8 +1,8 @@
-From f533981327e1fdd3b2013a69a2ad297a6c66b7dc Mon Sep 17 00:00:00 2001
+From cb5b7345ade9c5b5c16630e3b78b352a97eda3ab Mon Sep 17 00:00:00 2001
 From: Creeper23456 <Creeper23456@outlook.com>
 Date: Mon, 16 Nov 2026 11:50:24 +0800
-Subject: [PATCH] venus: select the WinBridge renderer on Windows and mark ring
- shmems
+Subject: [PATCH 6/7] venus: select the WinBridge renderer on Windows and mark
+ ring shmems
 
 ---
  src/virtio/vulkan/meson.build   |  2 ++

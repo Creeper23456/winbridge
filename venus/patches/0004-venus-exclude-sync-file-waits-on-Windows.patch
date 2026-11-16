@@ -1,55 +1,42 @@
-From 6b2c0b8bfbdeca79784ede509a51e7da0f6a5c07 Mon Sep 17 00:00:00 2001
+From 0deb18768ab9a20a89d09282b002529fb24ee5ae Mon Sep 17 00:00:00 2001
 From: Creeper23456 <Creeper23456@outlook.com>
 Date: Mon, 16 Nov 2026 11:30:44 +0800
-Subject: [PATCH] venus: exclude sync-file waits on Windows
+Subject: [PATCH 4/7] venus: exclude sync-file waits on Windows
 
 ---
- src/virtio/vulkan/vn_sync.c | 14 ++++++++++++++
- 1 file changed, 14 insertions(+)
+ src/virtio/vulkan/vn_sync.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
 
 diff --git a/src/virtio/vulkan/vn_sync.c b/src/virtio/vulkan/vn_sync.c
-index b5f71bb..4819b13 100644
+index b5f71bb..a16198a 100644
 --- a/src/virtio/vulkan/vn_sync.c
 +++ b/src/virtio/vulkan/vn_sync.c
-@@ -156,12 +156,16 @@ vn_GetFenceStatus(VkDevice device, VkFence _fence)
-       if (result == VK_SUCCESS)
-          result = val ? VK_SUCCESS : VK_NOT_READY;
-    } else {
-+#ifndef _WIN32
-       assert(payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD);
+@@ -16,6 +16,18 @@
+ #include "vn_renderer.h"
+ #include "vn_wsi.h"
  
-       if (payload->fd < 0 || sync_wait(payload->fd, 0) == 0)
-          result = VK_SUCCESS;
-       else
-          result = errno == ETIME ? VK_NOT_READY : VK_ERROR_DEVICE_LOST;
-+#else
-+      result = VK_ERROR_DEVICE_LOST;
++#ifdef _WIN32
++/* Windows has no sync files. vn_sync_valid_fd only accepts -1, an object that has already
++ * signaled, so the wait below is never reached with an fd >= 0. */
++static inline int
++sync_wait(int fd, int timeout)
++{
++   (void)fd;
++   (void)timeout;
++   return 0;
++}
 +#endif
-    }
- 
-    return vn_result(dev->instance, result);
-@@ -211,6 +215,7 @@ vn_WaitForFences(VkDevice device,
-       VK_FROM_HANDLE(vn_fence, fence, pFences[i]);
-       struct vn_sync_payload *payload = fence->payload;
- 
-+#ifndef _WIN32
-       if (payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD) {
-          const int poll_timeout = vn_timeout_to_poll_timeout(timeout);
-          if (payload->fd >= 0 && sync_wait(payload->fd, poll_timeout)) {
-@@ -222,6 +227,7 @@ vn_WaitForFences(VkDevice device,
- 
-          continue;
-       }
-+#endif
- 
-       assert(payload->type == VN_SYNC_TYPE_SYNC);
- 
-@@ -252,10 +258,14 @@ out_stack_arr_fini:
++
+ static void
+ vn_sync_payload_release_internal(struct vn_device *dev,
+                                  struct vn_sync_payload *payload,
+@@ -252,10 +264,15 @@ out_stack_arr_fini:
  static inline bool
  vn_sync_valid_fd(int fd)
  {
 +#ifdef _WIN32
-+   return false;
++   /* -1 only: there are no sync file descriptors on Windows. */
++   return fd == -1;
 +#else
     /* the special value -1 for fd is treated like a valid sync file descriptor
      * referring to an object that has already signaled
@@ -59,24 +46,6 @@ index b5f71bb..4819b13 100644
  }
  
  VKAPI_ATTR VkResult VKAPI_CALL
-@@ -344,6 +354,7 @@ vn_semaphore_wait_sync_fd(VkDevice dev_handle, VkSemaphore sem_handle)
-       return result == VK_SUCCESS;
-    }
- 
-+#ifndef _WIN32
-    assert(payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD &&
-           payload == &sem->temporary);
- 
-@@ -356,6 +367,9 @@ vn_semaphore_wait_sync_fd(VkDevice dev_handle, VkSemaphore sem_handle)
-    sem->payload = &sem->permanent;
- 
-    return true;
-+#else
-+   return false;
-+#endif
- }
- 
- static VkResult
 -- 
 2.47.3
 

@@ -1,0 +1,42 @@
+From 939de9cfb75f95f1157f0255b5e51a93bdf45ad7 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 14:15:17 +0800
+Subject: [PATCH 8/8] venus: expose only cached host-visible memory types on
+ Windows
+
+---
+ src/virtio/vulkan/vn_physical_device.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 1eb8ff7..1e58da4 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1059,6 +1059,24 @@ vn_physical_device_init_memory_properties(
+       props->memoryTypes[first_coherent].propertyFlags |=
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
++
++#ifdef _WIN32
++   /* The WinBridge renderer mirrors host-visible memory by reading it on the renderer side after
++    * every fence. Write-combined and BAR types are uncached for CPU reads and a 10 MiB scan took
++    * about 490 ms on NVIDIA 550. When a cached host-visible type exists, the others stay in
++    * place so memory type indices keep matching the renderer, but lose their host-visible bits. */
++   bool has_cached_visible = false;
++   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++      const VkMemoryPropertyFlags f = props->memoryTypes[i].propertyFlags;
++      if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++         has_cached_visible = true;
++   }
++   for (uint32_t i = 0; has_cached_visible && i < props->memoryTypeCount; i++) {
++      VkMemoryPropertyFlags *f = &props->memoryTypes[i].propertyFlags;
++      if ((*f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !(*f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++         *f &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++   }
++#endif
+ }
+ 
+ static void
+-- 
+2.47.3
+

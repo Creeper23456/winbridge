@@ -1,0 +1,76 @@
+From 22a9c1683806686a6c7bb3e684004034d58da5e9 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 13:50:26 +0800
+Subject: [PATCH 7/7] venus: enable the software WSI path on Windows
+
+---
+ src/virtio/vulkan/meson.build   | 2 +-
+ src/virtio/vulkan/vn_instance.c | 6 +++++-
+ src/virtio/vulkan/vn_wsi.c      | 7 +++++++
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index c409412..f6c89f3 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -138,7 +138,7 @@ if system_has_kms_drm
+   vn_deps += dep_libdrm
+ endif
+ 
+-if with_platform_wayland or with_platform_x11 or \
++if with_platform_wayland or with_platform_x11 or with_platform_windows or \
+    (system_has_kms_drm and not with_platform_android)
+   libvn_files += files('vn_wsi.c')
+   vn_c_args += '-DVN_USE_WSI_PLATFORM'
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+index 3af0561..9bed863 100644
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -56,6 +56,9 @@ static const struct vk_instance_extension_table
+ #ifdef VK_USE_PLATFORM_XLIB_XRANDR_EXT
+       .EXT_acquire_xlib_display = true,
+ #endif
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++      .KHR_win32_surface = true,
++#endif
+ #ifndef VK_USE_PLATFORM_WIN32_KHR
+       .EXT_headless_surface = true,
+ #endif
+@@ -359,7 +362,8 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                            .engineVersion = instance->base.vk.app_info.engine_version,
+                         });
+ 
+-   instance->renderer->info.has_implicit_fencing =
++   /* A backend that already tracks bo fences itself (WinBridge) keeps its setting. */
++   instance->renderer->info.has_implicit_fencing |=
+       instance->drirc.performance.implicit_fencing;
+ 
+    if (VN_DEBUG(INIT)) {
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index 0721e05..df541ce 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -448,6 +448,12 @@ vn_wsi_fence_wait(VkQueue queue_handle)
+ void
+ vn_wsi_sync_wait(struct vn_device *dev, int fd)
+ {
++#ifdef _WIN32
++   /* Windows has no sync files; the software WSI path never produces one. */
++   (void)dev;
++   (void)fd;
++   UNREACHABLE("sync file wait on Windows");
++#else
+    if (dev->renderer->info.has_implicit_fencing)
+       return;
+ 
+@@ -472,6 +478,7 @@ vn_wsi_sync_wait(struct vn_device *dev, int fd)
+       vn_wsi_chains_lock(dev, queue->async_present.info, /*all=*/false);
+       simple_mtx_lock(&queue->async_present.queue_mutex);
+    }
++#endif
+ }
+ 
+ void
+-- 
+2.47.3
+

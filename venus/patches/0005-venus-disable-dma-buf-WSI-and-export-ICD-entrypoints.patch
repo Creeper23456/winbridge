@@ -1,7 +1,7 @@
-From f08c9790f79ed62035645477abf51ec6d8df3e1f Mon Sep 17 00:00:00 2001
+From 6a62377dda8746470c0a73d94b9d48c16e5152eb Mon Sep 17 00:00:00 2001
 From: Creeper23456 <Creeper23456@outlook.com>
 Date: Mon, 16 Nov 2026 11:30:44 +0800
-Subject: [PATCH] venus: disable dma-buf WSI and export ICD entrypoints on
+Subject: [PATCH 5/7] venus: disable dma-buf WSI and export ICD entrypoints on
  Windows
 
 ---
