@@ -12,6 +12,8 @@
 # viewer's "Game mode" (relative mouse) needs. Without it, game mode is refused by QEMU.
 # Optional: WINBRIDGE_SHM=1 adds the ivshmem shared-memory device for the optional shared-memory
 # transport (see below); WINBRIDGE_SHM_FILE changes its backing file (default /dev/shm/winbridge-ctl).
+# Optional: WINBRIDGE_VENUS=N adds N Venus slots for 3D acceleration and starts one winbridge-venus
+# per slot (see below and venus/README.md).
 # Runs in the foreground so the EXIT trap can stop the private bus daemon.
 
 set -euo pipefail
@@ -79,6 +81,40 @@ if [ "${WINBRIDGE_SHM:-0}" = 1 ]; then
     )
 fi
 
+# Optional Venus slots (venus/README.md): WINBRIDGE_VENUS=N adds N client slots for 3D
+# acceleration. A slot is a 64 MiB ivshmem-plain device backed by /dev/shm/winbridge-venus<I>
+# (recreated empty at every start, mode 0600) plus the virtio-serial port org.winbridge.venus.<I>
+# that carries wake-up bytes, and gets one winbridge-venus process, stopped when this script ends.
+# A guest Vulkan process takes one slot at a time. Needs WINBRIDGE_VIRGL_LIB (libvirglrenderer.so.1
+# with the patches of venus/patches/virglrenderer) and WINBRIDGE_RENDER_SERVER (virgl_render_server);
+# WINBRIDGE_VENUS_BIN names the winbridge-venus binary (default: from PATH).
+VENUS_DEVICES=()
+VENUS_PIDS=()
+VENUS_SLOTS="${WINBRIDGE_VENUS:-0}"
+if [ "$VENUS_SLOTS" -gt 0 ]; then
+    : "${WINBRIDGE_VIRGL_LIB:?WINBRIDGE_VENUS needs WINBRIDGE_VIRGL_LIB}"
+    : "${WINBRIDGE_RENDER_SERVER:?WINBRIDGE_VENUS needs WINBRIDGE_RENDER_SERVER}"
+    VENUS_BIN="${WINBRIDGE_VENUS_BIN:-winbridge-venus}"
+    for ((i = 0; i < VENUS_SLOTS; i++)); do
+        slot_file="/dev/shm/winbridge-venus$i"
+        slot_sock="/tmp/winbridge-venus$i.sock"
+        rm -f "$slot_file" "$slot_sock"
+        (umask 077 && : > "$slot_file")
+        truncate -s 64M "$slot_file"
+        VENUS_DEVICES+=(
+            -object memory-backend-file,id=wbv$i,mem-path="$slot_file",size=64M,share=on
+            -device ivshmem-plain,memdev=wbv$i
+            -chardev socket,id=wv$i,path="$slot_sock",server=on,wait=off
+            -device virtserialport,chardev=wv$i,name=org.winbridge.venus.$i
+        )
+        "$VENUS_BIN" --shm "$slot_file" --socket "$slot_sock" --slot "$i" \
+            --virgl-lib "$WINBRIDGE_VIRGL_LIB" --render-server "$WINBRIDGE_RENDER_SERVER" &
+        VENUS_PIDS+=($!)
+        echo "Venus slot $i:        $slot_file (64 MiB, ivshmem-plain), $slot_sock"
+    done
+    trap 'kill "$BUS_PID" "${VENUS_PIDS[@]}" 2>/dev/null || true; rm -f "$BUS_CONF" "$DBUS_SOCK" "$WINBRIDGE_QMP_SOCK"' EXIT
+fi
+
 # The default pc machine provides the IDE bus used by this removable CD-ROM.
 qemu-system-x86_64 \
     -enable-kvm \
@@ -99,5 +135,6 @@ qemu-system-x86_64 \
     -chardev socket,id=wb0,path="$WINBRIDGE_SOCK",server=on,wait=off \
     -device virtio-serial-pci \
     -device virtserialport,chardev=wb0,name=org.winbridge.0 \
+    "${VENUS_DEVICES[@]}" \
     -nic user,model=virtio-net-pci \
     "$@"
