@@ -121,6 +121,9 @@ pub struct ViewerWindow {
     notice_timer: RefCell<Option<glib::SourceId>>,
     /// The agent answered the last keepalive check; a silence followed by an answer re-syncs.
     agent_heard: Cell<bool>,
+    /// The refresh rate (millihertz) last sent to the guest; `None` until sent, and again after
+    /// the agent was silent, so a restarted agent gets it once more.
+    refresh_sent: Cell<Option<u32>>,
     /// Re-sends the canvas resolution and DPI to the guest (through the resize debounce).
     resync: RefCell<Option<Rc<dyn Fn()>>>,
     /// `Mouse.IsAbsolute` as read from QEMU when game mode was last switched on.
@@ -242,6 +245,7 @@ impl ViewerWindow {
             notice: RefCell::new(None),
             notice_timer: RefCell::new(None),
             agent_heard: Cell::new(true),
+            refresh_sent: Cell::new(None),
             resync: RefCell::new(None),
             is_absolute: Cell::new(None),
             agent_unresponsive: Cell::new(false),
@@ -1186,8 +1190,22 @@ impl ViewerWindow {
                 }
                 self.serial.send_message(Message::QueryStatus);
             }
+            self.sync_refresh_rate();
         } else {
             self.agent_heard.set(false);
+            self.refresh_sent.set(None);
+        }
+    }
+
+    /// Sends the refresh rate for the monitors connected now when it differs from the last one
+    /// sent (hot-plug, a monitor switched to another mode).
+    fn sync_refresh_rate(&self) {
+        let Some(millihertz) = crate::refresh::target_millihertz() else {
+            return;
+        };
+        if self.refresh_sent.replace(Some(millihertz)) != Some(millihertz) {
+            info!("Syncing guest refresh rate: {} mHz", millihertz);
+            self.serial.send_message(Message::SetRefreshRate { millihertz });
         }
     }
 

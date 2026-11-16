@@ -251,6 +251,18 @@ pub enum Message {
     ShmFallback {
         reason: String,
     },
+    /// Host -> guest: the refresh rate the virtual screen should run at, in millihertz (60000 =
+    /// 60 Hz): the lowest rate among the monitors connected to the host, at most 60 Hz.
+    SetRefreshRate {
+        millihertz: u32,
+    },
+    /// Guest -> host: answer to `SetRefreshRate`. `success` is true only when the display
+    /// configuration reports the requested rate afterwards; `error` says what it reports instead.
+    RefreshRateResult {
+        millihertz: u32,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 impl Message {
@@ -524,6 +536,12 @@ mod tests {
                 scale_percent: 150,
                 success: true,
                 error: None,
+            },
+            Message::SetRefreshRate { millihertz: 59_940 },
+            Message::RefreshRateResult {
+                millihertz: 59_940,
+                success: false,
+                error: Some("mode rejected".to_string()),
             },
             Message::QueryStatus,
             Message::StatusReply {

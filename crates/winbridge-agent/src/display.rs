@@ -11,9 +11,10 @@ mod imp {
     use windows_sys::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
         QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
         QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
-        SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+        SDC_APPLY, SDC_SAVE_TO_DATABASE, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
     };
     /// DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE (not exported by windows-sys): the source/target
     /// mode indices of a path are packed into 16-bit halves.
@@ -73,10 +74,8 @@ mod imp {
         Err(last)
     }
 
-    /// Applies the size through the CCD API, the way the virtio-win helper does it. Windows only
-    /// offers a fixed mode list to ChangeDisplaySettings, while the GPU driver's custom mode
-    /// (taken from the host window size) is accepted as a supplied display configuration.
-    fn set_resolution_ccd(width: u32, height: u32) -> Result<(), String> {
+    /// The active display paths and their modes, as CCD reports them.
+    fn query_active_config() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
         let mut path_count: u32 = 0;
         let mut mode_count: u32 = 0;
         let status = unsafe {
@@ -105,7 +104,91 @@ mod imp {
         }
         paths.truncate(path_count as usize);
         modes.truncate(mode_count as usize);
+        Ok((paths, modes))
+    }
 
+    /// The refresh rate of the first active path in millihertz, 0 when it reports none.
+    fn path_millihertz(path: &DISPLAYCONFIG_PATH_INFO) -> u32 {
+        let rate = path.targetInfo.refreshRate;
+        if rate.Denominator == 0 {
+            return 0;
+        }
+        (u64::from(rate.Numerator) * 1000 / u64::from(rate.Denominator)) as u32
+    }
+
+    /// Sets the refresh rate of the virtual screen. Ok only when the display configuration reports
+    /// the requested rate afterwards. The configuration is validated first, so a driver that does
+    /// not offer the rate keeps the mode it has. Two forms are tried: the rate on the path and in
+    /// the target's video signal, then on the path alone.
+    pub fn set_refresh_rate(millihertz: u32) -> Result<(), String> {
+        let (mut paths, modes) = query_active_config()?;
+        let before = path_millihertz(&paths[0]);
+        if before == millihertz {
+            return Ok(());
+        }
+        let rate = DISPLAYCONFIG_RATIONAL { Numerator: millihertz, Denominator: 1000 };
+        paths[0].targetInfo.refreshRate = rate;
+        let raw = unsafe { paths[0].targetInfo.Anonymous.modeInfoIdx };
+        let idx = if paths[0].flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
+            raw & 0xFFFF
+        } else {
+            raw
+        } as usize;
+        let has_target_mode = idx < modes.len() && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET;
+
+        let mut failures = Vec::new();
+        for with_signal in [true, false] {
+            if with_signal && !has_target_mode {
+                continue;
+            }
+            let mut attempt = modes.clone();
+            if with_signal {
+                attempt[idx].Anonymous.targetMode.targetVideoSignalInfo.vSyncFreq = rate;
+            }
+            let submit = |flags: u32| unsafe {
+                SetDisplayConfig(
+                    paths.len() as u32,
+                    paths.as_ptr(),
+                    attempt.len() as u32,
+                    attempt.as_ptr(),
+                    flags | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+                )
+            };
+            let form = if with_signal { "path and signal" } else { "path only" };
+            let status = submit(SDC_VALIDATE);
+            if status != 0 {
+                failures.push(format!("{form}: validation code {status}"));
+                continue;
+            }
+            let status = submit(SDC_APPLY | SDC_SAVE_TO_DATABASE);
+            if status != 0 {
+                failures.push(format!("{form}: apply code {status}"));
+                continue;
+            }
+            let applied = query_active_config().map_or(0, |(p, _)| path_millihertz(&p[0]));
+            if applied != millihertz {
+                // The driver validated and accepted the configuration but kept its own rate.
+                failures.push(format!("{form}: accepted, but the path still reports {applied} mHz"));
+                continue;
+            }
+            info!("SetDisplayConfig applied {} mHz ({})", millihertz, form);
+            return Ok(());
+        }
+        Err(format!(
+            "the display driver does not take {} mHz (it runs at {} mHz): {}",
+            millihertz,
+            before,
+            failures.join("; ")
+        ))
+    }
+
+    /// Applies the size through the CCD API, the way the virtio-win helper does it. Windows only
+    /// offers a fixed mode list to ChangeDisplaySettings, while the GPU driver's custom mode
+    /// (taken from the host window size) is accepted as a supplied display configuration.
+    fn set_resolution_ccd(width: u32, height: u32) -> Result<(), String> {
+        let (paths, mut modes) = query_active_config()?;
+        let path_count = paths.len() as u32;
+        let mode_count = modes.len() as u32;
         let path = &paths[0];
         let raw = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
         let idx = if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
@@ -408,6 +491,11 @@ mod imp {
 
     pub fn set_dpi_scale(scale_percent: u32) -> Result<(), String> {
         tracing::info!("[Mock] Set DPI scale to {}%", scale_percent);
+        Ok(())
+    }
+
+    pub fn set_refresh_rate(millihertz: u32) -> Result<(), String> {
+        tracing::info!("[Mock] Set refresh rate to {} mHz", millihertz);
         Ok(())
     }
 

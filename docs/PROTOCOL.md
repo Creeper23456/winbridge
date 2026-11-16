@@ -80,6 +80,24 @@ All communication occurs as discrete, length-prefixed binary frames:
   - `success: bool`: `true` if successful; `false` otherwise.
   - `error: Option<String>`: Diagnostic error message if failed.
 
+### 2.3.1 Refresh Rate
+
+#### `SetRefreshRate`
+- **Direction:** Host $\to$ Agent
+- **Description:** The refresh rate the virtual screen should run at. The viewer sends the lowest rate among the monitors connected to the Linux host, at most 60 Hz, when the agent first answers and again whenever that value changes (monitor plugged in, removed or switched to another mode). A host whose monitors report no rate sends nothing.
+- **Fields:**
+  - `millihertz: u32`: Rate in millihertz (`60000` = 60 Hz, `59940` = 59.94 Hz).
+
+#### `RefreshRateResult`
+- **Direction:** Agent $\to$ Host
+- **Description:** Answer to `SetRefreshRate`. The agent changes the rate of the active display path through `SetDisplayConfig`, validates the configuration first and then reads the rate back. A driver can accept a configuration and keep its own rate: the answer is a failure then, with the rate it reports in `error`.
+- **Fields:**
+  - `millihertz: u32`: The requested rate.
+  - `success: bool`: `true` only if the display configuration reports the requested rate afterwards.
+  - `error: Option<String>`: Diagnostic message if failed.
+
+Measured (2026-11-16, Windows 11 LTSC guest, `Red Hat VirtIO GPU DOD controller` 100.101.104.28500): the display path reports 64 Hz, `SetDisplayConfig` validates and applies a 60 Hz request without an error, and the path still reports 64 Hz afterwards, so the answer is a failure on this driver. QEMU's `virtio-gpu-pci` has no refresh-rate property, and its D-Bus `SetUIInfo` carries none.
+
 ---
 
 ### 2.4 Status Query

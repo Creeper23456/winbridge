@@ -19,6 +19,7 @@ mod keymap;
 mod launch;
 mod pointer;
 mod qmp;
+mod refresh;
 mod router;
 mod serial_client;
 mod shm;
@@ -191,6 +192,17 @@ fn main() -> glib::ExitCode {
                     refresh_guest_status(&serial_for_requests);
                 } else {
                     warn!("Guest failed to apply DPI scale {}%: {:?}", scale_percent, error);
+                }
+            }
+            Message::RefreshRateResult {
+                millihertz,
+                success,
+                error,
+            } => {
+                if success {
+                    info!("Guest runs at {} mHz", millihertz);
+                } else {
+                    warn!("Guest did not take the refresh rate {} mHz: {:?}", millihertz, error);
                 }
             }
             msg @ (Message::ClipboardOffer { .. }

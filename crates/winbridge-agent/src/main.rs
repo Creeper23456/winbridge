@@ -253,6 +253,19 @@ fn main() {
                 });
             }
 
+            Message::SetRefreshRate { millihertz } => {
+                info!("Received SetRefreshRate: {} mHz", millihertz);
+                let (success, error) = match display::set_refresh_rate(millihertz) {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                };
+                let _ = out.send(Message::RefreshRateResult {
+                    millihertz,
+                    success,
+                    error,
+                });
+            }
+
             Message::QueryStatus => {
                 let (w, h, dpi) = display::get_display_info();
                 let _ = out.send(Message::StatusReply {
