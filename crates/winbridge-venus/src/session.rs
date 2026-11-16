@@ -9,6 +9,7 @@
 //! head never becomes visible ahead of the reply it covers.
 
 use crate::proto::{self, Hdr, PushBuilder, HDR_LEN};
+use crate::stats::Stats;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -123,11 +124,10 @@ impl Shm {
         let words = snap.len();
         let mut i = 0;
         let mut cur = vec![0u64; 0];
-        while i < words {
         // Most of a scanned shmem is unchanged between two scans, so equal 4 KiB blocks are
         // skipped with one memcmp, which is much faster than comparing word by word.
         const BLOCK_WORDS: usize = 512;
-            if self.word(i * 8).load(Ordering::Relaxed) == snap[i] {
+        while i < words {
             if i % BLOCK_WORDS == 0 {
                 let n = BLOCK_WORDS.min(words - i);
                 // SAFETY: both ranges are in bounds (`snap` has `words` entries and the mapping is
@@ -140,6 +140,7 @@ impl Shm {
                     continue;
                 }
             }
+            if self.word(i * 8).load(Ordering::Relaxed) == snap[i] {
                 i += 1;
                 continue;
             }
@@ -210,18 +211,24 @@ pub struct Session<R: Renderer> {
     last_scan: Instant,
     last_state: Instant,
     record: Option<(std::fs::File, Instant)>,
+    stats: Stats,
 }
 
 impl<R: Renderer> Session<R> {
     pub fn new(r: R, stream: UnixStream) -> Session<R> {
         let now = Instant::now();
-        Session { r, stream, rbuf: Vec::new(), rpos: 0, hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None }
+        Session { r, stream, rbuf: Vec::new(), rpos: 0, hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None, stats: Stats::new() }
     }
 
     /// Appends everything the guest sends to `file` as `(microseconds, length, bytes)` records,
     /// for `replay` in `main.rs`.
     pub fn record_to(&mut self, file: std::fs::File) {
         self.record = Some((file, Instant::now()));
+    }
+
+    /// Reports the serve loop's counters once a second (see `stats.rs`).
+    pub fn enable_stats(&mut self) {
+        self.stats.enable();
     }
 
     /// Serves the guest until it closes the channel or the renderer fails.
@@ -269,6 +276,8 @@ impl<R: Renderer> Session<R> {
                     self.log_rings();
                 }
             }
+            self.stats.loop_phases(&phases);
+            self.stats.tick();
             if phases.iter().any(|p| *p >= Duration::from_millis(20)) {
                 debug!("slow loop iteration: wait {:?}, handle {:?}, poll {:?}, retire {:?}, scan {:?}", phases[0], phases[1], phases[2], phases[3], phases[4]);
             }
@@ -349,17 +358,27 @@ impl<R: Renderer> Session<R> {
     }
 
     fn send(&mut self, kind: u32, req: u32, arg: u32, payload: &[u8]) -> io::Result<()> {
+        let started = Instant::now();
         let hdr = Hdr { len: payload.len() as u32, kind, req, arg };
         let mut s = &self.stream;
-        s.write_all(&hdr.encode())?;
-        s.write_all(payload)
+        let result = s.write_all(&hdr.encode()).and_then(|()| s.write_all(payload));
+        self.stats.sent(HDR_LEN + payload.len(), started.elapsed());
+        result
     }
 
     /// Handles one message. Returns false when the session is over.
     fn handle(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
+        let started = Instant::now();
+        let result = self.dispatch(hdr, p);
+        self.stats.message(hdr.kind, p.len(), started.elapsed());
+        result
+    }
+
+    fn dispatch(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
         debug!("guest message {} (arg {}, {} bytes)", hdr.kind, hdr.arg, p.len());
         match hdr.kind {
             proto::HELLO => self.on_hello(hdr, p)?,
+            proto::PING => self.send(hdr.kind | proto::REPLY, hdr.req, hdr.arg, p)?,
             _ if !self.hello => {
                 warn!("message {} before HELLO", hdr.kind);
                 return Ok(false);
@@ -466,6 +485,7 @@ impl<R: Renderer> Session<R> {
         let tail = s.word32(proto::RING_TAIL as usize).load(Ordering::SeqCst);
         let cs = proto::notify_ring_cs(s.ring_id, tail);
         debug!("waking ring {res_id}: tail {tail}");
+        self.stats.wake();
         if let Err(e) = self.r.submit(CTX, &cs) {
             warn!("cannot wake ring {res_id}: {e}");
         }
@@ -499,8 +519,10 @@ impl<R: Renderer> Session<R> {
     fn run_submit(&mut self, sub: proto::Submit<'_>) -> io::Result<bool> {
         let started = Instant::now();
         let submitted = self.r.submit(CTX, sub.cs);
-        if started.elapsed() >= Duration::from_millis(5) {
-            debug!("submit_cmd of {} byte(s) took {:?}", sub.cs.len(), started.elapsed());
+        let took = started.elapsed();
+        self.stats.submit(sub.cs.len(), took);
+        if took >= Duration::from_millis(5) {
+            debug!("submit_cmd of {} byte(s) took {:?}", sub.cs.len(), took);
         }
         if let Err(e) = submitted {
             error!("submit_cmd failed: {e}");
@@ -578,6 +600,7 @@ impl<R: Renderer> Session<R> {
             self.fences.retain(|f| {
                 let done = f.ring_idx == ring_idx && f.id <= id;
                 if done {
+                    self.stats.fence(f.submitted.elapsed());
                     debug!("fence {} on ring {} retired {:?} after its submit", f.id, f.ring_idx, f.submitted.elapsed());
                     points.extend_from_slice(&f.syncs);
                 }
@@ -643,11 +666,16 @@ impl<R: Renderer> Session<R> {
         if !ring.is_empty() || !others.is_empty() {
             debug!("push: {} other range(s), then {} ring range(s)", others.len(), ring.len());
         }
-        if !others.is_empty() {
-            self.send(proto::PUSH, 0, 0, &others.finish())?;
+        let mut out = (0u64, 0u64);
+        for push in [others, ring] {
+            if !push.is_empty() {
+                let body = push.finish();
+                out = (out.0 + 1, out.1 + body.len() as u64);
+                self.send(proto::PUSH, 0, 0, &body)?;
+            }
         }
-        if !ring.is_empty() {
-            self.send(proto::PUSH, 0, 0, &ring.finish())?;
+        if out.0 > 0 {
+            self.stats.scan(out.0, out.1);
         }
         Ok(())
     }

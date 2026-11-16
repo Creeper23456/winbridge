@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `winbridge-venus --socket PATH --virgl-lib LIB [--render-server PATH] [--record FILE]`
-//! `winbridge-venus --replay FILE --virgl-lib LIB [--render-server PATH]`
+//! `winbridge-venus --socket PATH --virgl-lib LIB [--render-server PATH] [--record FILE] [--stats]`
+//! `winbridge-venus --replay FILE --virgl-lib LIB [--render-server PATH] [--stats]`
 //!
 //! Connects to the QEMU chardev socket of the `org.winbridge.venus.0` virtio-serial port (QEMU is
 //! the listener, `server=on`) and runs the guest's Venus context on virglrenderer. Reconnects
@@ -16,11 +16,11 @@ use tracing::{error, info};
 use winbridge_venus::session::Session;
 use winbridge_venus::virgl::Virgl;
 
-const USAGE: &str = "usage: winbridge-venus (--socket PATH [--record FILE] | --replay FILE) --virgl-lib LIB [--render-server PATH]";
+const USAGE: &str = "usage: winbridge-venus (--socket PATH [--record FILE] [--stats] | --replay FILE) --virgl-lib LIB [--render-server PATH]";
 
 fn main() {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
-    let (mut socket, mut lib, mut server, mut record, mut replay) = (None, None, None, None, None);
+    let (mut socket, mut lib, mut server, mut record, mut replay, mut stats) = (None, None, None, None, None, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -29,6 +29,7 @@ fn main() {
             "--render-server" => server = args.next(),
             "--record" => record = args.next(),
             "--replay" => replay = args.next(),
+            "--stats" => stats = true,
             _ => {
                 eprintln!("{USAGE}");
                 std::process::exit(2);
@@ -55,7 +56,7 @@ fn main() {
         }
     };
     if let Some(path) = replay {
-        replay_file(&mut virgl, &path);
+        replay_file(&mut virgl, &path, stats);
         return;
     }
     let socket = socket.unwrap();
@@ -69,6 +70,9 @@ fn main() {
         };
         info!("connected to {socket}");
         let mut session = Session::new(&mut virgl, stream);
+        if stats {
+            session.enable_stats();
+        }
         if let Some(path) = &record {
             match std::fs::File::create(path) {
                 Ok(f) => session.record_to(f),
@@ -85,7 +89,7 @@ fn main() {
 
 /// Plays a recording into a session: each record is written when its time has come, replies are
 /// read and dropped, and the channel is closed a little after the last record.
-fn replay_file(virgl: &mut Virgl, path: &str) {
+fn replay_file(virgl: &mut Virgl, path: &str, stats: bool) {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -119,7 +123,11 @@ fn replay_file(virgl: &mut Virgl, path: &str) {
         std::thread::sleep(Duration::from_secs(5));
         let _ = guest.shutdown(std::net::Shutdown::Both);
     });
-    match Session::new(virgl, host).run() {
+    let mut session = Session::new(virgl, host);
+    if stats {
+        session.enable_stats();
+    }
+    match session.run() {
         Ok(()) => info!("replay finished"),
         Err(e) => error!("replay ended: {e}"),
     }

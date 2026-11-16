@@ -60,6 +60,9 @@ enum wbvn_kind {
     * The host also scans it for GPU writes whenever a fence retires. reply arg: 0 = ok.
     * Destroyed with WBVN_SHM_DESTROY. */
    WBVN_BO_CREATE = 10,
+   /* guest -> host. Payload of any size; the reply echoes payload and arg unchanged. Measures the
+    * channel alone, the renderer is not involved. */
+   WBVN_PING = 11,
 
    WBVN_REPLY = 0x8000,
 };

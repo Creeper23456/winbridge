@@ -4,4 +4,5 @@
 
 pub mod proto;
 pub mod session;
+pub mod stats;
 pub mod virgl;
