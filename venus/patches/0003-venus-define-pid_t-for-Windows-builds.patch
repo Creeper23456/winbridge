@@ -1,0 +1,28 @@
+From c276d897254f4fd5f6cd8c71e842c6f4f2ce66a2 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 11:30:44 +0800
+Subject: [PATCH] venus: define pid_t for Windows builds
+
+---
+ src/virtio/vulkan/vn_common.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 86235f6..a69990f 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -22,6 +22,11 @@
+ #include <string.h>
+ #include <vulkan/vulkan.h>
+ 
++#if defined(_WIN32)
++#include <process.h>
++typedef int pid_t;
++#endif
++
+ #include "util/bitscan.h"
+ #include "util/bitset.h"
+ #include "util/compiler.h"
+-- 
+2.47.3
+

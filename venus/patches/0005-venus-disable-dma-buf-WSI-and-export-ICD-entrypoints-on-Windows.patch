@@ -1,0 +1,35 @@
+From f08c9790f79ed62035645477abf51ec6d8df3e1f Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 11:30:44 +0800
+Subject: [PATCH] venus: disable dma-buf WSI and export ICD entrypoints on
+ Windows
+
+---
+ src/virtio/vulkan/meson.build | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index ff48d24..fed4c4d 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -137,8 +137,7 @@ if system_has_kms_drm
+ endif
+ 
+ if with_platform_wayland or with_platform_x11 or \
+-   (system_has_kms_drm and not with_platform_android) or \
+-   with_platform_windows
++   (system_has_kms_drm and not with_platform_android)
+   libvn_files += files('vn_wsi.c')
+   vn_c_args += '-DVN_USE_WSI_PLATFORM'
+ endif
+@@ -165,6 +164,7 @@ libvulkan_virtio = shared_library(
+   c_args : vn_c_args,
+   link_args : vn_link_args,
+   link_depends : vulkan_icd_link_depends,
++  vs_module_defs : vulkan_api_def,
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+ )
+-- 
+2.47.3
+

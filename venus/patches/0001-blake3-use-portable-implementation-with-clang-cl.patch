@@ -1,0 +1,26 @@
+From 305bab3df34febbde75446bd7085a1f1c0e58f2f Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 11:30:44 +0800
+Subject: [PATCH] blake3: use portable implementation with clang-cl
+
+---
+ src/util/blake3/meson.build | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/util/blake3/meson.build b/src/util/blake3/meson.build
+index 767da2c..136ec95 100644
+--- a/src/util/blake3/meson.build
++++ b/src/util/blake3/meson.build
+@@ -21,6 +21,9 @@ if cpu_family == 'x86_64'
+       else
+         blake3_defs += blake3_x86_no_simd_defs
+       endif
++    elif meson.get_compiler('c').get_id() == 'clang-cl'
++      # clang-cl applies C-only forced includes and definitions to .S files.
++      blake3_defs += blake3_x86_no_simd_defs
+     else
+       files_blake3 += ['blake3_sse2_x86-64_windows_gnu.S', 'blake3_sse41_x86-64_windows_gnu.S', 'blake3_avx2_x86-64_windows_gnu.S', 'blake3_avx512_x86-64_windows_gnu.S']
+     endif
+-- 
+2.47.3
+

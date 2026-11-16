@@ -1,0 +1,76 @@
+From f533981327e1fdd3b2013a69a2ad297a6c66b7dc Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 11:50:24 +0800
+Subject: [PATCH] venus: select the WinBridge renderer on Windows and mark ring
+ shmems
+
+---
+ src/virtio/vulkan/meson.build   |  2 ++
+ src/virtio/vulkan/vn_renderer.h | 11 +++++++++++
+ src/virtio/vulkan/vn_ring.c     |  1 +
+ 3 files changed, 14 insertions(+)
+
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index fed4c4d..c409412 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -126,6 +126,8 @@ vn_libs = []
+ 
+ if not with_platform_windows
+   libvn_files += files('vn_renderer_vtest.c')
++else
++  libvn_files += files('vn_renderer_winbridge.c')
+ endif
+ 
+ if system_has_kms_drm
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..1fe6378 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -17,6 +17,10 @@ struct vn_renderer_shmem {
+ 
+    struct list_head cache_head;
+    int64_t cache_timestamp;
++
++   /* the id of the ring living in this shmem, 0 if none. The winbridge backend mirrors a ring
++    * shmem both ways and has to wake the renderer's ring thread itself. */
++   uint64_t mirror_ring_id;
+ };
+ 
+ struct vn_renderer_bo {
+@@ -225,6 +229,11 @@ vn_renderer_create_vtest(struct vn_instance *instance,
+                          const VkAllocationCallbacks *alloc,
+                          struct vn_renderer **renderer);
+ 
++VkResult
++vn_renderer_create_winbridge(struct vn_instance *instance,
++                             const VkAllocationCallbacks *alloc,
++                             struct vn_renderer **renderer);
++
+ static inline VkResult
+ vn_renderer_create(struct vn_instance *instance,
+                    const VkAllocationCallbacks *alloc,
+@@ -242,6 +251,8 @@ vn_renderer_create(struct vn_instance *instance,
+          result = vn_renderer_create_vtest(instance, alloc, renderer);
+    }
+    return result;
++#elif defined(_WIN32)
++   return vn_renderer_create_winbridge(instance, alloc, renderer);
+ #else
+    return vn_renderer_create_vtest(instance, alloc, renderer);
+ #endif
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 8b4b9f0..62f3b8d 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -307,6 +307,7 @@ vn_ring_create(struct vn_instance *instance,
+       vk_free(alloc, ring);
+       return NULL;
+    }
++   ring->shmem->mirror_ring_id = ring->id;
+ 
+    void *shared = ring->shmem->mmap_ptr;
+    memset(shared, 0, layout->shmem_size);
+-- 
+2.47.3
+

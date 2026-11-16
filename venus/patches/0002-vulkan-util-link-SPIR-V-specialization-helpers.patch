@@ -1,0 +1,23 @@
+From 0cc4c94ae60fe2ff7b243aea44ae95a68c89f2ab Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 11:30:44 +0800
+Subject: [PATCH] vulkan/util: link SPIR-V specialization helpers
+
+---
+ src/vulkan/util/meson.build | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vulkan/util/meson.build b/src/vulkan/util/meson.build
+index 086eb6e..b501132 100644
+--- a/src/vulkan/util/meson.build
++++ b/src/vulkan/util/meson.build
+@@ -140,5 +140,5 @@ idep_vulkan_util_headers = declare_dependency(
+ 
+ idep_vulkan_util = declare_dependency(
+   link_with : libvulkan_util,
+-  dependencies : [idep_vulkan_util_headers, idep_mesautil],
++  dependencies : [idep_vulkan_util_headers, idep_mesautil, idep_vtn],
+ )
+-- 
+2.47.3
+
