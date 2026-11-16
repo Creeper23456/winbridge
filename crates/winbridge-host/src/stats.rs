@@ -4,6 +4,7 @@
 //! (how many, how large, how long the handler takes) and the canvas redraws.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -17,6 +18,16 @@ static SCANOUTS: AtomicU64 = AtomicU64::new(0);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static DRAW_NS: AtomicU64 = AtomicU64::new(0);
 static COPY_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_UPDATE: Mutex<Option<Instant>> = Mutex::new(None);
+/// How far apart updates arrive: < 8 ms, < 15 ms, < 20 ms, < 28 ms, < 40 ms, more.
+const GAP_LIMITS: [Duration; 5] = [
+    Duration::from_millis(8),
+    Duration::from_millis(15),
+    Duration::from_millis(20),
+    Duration::from_millis(28),
+    Duration::from_millis(40),
+];
+static GAPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 pub fn enable() {
     ENABLED.store(true, Relaxed);
@@ -38,6 +49,12 @@ pub fn update(t: Option<Instant>, pixels: u64, bytes: u64) {
         UPDATE_PIXELS.fetch_add(pixels, Relaxed);
         UPDATE_BYTES.fetch_add(bytes, Relaxed);
         UPDATE_NS.fetch_add(nanos(t), Relaxed);
+        let mut last = LAST_UPDATE.lock().unwrap();
+        if let Some(prev) = last.replace(t) {
+            let gap = t.saturating_duration_since(prev);
+            let slot = GAP_LIMITS.iter().position(|l| gap < *l).unwrap_or(GAP_LIMITS.len());
+            GAPS[slot].fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -76,8 +93,9 @@ pub fn start() {
             if updates + scanouts + draws == 0 {
                 continue;
             }
+            let gaps: Vec<u64> = GAPS.iter().map(|g| g.swap(0, Relaxed)).collect();
             info!(
-                "display: {} updates ({} px on average, {} KiB/s, {:.1} ms in the handler), {} scanouts; {} draws ({:.1} ms, {:.1} ms of it copying the framebuffer)",
+                "display: {} updates ({} px on average, {} KiB/s, {:.1} ms in the handler), {} scanouts; {} draws ({:.1} ms, {:.1} ms of it copying the framebuffer); gaps between updates <8/<15/<20/<28/<40/more ms: {:?}",
                 updates,
                 pixels.checked_div(updates).unwrap_or(0),
                 bytes / 1024,
@@ -86,6 +104,7 @@ pub fn start() {
                 draws,
                 draw_ns as f64 / 1e6,
                 copy_ns as f64 / 1e6,
+                gaps,
             );
         }
     });
