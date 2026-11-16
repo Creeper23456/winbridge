@@ -286,6 +286,15 @@ impl<R: Renderer, C: Channel> Session<R, C> {
                 }
             }
             self.stats.loop_phases(&phases);
+            if self.stats.due() {
+                let mut now = [(0u64, 0u64); 3];
+                for s in self.shms.values().filter(|s| s.snap.is_some()) {
+                    let kind = if s.ring { 0 } else if s.bo { 2 } else { 1 };
+                    now[kind].0 += 1;
+                    now[kind].1 += s.size as u64;
+                }
+                self.stats.mirrored(now);
+            }
             self.stats.tick();
             if phases.iter().any(|p| *p >= Duration::from_millis(20)) {
                 debug!("slow loop iteration: wait {:?}, handle {:?}, poll {:?}, retire {:?}, scan {:?}", phases[0], phases[1], phases[2], phases[3], phases[4]);

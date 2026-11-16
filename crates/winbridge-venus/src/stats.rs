@@ -36,6 +36,7 @@ struct Window {
     scan_bytes: u64,
     compare_calls: u64,
     compare_bytes: u64,
+    mirror: [(u64, u64); 3],
     out_msgs: u64,
     out_bytes: u64,
     send_time: Duration,
@@ -107,6 +108,16 @@ impl Stats {
         self.w.scan_bytes += bytes;
     }
 
+    /// True when the next `tick` will report.
+    pub fn due(&self) -> bool {
+        self.on && self.last.elapsed() >= Duration::from_secs(1)
+    }
+
+    /// How much memory is mirrored (count, bytes) as ring, other shmem, device memory.
+    pub fn mirrored(&mut self, now: [(u64, u64); 3]) {
+        self.w.mirror = now;
+    }
+
     /// A scan pass compared `bytes` of mirrored memory with its copy.
     pub fn compared(&mut self, bytes: u64) {
         self.w.compare_calls += 1;
@@ -154,6 +165,11 @@ impl Stats {
             target: "stats",
             "  out: {} msgs {:.0} KiB, write {:.1} ms total max {:.2} ms; {} scans made {} msgs {:.0} KiB; compared {} x {:.0} KiB",
             w.out_msgs, kib(w.out_bytes), ms(w.send_time), ms(w.send_max), w.scans, w.scan_msgs, kib(w.scan_bytes), w.compare_calls, kib(w.compare_bytes)
+        );
+        info!(
+            target: "stats",
+            "  mirrored now: ring {} x {:.0} KiB, other shmem {} x {:.0} KiB, device memory {} x {:.0} KiB",
+            w.mirror[0].0, kib(w.mirror[0].1), w.mirror[1].0, kib(w.mirror[1].1), w.mirror[2].0, kib(w.mirror[2].1)
         );
     }
 }
