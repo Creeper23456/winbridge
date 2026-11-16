@@ -60,6 +60,13 @@ Guest: the ivshmem driver must be installed (`docs/IVSHMEM-TRANSPORT.md` section
 PowerShell. Applications then find the driver through the Vulkan loader. `WBVN_SPIN_US` (default
 150) is how long the driver's reader polls for the host before it sleeps.
 
+The driver needs the Visual C++ runtime in the guest (`VCRUNTIME140.dll`; the test programs also
+`MSVCP140.dll` and, through it, `VCRUNTIME140_1.dll`). A Windows 11 install does not have it until some
+application brings it: without it the loader reports no driver and a program that links it
+dynamically stops with 0xC0000135. Install the Visual C++ Redistributable, or put the DLLs of
+Microsoft's `Microsoft.VC.<version>.CRT.Redist.X64.base` package next to the application and next to
+`vulkan_virtio.dll`.
+
 ## Measuring
 
 `WBVN_STATS=FILE` in the guest's environment makes the driver append one line of counters per second to FILE (submits, renderer waits with a histogram, ring waits, writes, lock waits, reader and pump activity), a line of totals at the end, and at start-up the channel's ping round trips and the length of `Sleep(1)`. `winbridge-venus --stats` logs the host's side once a second: the serve loop by phase, messages and bytes by kind, `submit_cmd`, fence latency with a histogram and the time spent writing. `--stats` also works with `--replay`, which feeds a recording made with `--record` to the host without a guest. Section 3.7 of the ADR shows what these found.
