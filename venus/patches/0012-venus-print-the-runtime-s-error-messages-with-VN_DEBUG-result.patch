@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 22:00:00 +0800
+Subject: [PATCH 12/12] venus: print the runtime's error messages with
+ VN_DEBUG=result
+
+vk_errorf in the common runtime says why it failed (which feature or extension a vkCreateDevice asked for and the device does not have) only when the instance enables debug logging or a debug callback exists. A release build of the driver never printed it, so an application that gets VK_ERROR_FEATURE_NOT_PRESENT gave no hint which feature. VN_DEBUG=result already makes Venus log the results it returns; it now enables the runtime's messages too.
+---
+ src/virtio/vulkan/vn_instance.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -283,6 +283,10 @@
+       return vn_error(NULL, result);
+    }
+ 
++   /* The common runtime explains most errors it returns (an unsupported feature or extension in
++    * vkCreateDevice, say) only when this is set or a debug callback is registered. */
++   instance->base.vk.enable_debug_logging = VN_DEBUG(RESULT);
++
+    /* util_cpu_trace_init is called by vk_instance_init */
+    VN_TRACE_FUNC();
+ 
