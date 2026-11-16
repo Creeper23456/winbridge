@@ -5,7 +5,7 @@
 `build.sh` cross-builds `vulkan_virtio.dll` and Mesa's OpenGL for Windows (`opengl32.dll`, `libgallium_wgl.dll` with the Zink driver, and `z-1.dll`) on Linux with clang-cl and lld-link, against the MSVC CRT and the Windows SDK that it fetches from Microsoft's public channel. Nothing from a Windows machine is needed, and nothing from Microsoft is stored in this repository.
 
 ```sh
-WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh      # all stages; the DLLs end up in $WBVN_BUILD_DIR/out
+WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh      # all stages; the DLLs end up in $WBVN_BUILD_DIR/out (x64) and out32 (x86)
 ```
 
 The work directory is `~/.cache/winbridge-venus-build` unless `WBVN_BUILD_DIR` says otherwise. Stages can be run alone (`build.sh mesa build`), and a finished stage is cheap to run again.
@@ -34,6 +34,7 @@ The work directory is `~/.cache/winbridge-venus-build` unless `WBVN_BUILD_DIR` s
 - `windows_compat.h` is force-included in every C and C++ file. Mesa uses the lowercase `_interlockedadd` family that MSVC provides as intrinsics and clang-cl does not.
 - `make-overlay.py` writes a case-insensitive clang VFS overlay over the include directories, because Mesa and the SDK include `<BaseTsd.h>` and `"DriverSpecs.h"` where the files are lowercase. A copy of the headers or a set of symbolic links would do the same.
 - `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` lets the MSVC 14.52 STL accept clang 19.
+- There is one set of compiler wrappers and one cross file per architecture (`bin/` with `cross.ini` for x64, `bin32/` with `cross32.ini` for x86, `--target=i686-pc-windows-msvc`). The x86 build adds `-msse2 -mfxsr`: Mesa's CPU detection needs both and clang's default for that target has neither. Each architecture has its own build directory; a changed cross file makes the script reconfigure from scratch, because meson keeps the compiler flags of the first configure. `WBVN_ARCHS="x64"` or `"x86"` builds one of them; the sysroot carries both sets of import libraries.
 
 ## Verified (2026-11-16)
 
@@ -52,3 +53,5 @@ About 14 minutes in all, 6 of them compiling xwin. The DLL differs in size by 2.
 Not verified: other LLVM versions, other Linux distributions, a sysroot made from a Visual Studio install through `WBVN_SYSROOT`, and the other SDK libraries the link reads (only six are hash-checked).
 
 The script has changed since that run: it builds Mesa's OpenGL (`opengl32.dll`, `libgallium_wgl.dll`, Zink) and uses the static CRT and zlib (`-Db_vscrt=mt -Ddefault_library=static`), so the DLLs import only system libraries. That version was checked by running `build.sh mesa build` in the existing work directory, not from nothing: `vulkan_virtio.dll` 6,138,880 bytes (imports GDI32, KERNEL32, SETUPAPI, USER32 and an api-set), `libgallium_wgl.dll` 22,665,728 bytes (GDI32, KERNEL32, USER32 and an api-set), `opengl32.dll` 678,912 bytes (GDI32, KERNEL32 and `libgallium_wgl.dll`). The link prints `LNK4099` (no PDB for `libvcruntime.lib`). The DLLs that ran in the LTSC guest (ADR section 3.9) came from a manual meson build with the same options, not from this script run; they have the same sizes and imports but different hashes, so the builds are not byte-reproducible (not looked into why).
+
+The DLLs of ADR section 3.10 (x64 with patch 0013, and the x86 ones) came from `build.sh mesa build` in the existing work directory. The x86 build was configured from nothing once: an earlier try failed in the compile of `u_cpu_detect.c` (`_fxsave` needs `fxsr`), which is why the cross file carries `-mfxsr`.
