@@ -196,8 +196,11 @@ stage_build() {
     say "configure"
     local setup=(setup)
     [ -f "$build/build.ninja" ] && setup=(setup --reconfigure)
+    # The static CRT and zlib make the DLLs depend on system libraries only: the guest needs no Visual C++
+    # runtime, and opengl32.dll with libgallium_wgl.dll work from any program directory without other files.
     "$work/venv/bin/meson" "${setup[@]}" "$build" "$src" --cross-file "$work/cross.ini" \
-        --buildtype debugoptimized -Dvulkan-drivers=virtio -Dgallium-drivers=zink -Dplatforms=windows \
+        --buildtype debugoptimized -Db_vscrt=mt -Ddefault_library=static \
+        -Dvulkan-drivers=virtio -Dgallium-drivers=zink -Dplatforms=windows \
         -Dopengl=true -Degl=disabled -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
         -Dvalgrind=disabled -Dlibunwind=disabled -Dbuild-tests=false -Dmicrosoft-clc=disabled \
         -Dtools= -Dxmlconfig=disabled
@@ -208,7 +211,7 @@ stage_build() {
     cp "$build/src/virtio/vulkan/vulkan_virtio.dll" "$build/src/virtio/vulkan/vulkan_virtio.pdb" \
         "$build/src/gallium/targets/libgl-gdi/opengl32.dll" "$build/src/gallium/targets/libgl-gdi/opengl32.pdb" \
         "$build/src/gallium/targets/wgl/libgallium_wgl.dll" "$build/src/gallium/targets/wgl/libgallium_wgl.pdb" \
-        "$build/subprojects/zlib-1.3.1/z-1.dll" "$work/out/"
+        "$work/out/"
     say "done: $work/out"
 }
 
