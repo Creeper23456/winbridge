@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use winbridge_shm::file::{self, FileMapping};
 use winbridge_shm::{Region, Side};
 use winbridge_venus::channel::Channel;
-use winbridge_venus::slot::{ShmChannel, Slot, CLAIMED, CLOSED, LANE_G2H, LANE_H2G, SLOT_LEN};
+use winbridge_venus::slot::{Arrival, ShmChannel, Slot, CLAIMED, CLOSED, FREE, LANE_G2H, LANE_H2G, SLOT_LEN};
 
 struct Rig {
     dir: PathBuf,
@@ -62,6 +62,23 @@ fn records_arrive_in_order_and_a_closed_slot_ends_the_stream_after_they_are_read
     assert!(r.host.read_available(&mut buf).unwrap());
     assert_eq!(buf, b" last");
     assert!(!r.host.read_available(&mut buf).unwrap());
+}
+
+#[test]
+fn a_guest_that_claims_and_leaves_between_two_looks_is_still_noticed() {
+    let r = rig("arrival");
+    // Claimed and closed again before the host looked: the slot is CLOSED, never seen CLAIMED.
+    r.block.set_state(CLOSED);
+    assert_eq!(r.block.wait_for_guest(|| false), Arrival::Left);
+    r.block.set_state(FREE);
+    assert_eq!(r.block.wait_for_guest(|| true), Arrival::Abandoned);
+    let block = r.block.clone();
+    let guest = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        block.set_state(CLAIMED);
+    });
+    assert_eq!(r.block.wait_for_guest(|| false), Arrival::Claimed);
+    guest.join().unwrap();
 }
 
 #[test]

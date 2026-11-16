@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use winbridge_venus::channel::StreamChannel;
 use winbridge_venus::session::Session;
-use winbridge_venus::slot::{ShmChannel, Slot, CLAIMED};
+use winbridge_venus::slot::{Arrival, ShmChannel, Slot};
 use winbridge_venus::virgl::Virgl;
 
 const USAGE: &str = "usage: winbridge-venus (--shm FILE --socket PATH [--slot N] [--record FILE] [--stats] | --replay FILE [--stats]) --virgl-lib LIB [--render-server PATH]";
@@ -132,15 +132,17 @@ fn serve(virgl: &mut Virgl, args: &Args) -> ! {
         };
         let block = slot.block();
         info!("slot {} is free", slot.id());
-        while block.state() != CLAIMED {
-            if socket_closed(&k) {
-                break;
+        match block.wait_for_guest(|| socket_closed(&k)) {
+            Arrival::Claimed => {}
+            Arrival::Left => {
+                info!("a guest claimed slot {} and left it before the host looked", slot.id());
+                kick = Some(k);
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        if block.state() != CLAIMED {
-            warn!("the wake-up socket closed while the slot was free");
-            continue;
+            Arrival::Abandoned => {
+                warn!("the wake-up socket closed while the slot was free");
+                continue;
+            }
         }
         info!("a guest claimed slot {} (nonce {:#x})", slot.id(), block.nonce());
         let channel = match k.try_clone().map_err(|e| e.to_string()).and_then(|k2| ShmChannel::new(&region, block.clone(), k2)) {

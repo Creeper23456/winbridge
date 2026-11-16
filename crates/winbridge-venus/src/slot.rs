@@ -65,6 +65,17 @@ pub const CLAIMED: u32 = 1;
 /// The guest has finished; the host resets the slot.
 pub const CLOSED: u32 = 2;
 
+/// How the wait for a guest ended ([`SlotBlock::wait_for_guest`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// A guest owns the slot.
+    Claimed,
+    /// A guest claimed the slot and closed it again before the host looked.
+    Left,
+    /// The caller gave up (the wake-up socket is gone).
+    Abandoned,
+}
+
 /// A claimed slot whose heartbeat has not moved for this long belongs to a dead guest.
 const STALE: Duration = Duration::from_secs(10);
 /// A write that finds the lane full gives up after this long.
@@ -115,6 +126,24 @@ impl SlotBlock {
 
     pub fn beat(&self) {
         self.u64_at(OFF_HEARTBEAT).fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Waits for a guest to claim the slot. A guest that claims it and closes it again between two
+    /// looks (it failed right after the claim) leaves it CLOSED, which also ends the wait: the
+    /// slot needs a reset, and waiting for CLAIMED would hold it closed for ever. `abandoned` is
+    /// asked at every look and ends the wait when it returns true.
+    pub fn wait_for_guest(&self, mut abandoned: impl FnMut() -> bool) -> Arrival {
+        loop {
+            match self.state() {
+                CLAIMED => return Arrival::Claimed,
+                CLOSED => return Arrival::Left,
+                _ => {}
+            }
+            if abandoned() {
+                return Arrival::Abandoned;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
