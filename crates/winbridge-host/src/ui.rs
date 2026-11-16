@@ -3,7 +3,7 @@
 //! GTK4 viewer user interface, Cairo canvas rendering, and input routing.
 
 use crate::capture::Capture;
-use crate::dbus_display::{DbusDisplayConnection, Framebuffer};
+use crate::dbus_display::{DbusDisplayConnection, Framebuffer, Pixels};
 use crate::router::InputRouter;
 use crate::serial_client::SerialClientHandle;
 use crate::stats;
@@ -1360,24 +1360,47 @@ fn render_framebuffer(
     target_height: f64,
 ) {
     let t = stats::begin();
-    let (width, height, stride, data) = {
+    let (width, height, stride, pixels) = {
         let guard = fb_arc.lock().unwrap();
-        (guard.width, guard.height, guard.stride, guard.data.clone())
+        let pixels = match &guard.mapped {
+            Some(map) => Pixels::Mapped(map.clone()),
+            None => Pixels::Owned(guard.data.clone()),
+        };
+        (guard.width, guard.height, guard.stride, pixels)
     };
     let copy_ns = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
 
-    if width == 0 || height == 0 || data.is_empty() {
+    if width == 0 || height == 0 {
         return;
     }
 
+    // The mapping must outlive the surface (declared first, dropped last).
+    let mut mapped = None;
+    let mut owned = None;
+    match pixels {
+        Pixels::Mapped(map) => mapped = Some(map),
+        Pixels::Owned(data) if !data.is_empty() => owned = Some(data),
+        Pixels::Owned(_) => return,
+    }
     // PIXMAN_x8r8g8b8 pixel data matches Cairo Format::Rgb24
-    if let Ok(surface) = ImageSurface::create_for_data(
-        data,
-        Format::Rgb24,
-        width as i32,
-        height as i32,
-        stride as i32,
-    ) {
+    let surface = match (&mapped, owned) {
+        // SAFETY: the mapping is `stride * height` bytes (checked when it was made), read only,
+        // and `mapped` keeps it alive until the surface is gone.
+        (Some(map), _) => unsafe {
+            ImageSurface::create_for_data_unsafe(
+                map.as_ptr() as *mut u8,
+                Format::Rgb24,
+                width as i32,
+                height as i32,
+                stride as i32,
+            )
+        },
+        (None, Some(data)) => {
+            ImageSurface::create_for_data(data, Format::Rgb24, width as i32, height as i32, stride as i32)
+        }
+        (None, None) => return,
+    };
+    if let Ok(surface) = surface {
         let scale_x = target_width / (width as f64);
         let scale_y = target_height / (height as f64);
 

@@ -1682,6 +1682,7 @@ dependencies = [
  "gtk4",
  "ksni",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tokio",
