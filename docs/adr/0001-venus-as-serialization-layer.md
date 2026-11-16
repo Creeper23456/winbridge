@@ -2,7 +2,7 @@
 
 # ADR 0001: Venus as the Vulkan serialization layer on Windows guests
 
-- Status: **Proposed** (evidence gathered 2026-11-16; the Windows port is not started)
+- Status: **Proposed** (evidence gathered 2026-11-16; the Windows port runs a buffer-copy probe through NVIDIA 550 in the build VM; acceptance in section 5 is not complete)
 - Context owner: 3D acceleration (`docs/GFX-DESIGN.md`)
 - Related: `docs/IVSHMEM-TRANSPORT.md` (shared-memory transport), `docs/GFX-DESIGN.md` (current hand-written ICD)
 
@@ -14,11 +14,12 @@ Mesa's Venus driver (`src/virtio/vulkan`, MIT) generates the encoding of the who
 
 ## 2. Decision (proposed)
 
-1. Guest ICD = Mesa Venus (`vn_*` object tracking, sync, encoder) with a **new WinBridge `vn_renderer` backend** over the ivshmem transport, replacing the POSIX-only `vn_renderer_virtgpu.c` and `vn_renderer_vtest.c`.
-2. Host = virglrenderer `vkr` (`vkr_context_submit_cmd`) fed from the ring, replacing the current dispatcher once parity is shown.
-3. **No blob / dma-buf resources.** The guest never relies on host-exported dma-buf memory. Only `DEVICE_LOCAL` memory is allocated on the host; host-visible behaviour is provided by guest shadow memory plus explicit transfers through the ivshmem lanes. Detail of the exposed memory types is an open design item (section 6).
-4. The existing hand-written ICD stays as the fallback until Venus passes the acceptance in section 5.
-5. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. It accepts the GNU syntax Mesa uses, so Mesa's shared headers need no patches for it. Native `cl` is dropped.
+1. Guest ICD = Mesa Venus (`vn_*` object tracking, sync, encoder) with a **new WinBridge `vn_renderer` backend** (`venus/guest/vn_renderer_winbridge.c`, protocol `wbvn_proto.h`), replacing the POSIX-only `vn_renderer_virtgpu.c` and `vn_renderer_vtest.c`. Transport: a virtio-serial port `org.winbridge.venus.0`; moving it onto the ivshmem lanes is future work (serial measured 220-390 MiB/s).
+2. Host = `crates/winbridge-venus` on virglrenderer `vkr` (render-server process), fed from the mirrored ring.
+3. **Memory (amended 2026-11-16, replaces "no blob").** Shmem (command rings, command-stream pools) and `VkDeviceMemory` are *mirrored* between guest and host by copy, not shared: the guest copy is a `VirtualAlloc(MEM_WRITE_WATCH)` region diffed against a snapshot, pushed at submit/flush; GPU writes come back when a fence retires. Host-visible `VkDeviceMemory` is a mappable HOST3D blob on the host, mapped by the bridge. NVIDIA 550 exports dma-bufs it cannot mmap, so the host runs a virglrenderer patch (`VKR_DEBUG=opaque`, `venus/patches/virglrenderer/0001`) that exports an opaque fd instead. Guest event, semaphore and query feedback are disabled (`VN_PERF=no_event_feedback,no_semaphore_feedback,no_query_feedback`) because they would poll mapped device memory.
+4. **Sync fences are created without sync-fd export** (`VKR_DEBUG=nofenceexport`, patch `0002`). Evidence: replaying a recorded guest session (`--record`/`--replay`) segfaulted at a fixed offset in `libnvidia-glcore.so.550.163.01` in the `vkr-queue` thread (`vkWaitForFences`) on every run; with `VK_EXPORT_FENCE_CREATE_INFO` removed the same replay and the VM probe both pass. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when the variable is unset. Cause inside the driver is not known.
+5. The existing hand-written ICD stays as the fallback until Venus passes the acceptance in section 5.
+6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus six local patches (`venus/patches/`) cross-compiles clean (457 of 457 objects) and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
 
 ## 3. Evidence
 
@@ -75,16 +76,15 @@ Limits of this test: it clears an image and does not copy back or sample; it pro
 
 ## 6. Open design items
 
-- **Memory types exposed to the guest.** Venus advertises the host's `HOST_VISIBLE` types. With no blob, either the backend strips them and an emulation layer provides mappable memory through shadow buffers, or the host side must not export. Which of these is the least invasive (guest-side change in `vn_physical_device` or host-side filter in `vkr`) is undecided.
-- **Where shadow memory is synchronised:** reuse the command-driven readback already in the current ICD, or explicit transfer commands.
+- **Memory types exposed to the guest (decided).** All host types are exposed, including `HOST_VISIBLE`; the mirrored design in section 2.3 makes mapping work. Cost: copies at submit/fence, so large frequently written buffers are slower than true sharing. Hiding `HOST_VISIBLE` types remains an alternative if the copy cost proves too high.
+- **Where mirrored memory is synchronised:** guest writes are pushed at submit and at `vkFlushMappedMemoryRanges`; host writes are scanned and returned when a fence retires. Bos above 2 MiB are not host-scanned.
 - **Synchronisation primitives** of the new `vn_renderer` (timeline counters over the ring, wait in the guest) and how the wake-up interacts with the poll-and-kick scheme in `docs/IVSHMEM-TRANSPORT.md` (idle wake-up latency is acceptable; steady state must not degrade).
-- **Toolchain:** decided, `clang-cl` cross-compiling from Linux (`--target=x86_64-pc-windows-msvc`, `lld-link`) against MSVC and Windows SDK headers and libraries copied from a Windows install; nothing is built inside the guest. Linking has not been tried yet; the first step is a small DLL that links and loads in the build VM.
+- **Toolchain:** decided, `clang-cl` cross-compiling from Linux (`lld-link`) against MSVC and Windows SDK headers and libraries copied from a Windows install; nothing is built inside the guest. The sysroot currently lives outside the repository and a reproducible build script is still to be written.
 - **Host driver:** 550.163.01 works for the serialization-only path. Upgrading to 570.86 or later is not required by this decision.
 
 ## 7. Not verified
 
-- Linking, exported symbols and any execution of Mesa code on Windows.
-- Venus behaviour with host-visible memory on a driver of 570.86 or later (not tried).
-- A full render-and-readback path through Venus on NVIDIA 550 (only clear and fence were tested).
-- Memory-type stripping or shadow buffering of the Venus guest (design only).
+- Venus on a driver of 570.86 or later (not tried).
+- A full draw-and-readback path through Venus on NVIDIA 550 (only clears, fences and a buffer copy were run).
+- Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`); probe wall time of about 41 s in the VM is not analysed.
 - Container tooling: docker was unusable without root, so the build used a user prefix; the byte-for-byte stream comparison of 5.1 has not been run.
