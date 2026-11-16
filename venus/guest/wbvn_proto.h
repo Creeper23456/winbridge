@@ -53,6 +53,13 @@ enum wbvn_kind {
     * at `offset` of a ring shmem (the status word, whose other bits the host owns). The
     * host does `word &= ~mask` on its memory and on its snapshot. No reply. */
    WBVN_STATUS_CLEAR = 9,
+   /* arg: res_id chosen by the guest. payload: struct wbvn_bo_create, then batch_len bytes
+    * laid out like a WBVN_SUBMIT payload (the vkWaitRingSeqnoMESA that orders the resource
+    * after its vkAllocateMemory; may be empty). The host runs the batch, creates a mappable
+    * host3d blob for the device memory with id blob_id, maps it, and mirrors it like a shmem.
+    * The host also scans it for GPU writes whenever a fence retires. reply arg: 0 = ok.
+    * Destroyed with WBVN_SHM_DESTROY. */
+   WBVN_BO_CREATE = 10,
 
    WBVN_REPLY = 0x8000,
 };
@@ -88,6 +95,16 @@ struct wbvn_sync_point {
    uint32_t reserved;
    uint64_t value;
 };
+
+/* WBVN_BO_CREATE payload header. */
+struct wbvn_bo_create {
+   uint64_t size;
+   uint64_t blob_id; /* the vn_object_id of the VkDeviceMemory */
+   uint32_t blob_flags; /* WBVN_BLOB_* */
+   uint32_t batch_len;
+};
+
+#define WBVN_BLOB_MAPPABLE 1u
 
 /* Largest payload either side accepts. */
 #define WBVN_MAX_PAYLOAD (64u << 20)

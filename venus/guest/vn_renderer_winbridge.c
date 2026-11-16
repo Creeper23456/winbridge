@@ -42,13 +42,32 @@ struct wbvn_tab {
    uint32_t next;
 };
 
-struct wbvn_shmem {
-   struct vn_renderer_shmem base;
-   uint32_t res_id;
+/* Memory that is mirrored with the host: a venus shmem or a device memory bo. */
+struct wbvn_region {
+   uint8_t *ptr; /* the guest copy, write tracked */
    size_t size; /* a multiple of the page size */
    uint64_t *snap; /* what the host last saw (or sent us) */
    void **dirty; /* scratch for GetWriteWatch, size / page entries */
+   uint32_t res_id;
    bool role_sent;
+   /* the shmem's `mirror_ring_id`, which Mesa sets after creation; NULL for a bo */
+   const uint64_t *ring_src;
+};
+
+static inline uint64_t
+region_ring_id(const struct wbvn_region *r)
+{
+   return r->ring_src ? *r->ring_src : 0;
+}
+
+struct wbvn_shmem {
+   struct vn_renderer_shmem base;
+   struct wbvn_region r;
+};
+
+struct wbvn_bo {
+   struct vn_renderer_bo base;
+   struct wbvn_region r;
 };
 
 struct wbvn_sync {
@@ -81,7 +100,7 @@ struct wbvn {
    SRWLOCK mu;
    CONDITION_VARIABLE cv;
 
-   struct wbvn_tab shmems;
+   struct wbvn_tab regions;
    struct wbvn_tab syncs;
 
    /* one outstanding request at a time */
@@ -282,11 +301,11 @@ push_range(struct wbvn_buf *b, uint32_t res_id, uint32_t off, const uint64_t *wo
 /* Collects the words the guest changed in `s` since the last scan. Returns the number of
  * ranges appended to `b`, or -1 if memory ran out. */
 static int
-scan_shmem(struct wbvn_shmem *s, struct wbvn_buf *b, uint32_t *status_clear)
+scan_region(struct wbvn_region *s, struct wbvn_buf *b, uint32_t *status_clear)
 {
    ULONG_PTR count = s->size / WBVN_PAGE;
    DWORD gran = 0;
-   if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, s->base.mmap_ptr, s->size, s->dirty,
+   if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, s->ptr, s->size, s->dirty,
                      &count, &gran) != 0)
       return -1;
 
@@ -294,12 +313,12 @@ scan_shmem(struct wbvn_shmem *s, struct wbvn_buf *b, uint32_t *status_clear)
    uint64_t page[WBVN_PAGE / 8];
    for (ULONG_PTR i = 0; i < count; i++) {
       const uint8_t *src = s->dirty[i];
-      uint32_t base_off = (uint32_t)(src - (const uint8_t *)s->base.mmap_ptr);
+      uint32_t base_off = (uint32_t)(src - s->ptr);
       uint64_t *snap = s->snap + base_off / 8;
       for (uint32_t k = 0; k < WBVN_PAGE / 8; k++)
          page[k] = load64(src + k * 8);
 
-      if (s->base.mirror_ring_id && base_off == 0) {
+      if (region_ring_id(s) && base_off == 0) {
          /* The status word has two writers. The host sets and clears IDLE and FATAL and the
           * ALIVE bit; the guest only ever clears ALIVE. Do not mirror the word, tell the host
           * which bits the guest took away. */
@@ -359,21 +378,21 @@ wbvn_flush_push(struct wbvn *w)
 
    AcquireSRWLockExclusive(&w->mu);
    /* roles first, so the host never sees ring data without knowing it is a ring */
-   for (uint32_t id = 1; id < w->shmems.cap; id++) {
-      struct wbvn_shmem *s = w->shmems.v[id];
-      if (s && !s->role_sent && s->base.mirror_ring_id) {
+   for (uint32_t id = 1; id < w->regions.cap; id++) {
+      struct wbvn_region *s = w->regions.v[id];
+      if (s && !s->role_sent && region_ring_id(s)) {
          s->role_sent = true;
-         const uint64_t ring_id = s->base.mirror_ring_id;
+         const uint64_t ring_id = region_ring_id(s);
          ReleaseSRWLockExclusive(&w->mu);
          wbvn_send(w, WBVN_SHM_ROLE, 0, s->res_id, &ring_id, sizeof(ring_id));
          AcquireSRWLockExclusive(&w->mu);
       }
    }
-   for (uint32_t id = 1; id < w->shmems.cap; id++) {
-      struct wbvn_shmem *s = w->shmems.v[id];
-      if (s && s->base.mirror_ring_id) {
+   for (uint32_t id = 1; id < w->regions.cap; id++) {
+      struct wbvn_region *s = w->regions.v[id];
+      if (s && region_ring_id(s)) {
          uint32_t clear = 0;
-         int n = scan_shmem(s, &ring, &clear);
+         int n = scan_region(s, &ring, &clear);
          if (n > 0)
             ring_count += n;
          if (clear) {
@@ -383,11 +402,11 @@ wbvn_flush_push(struct wbvn *w)
          }
       }
    }
-   for (uint32_t id = 1; id < w->shmems.cap; id++) {
-      struct wbvn_shmem *s = w->shmems.v[id];
-      if (!s || s->base.mirror_ring_id)
+   for (uint32_t id = 1; id < w->regions.cap; id++) {
+      struct wbvn_region *s = w->regions.v[id];
+      if (!s || region_ring_id(s))
          continue;
-      int n = scan_shmem(s, body, &(uint32_t){ 0 });
+      int n = scan_region(s, body, &(uint32_t){ 0 });
       if (n > 0)
          count += n;
       if (body->len >= WBVN_PUSH_CHUNK) {
@@ -438,7 +457,7 @@ wbvn_apply_push(struct wbvn *w, const uint8_t *p, uint32_t len)
    AcquireSRWLockExclusive(&w->mu);
    for (uint32_t i = n; i-- > 0;) {
       memcpy(&r, ranges[i], sizeof(r));
-      struct wbvn_shmem *s = tab_get(&w->shmems, r.res_id);
+      struct wbvn_region *s = tab_get(&w->regions, r.res_id);
       if (!s || (r.offset & 7) || (r.len & 7) || r.offset > s->size ||
           r.len > s->size - r.offset)
          continue;
@@ -447,7 +466,7 @@ wbvn_apply_push(struct wbvn *w, const uint8_t *p, uint32_t len)
          uint64_t v;
          memcpy(&v, data + o, 8);
          s->snap[(r.offset + o) / 8] = v;
-         store64((uint8_t *)s->base.mmap_ptr + r.offset + o, v);
+         store64(s->ptr + r.offset + o, v);
       }
    }
    ReleaseSRWLockExclusive(&w->mu);
@@ -572,11 +591,35 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       CloseHandle(w->read_event);
    if (w->write_event)
       CloseHandle(w->write_event);
-   free(w->shmems.v);
+   free(w->regions.v);
    free(w->syncs.v);
    free(w->scratch.data);
    free(w->reply.payload);
    vk_free(alloc, w);
+}
+
+/* Appends a batch in the layout of a WBVN_SUBMIT payload. */
+static bool
+batch_encode(struct wbvn_buf *msg, const struct vn_renderer_submit_batch *batch)
+{
+   const struct wbvn_submit_hdr h = {
+      .ring_idx = batch->ring_idx,
+      .sync_count = batch->sync_count,
+      .cs_size = (uint32_t)batch->cs_size,
+   };
+   if (!buf_reserve(msg, sizeof(h) + (size_t)batch->sync_count * sizeof(struct wbvn_sync_point) +
+                            batch->cs_size) ||
+       !buf_put(msg, &h, sizeof(h)))
+      return false;
+   for (uint32_t i = 0; i < batch->sync_count; i++) {
+      const struct wbvn_sync_point sp = {
+         .sync_id = ((struct wbvn_sync *)batch->syncs[i])->base.sync_id,
+         .value = batch->sync_values[i],
+      };
+      if (!buf_put(msg, &sp, sizeof(sp)))
+         return false;
+   }
+   return buf_put(msg, batch->cs_data, batch->cs_size);
 }
 
 static VkResult
@@ -587,23 +630,8 @@ wbvn_submit(struct vn_renderer *renderer,
    if (w->lost)
       return VK_ERROR_DEVICE_LOST;
 
-   const size_t syncs_size = (size_t)batch->sync_count * sizeof(struct wbvn_sync_point);
-   struct wbvn_submit_hdr h = {
-      .ring_idx = batch->ring_idx,
-      .sync_count = batch->sync_count,
-      .cs_size = (uint32_t)batch->cs_size,
-   };
    struct wbvn_buf msg = { 0 };
-   bool ok = buf_reserve(&msg, sizeof(h) + syncs_size + batch->cs_size) &&
-             buf_put(&msg, &h, sizeof(h));
-   for (uint32_t i = 0; ok && i < batch->sync_count; i++) {
-      struct wbvn_sync_point sp = {
-         .sync_id = ((struct wbvn_sync *)batch->syncs[i])->base.sync_id,
-         .value = batch->sync_values[i],
-      };
-      ok = buf_put(&msg, &sp, sizeof(sp));
-   }
-   ok = ok && buf_put(&msg, batch->cs_data, batch->cs_size);
+   bool ok = batch_encode(&msg, batch);
    if (!ok) {
       free(msg.data);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -654,6 +682,64 @@ wbvn_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    return result;
 }
 
+static void
+region_fini(struct wbvn_region *r)
+{
+   if (r->ptr)
+      VirtualFree(r->ptr, 0, MEM_RELEASE);
+   free(r->snap);
+   free(r->dirty);
+   memset(r, 0, sizeof(*r));
+}
+
+/* Allocates the guest copy: page aligned, with write tracking so the mirror only looks at
+ * the pages the guest touched. */
+static bool
+region_init(struct wbvn_region *r, size_t size)
+{
+   r->size = (size + WBVN_PAGE - 1) & ~(size_t)(WBVN_PAGE - 1);
+   r->snap = calloc(1, r->size);
+   r->dirty = malloc(r->size / WBVN_PAGE * sizeof(void *));
+   r->ptr = VirtualAlloc(NULL, r->size, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                         PAGE_READWRITE);
+   if (r->snap && r->dirty && r->ptr)
+      return true;
+   region_fini(r);
+   return false;
+}
+
+/* Gives the region its id and tells the host about it. */
+static bool
+region_attach(struct wbvn *w, struct wbvn_region *r, uint32_t kind, const void *payload,
+              size_t len)
+{
+   AcquireSRWLockExclusive(&w->mu);
+   r->res_id = tab_add(&w->regions, r);
+   ReleaseSRWLockExclusive(&w->mu);
+   if (!r->res_id)
+      return false;
+   if (wbvn_request(w, kind, r->res_id, payload, len, NULL, NULL) == 0)
+      return true;
+   AcquireSRWLockExclusive(&w->mu);
+   tab_del(&w->regions, r->res_id);
+   ReleaseSRWLockExclusive(&w->mu);
+   return false;
+}
+
+static void
+region_detach(struct wbvn *w, struct wbvn_region *r)
+{
+   /* the host may still have to see the last words before the resource goes away */
+   AcquireSRWLockExclusive(&w->push_lock);
+   wbvn_flush_push(w);
+   AcquireSRWLockExclusive(&w->mu);
+   tab_del(&w->regions, r->res_id);
+   ReleaseSRWLockExclusive(&w->mu);
+   ReleaseSRWLockExclusive(&w->push_lock);
+
+   wbvn_request(w, WBVN_SHM_DESTROY, r->res_id, NULL, 0, NULL, NULL);
+}
+
 static struct vn_renderer_shmem *
 wbvn_shmem_create(struct vn_renderer *renderer, size_t size)
 {
@@ -661,44 +747,26 @@ wbvn_shmem_create(struct vn_renderer *renderer, size_t size)
    if (w->lost)
       return NULL;
 
-   size = (size + WBVN_PAGE - 1) & ~(size_t)(WBVN_PAGE - 1);
    struct wbvn_shmem *s = calloc(1, sizeof(*s));
    if (!s)
       return NULL;
-   s->size = size;
-   s->snap = calloc(1, size);
-   s->dirty = malloc(size / WBVN_PAGE * sizeof(void *));
-   void *mem = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
-                            PAGE_READWRITE);
-   if (!s->snap || !s->dirty || !mem)
+   if (!region_init(&s->r, size))
       goto fail;
+   s->r.ring_src = &s->base.mirror_ring_id;
 
-   AcquireSRWLockExclusive(&w->mu);
-   s->res_id = tab_add(&w->shmems, s);
-   ReleaseSRWLockExclusive(&w->mu);
-   if (!s->res_id)
-      goto fail;
-
-   s->base.refcount = VN_REFCOUNT_INIT(1);
-   s->base.res_id = s->res_id;
-   s->base.mmap_size = size;
-   s->base.mmap_ptr = mem;
-
-   const uint64_t size64 = size;
-   if (wbvn_request(w, WBVN_SHM_CREATE, s->res_id, &size64, sizeof(size64), NULL,
-                    NULL) != 0) {
-      AcquireSRWLockExclusive(&w->mu);
-      tab_del(&w->shmems, s->res_id);
-      ReleaseSRWLockExclusive(&w->mu);
+   const uint64_t size64 = s->r.size;
+   if (!region_attach(w, &s->r, WBVN_SHM_CREATE, &size64, sizeof(size64))) {
+      region_fini(&s->r);
       goto fail;
    }
+
+   s->base.refcount = VN_REFCOUNT_INIT(1);
+   s->base.res_id = s->r.res_id;
+   s->base.mmap_size = s->r.size;
+   s->base.mmap_ptr = s->r.ptr;
    return &s->base;
 
 fail:
-   if (mem)
-      VirtualFree(mem, 0, MEM_RELEASE);
-   free(s->snap);
-   free(s->dirty);
    free(s);
    return NULL;
 }
@@ -708,20 +776,8 @@ wbvn_shmem_destroy(struct vn_renderer *renderer, struct vn_renderer_shmem *_shme
 {
    struct wbvn *w = (struct wbvn *)renderer;
    struct wbvn_shmem *s = (struct wbvn_shmem *)_shmem;
-
-   /* the host may still have to see the last words before the resource goes away */
-   AcquireSRWLockExclusive(&w->push_lock);
-   wbvn_flush_push(w);
-   AcquireSRWLockExclusive(&w->mu);
-   tab_del(&w->shmems, s->res_id);
-   ReleaseSRWLockExclusive(&w->mu);
-   ReleaseSRWLockExclusive(&w->push_lock);
-
-   wbvn_request(w, WBVN_SHM_DESTROY, s->res_id, NULL, 0, NULL, NULL);
-
-   VirtualFree(s->base.mmap_ptr, 0, MEM_RELEASE);
-   free(s->snap);
-   free(s->dirty);
+   region_detach(w, &s->r);
+   region_fini(&s->r);
    free(s);
 }
 
@@ -734,25 +790,80 @@ wbvn_bo_create_from_device_memory(struct vn_renderer *renderer,
                                   VkExternalMemoryHandleTypeFlags external_handles,
                                   struct vn_renderer_bo **out_bo)
 {
-   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct wbvn *w = (struct wbvn *)renderer;
+   if (w->lost)
+      return VK_ERROR_DEVICE_LOST;
+
+   struct wbvn_bo *bo = calloc(1, sizeof(*bo));
+   if (!bo)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (!region_init(&bo->r, size)) {
+      free(bo);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   /* The batch waits for the ring to reach the vkAllocateMemory that made this memory. It
+    * has to be at the host before the host creates the resource, as does the ring itself. */
+   struct wbvn_buf msg = { 0 };
+   const struct wbvn_bo_create hdr = {
+      .size = size,
+      .blob_id = mem_id,
+      .blob_flags = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? WBVN_BLOB_MAPPABLE : 0,
+   };
+   bool ok = buf_put(&msg, &hdr, sizeof(hdr)) && (!batch || batch_encode(&msg, batch));
+   if (ok && batch) {
+      const uint32_t batch_len = (uint32_t)(msg.len - sizeof(hdr));
+      memcpy(msg.data + offsetof(struct wbvn_bo_create, batch_len), &batch_len, 4);
+   }
+
+   AcquireSRWLockExclusive(&w->push_lock);
+   wbvn_flush_push(w);
+   ok = ok && region_attach(w, &bo->r, WBVN_BO_CREATE, msg.data, msg.len);
+   ReleaseSRWLockExclusive(&w->push_lock);
+   free(msg.data);
+   if (!ok) {
+      region_fini(&bo->r);
+      free(bo);
+      return w->lost ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   bo->base.refcount = VN_REFCOUNT_INIT(1);
+   bo->base.res_id = bo->r.res_id;
+   bo->base.mmap_size = size;
+   bo->base.mmap_ptr = bo->r.ptr;
+   *out_bo = &bo->base;
+   return VK_SUCCESS;
 }
 
 static bool
-wbvn_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
+wbvn_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
 {
-   return false;
+   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn_bo *bo = (struct wbvn_bo *)_bo;
+   region_detach(w, &bo->r);
+   region_fini(&bo->r);
+   free(bo);
+   return true;
 }
 
 static void *
-wbvn_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *bo, void *placed_addr)
+wbvn_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo, void *placed_addr)
 {
-   return NULL;
+   /* the guest copy is allocated up front; a placed mapping cannot be honoured */
+   return placed_addr ? NULL : ((struct wbvn_bo *)_bo)->r.ptr;
 }
 
+/* The memory types the guest sees are coherent, so applications flush nothing. The guest
+ * copy goes to the host at every submit; this makes an explicit flush do the same. The host
+ * sends GPU writes back when a fence retires, so there is nothing to do on invalidate. */
 static void
 wbvn_bo_flush(struct vn_renderer *renderer, struct vn_renderer_bo *bo,
               VkDeviceSize offset, VkDeviceSize size)
 {
+   struct wbvn *w = (struct wbvn *)renderer;
+   AcquireSRWLockExclusive(&w->push_lock);
+   wbvn_flush_push(w);
+   ReleaseSRWLockExclusive(&w->push_lock);
 }
 
 static void

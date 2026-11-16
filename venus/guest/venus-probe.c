@@ -158,7 +158,125 @@ main(int argc, char **argv)
    CHECK(wait_idle(queue));
    destroy_fence(dev, fence, NULL);
 
+   /* Memory: fill a host visible buffer, copy it on the GPU into a second one, read it back.
+    * Exercises device memory creation, the mapping, the guest-to-host push before the submit
+    * and the host-to-guest push when the fence retires. */
+   {
+#define DEV(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
+      DEV(vkCreateBuffer);
+      DEV(vkGetBufferMemoryRequirements);
+      DEV(vkAllocateMemory);
+      DEV(vkBindBufferMemory);
+      DEV(vkMapMemory);
+      DEV(vkCreateCommandPool);
+      DEV(vkAllocateCommandBuffers);
+      DEV(vkBeginCommandBuffer);
+      DEV(vkCmdCopyBuffer);
+      DEV(vkEndCommandBuffer);
+      const VkDeviceSize bytes = 1u << 20;
+      VkBuffer buf[2];
+      VkDeviceMemory memory[2];
+      uint32_t *ptr[2];
+      for (int i = 0; i < 2; i++) {
+         VkBufferCreateInfo bci = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         };
+         CHECK(vkCreateBuffer(dev, &bci, NULL, &buf[i]));
+         VkMemoryRequirements req;
+         vkGetBufferMemoryRequirements(dev, buf[i], &req);
+         uint32_t type = UINT32_MAX;
+         const VkMemoryPropertyFlags want =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+         for (uint32_t t = 0; t < mem.memoryTypeCount; t++) {
+            if ((req.memoryTypeBits & (1u << t)) &&
+                (mem.memoryTypes[t].propertyFlags & want) == want) {
+               type = t;
+               break;
+            }
+         }
+         if (type == UINT32_MAX) {
+            printf("FAIL no host visible coherent type for the buffer\n");
+            return 1;
+         }
+         VkMemoryAllocateInfo mai = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size,
+            .memoryTypeIndex = type,
+         };
+         CHECK(vkAllocateMemory(dev, &mai, NULL, &memory[i]));
+         CHECK(vkBindBufferMemory(dev, buf[i], memory[i], 0));
+         void *p;
+         CHECK(vkMapMemory(dev, memory[i], 0, bytes, 0, &p));
+         ptr[i] = p;
+      }
+      for (VkDeviceSize i = 0; i < bytes / 4; i++) {
+         ptr[0][i] = (uint32_t)i * 2654435761u;
+         ptr[1][i] = 0xdeadbeefu;
+      }
+
+      VkCommandPoolCreateInfo pci = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+         .queueFamilyIndex = family,
+      };
+      VkCommandPool pool;
+      CHECK(vkCreateCommandPool(dev, &pci, NULL, &pool));
+      VkCommandBufferAllocateInfo cai = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool = pool,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = 1,
+      };
+      VkCommandBuffer cmd;
+      CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+      VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+      CHECK(vkBeginCommandBuffer(cmd, &cbi));
+      VkBufferCopy region = { .size = bytes };
+      vkCmdCopyBuffer(cmd, buf[0], buf[1], 1, &region);
+      CHECK(vkEndCommandBuffer(cmd));
+
+      VkFence copy_fence;
+      CHECK(create_fence(dev, &fci, NULL, &copy_fence));
+      VkSubmitInfo si = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .commandBufferCount = 1,
+         .pCommandBuffers = &cmd,
+      };
+      CHECK(submit(queue, 1, &si, copy_fence));
+      CHECK(wait_fences(dev, 1, &copy_fence, VK_TRUE, 10000000000ull));
+      uint64_t bad = 0;
+      VkDeviceSize first_bad = 0;
+      for (VkDeviceSize i = 0; i < bytes / 4; i++) {
+         if (ptr[1][i] != (uint32_t)i * 2654435761u) {
+            if (!bad)
+               first_bad = i;
+            bad++;
+         }
+      }
+      if (bad) {
+         printf("FAIL copy readback: %llu of %llu words differ, first at %llu (got 0x%x)\n",
+                (unsigned long long)bad, (unsigned long long)(bytes / 4),
+                (unsigned long long)first_bad, ptr[1][first_bad]);
+         return 1;
+      }
+      printf("ok   buffer copy through the GPU, %llu bytes read back\n",
+             (unsigned long long)bytes);
+      PFN_vkDestroyBuffer destroy_buffer = (PFN_vkDestroyBuffer)vkGetDeviceProcAddr(dev, "vkDestroyBuffer");
+      PFN_vkFreeMemory free_memory = (PFN_vkFreeMemory)vkGetDeviceProcAddr(dev, "vkFreeMemory");
+      PFN_vkDestroyCommandPool destroy_pool = (PFN_vkDestroyCommandPool)vkGetDeviceProcAddr(dev, "vkDestroyCommandPool");
+      printf("destroying the copy resources\n");
+      destroy_fence(dev, copy_fence, NULL);
+      destroy_pool(dev, pool, NULL);
+      for (int i = 0; i < 2; i++) {
+         destroy_buffer(dev, buf[i], NULL);
+         free_memory(dev, memory[i], NULL);
+      }
+   }
+   printf("destroying the device\n");
    destroy_device(dev, NULL);
+   printf("destroying the instance\n");
    vkDestroyInstance(inst, NULL);
    printf("RESULT ok\n");
    return 0;
