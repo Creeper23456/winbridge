@@ -55,7 +55,12 @@ struct Args {
     wait_secs: u64,
     clip_wait_secs: u64,
     skip_h2g: bool,
+    /// Transport-only host -> guest test: chunks for an unknown transfer id, which the guest
+    /// drops without touching the disk (0 = off).
+    sink_mb: usize,
     skip_g2h: bool,
+    /// Seconds of silence after the idle latency phase, before the restart measurement (0 = off).
+    idle_secs: u64,
 }
 
 fn parse_args() -> Args {
@@ -69,7 +74,9 @@ fn parse_args() -> Args {
         wait_secs: 240,
         clip_wait_secs: 300,
         skip_h2g: false,
+        sink_mb: 0,
         skip_g2h: false,
+        idle_secs: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -91,6 +98,8 @@ fn parse_args() -> Args {
             "--clip-wait" => a.clip_wait_secs = val("--clip-wait").parse().unwrap_or_else(|_| die("bad --clip-wait")),
             "--skip-h2g" => a.skip_h2g = true,
             "--skip-g2h" => a.skip_g2h = true,
+            "--sink-mb" => a.sink_mb = val("--sink-mb").parse().unwrap_or_else(|_| die("bad --sink-mb")),
+            "--idle-secs" => a.idle_secs = val("--idle-secs").parse().unwrap_or_else(|_| die("bad --idle-secs")),
             "--help" | "-h" => {
                 println!(
                     "shme2e --socket PATH --shm-file PATH --mode shm|serial [--bulk-mb N] [--pings N] \
@@ -349,6 +358,17 @@ fn main() {
     };
     report("bulk idle", &idle);
 
+    // --- phase 1a: go idle, then restart (first ping, then the steady state) ----------------------
+    if args.idle_secs > 0 {
+        std::thread::sleep(Duration::from_secs(args.idle_secs));
+        let base = args.pings as u64;
+        let range = ping_until(ep.clone(), base, Arc::new(AtomicBool::new(false)), Some(args.pings as u64)).join().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let after = rtts(&sh, range);
+        println!("IDLE {} s: first ping {} us", args.idle_secs, after.first().copied().unwrap_or_default());
+        report("after idle", &after);
+    }
+
     let bulk = args.work_dir.join("bulk.bin");
     let mut h2g_ok = None;
     let mut g2h_ok = None;
@@ -359,6 +379,40 @@ fn main() {
         ensure_file(&bulk, args.bulk_mb);
         expect_sha = sha256(&bulk);
         println!("SOURCE_SHA256 {expect_sha}");
+    }
+
+    // --- phase 1b: transport-only host -> guest stream ---------------------------------------------
+    // Chunks for a transfer the guest does not know: it decodes and drops them (no disk), then
+    // answers the closing `DropFileFinish` with a failed `DropResult`, which marks the end.
+    if args.sink_mb > 0 {
+        *sh.drop_result.lock().unwrap() = None;
+        let chunk = vec![0x5au8; CHUNK];
+        let chunks = args.sink_mb * (1 << 20) / CHUNK;
+        let t0 = Instant::now();
+        for i in 0..chunks {
+            send(&ep, Message::DropFileChunk { transfer_id: 0xdead_beef, offset: (i * CHUNK) as u64, data: chunk.clone() });
+        }
+        let sent_at = t0.elapsed();
+        send(&ep, Message::DropFileFinish { transfer_id: 0xdead_beef, success: true, error: None });
+        let until = Instant::now() + Duration::from_secs(600);
+        let at = loop {
+            if let Some((_, _, at)) = sh.drop_result.lock().unwrap().clone() {
+                break at;
+            }
+            if Instant::now() > until {
+                die("no DropResult after the sink stream");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let secs = at.duration_since(t0).as_secs_f64();
+        println!(
+            "SINK H2G {} MiB in {:.3} s = {:.0} MiB/s (all queued after {:.3} s)",
+            args.sink_mb,
+            secs,
+            args.sink_mb as f64 / secs,
+            sent_at.as_secs_f64()
+        );
+        *sh.drop_result.lock().unwrap() = None;
     }
 
     // --- phase 2: host -> guest stream while pinging --------------------------------------------
