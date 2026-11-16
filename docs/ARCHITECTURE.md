@@ -181,52 +181,11 @@ The viewer's lifetime is the VM's lifetime. How the VM starts is the user's busi
 
 ---
 
-## 6. Injection (IFEO) and GPU path
+## 6. GPU path
 
-The graphics hook is the planned route for GPU-accelerated Windows applications. Its guest-side delivery is the Image File Execution Options (IFEO) mechanism in `crates/winbridge-agent/src/gfx_inject.rs`. **Status: the hook DLL `winbridge_gfx_hook.dll` is not built yet, so nothing is injected today.** With no DLL beside the agent, `run_debugger` starts each target without the hook.
+3D acceleration is the Venus Vulkan layer (`docs/adr/0001-venus-as-serialization-layer.md`, `venus/README.md`). The guest driver `vulkan_virtio.dll` is registered once as a global Vulkan driver (`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`), and DXVK's DLLs sit next to the Direct3D programs. Nothing is injected into applications: the agent writes no Image File Execution Options entries and starts no target process. Each Vulkan process claims one shared-memory slot (section 7 and `docs/IVSHMEM-TRANSPORT.md`) served by one `winbridge-venus` process on the host.
 
-**The injection is off by default.** The agent only touches IFEO when started with `--enable-gfx`; a plain start never writes registry entries (`--uninstall-gfx` removes whatever an earlier run created). It has never run on a real guest, and with no hook DLL it cannot accelerate anything, so enabling it today only adds risk.
-
-### Allow-list
-- The allow-list is `%ProgramData%\WinBridge\gfx-apps.txt`: one bare `.exe` name per line, `#` comments, no paths or wildcards. It is re-read about every 5 seconds.
-- It is created with defaults only when missing, so an existing install keeps its list.
-- Defaults: the shell processes (`explorer.exe`, `SystemSettings.exe`, `ApplicationFrameHost.exe`, `ShellExperienceHost.exe`, `StartMenuExperienceHost.exe`, `SearchHost.exe`, `TextInputHost.exe`) and `dwm.exe`. The test programs `vkcube.exe` and `dxvk-test.exe` are commented out.
-- `dwm.exe` is the Desktop Window Manager. A fault in its hook can black-screen the session. It is in the default list and carries a warning comment in the template.
-
-### Arming: VM gate
-Redirects are armed only when `gate_open()` holds: not safe mode, and `is_virtual_machine()` is true. The gate is evaluated on every launch and is not cached.
-
-`is_virtual_machine()` evaluates five signals and needs at least 3 to fire:
-1. **cpuid-hypervisor**: CPUID.1:ECX bit 31 is set, and the hypervisor vendor leaf (0x40000000) reads `KVMKVMKVM` or `TCGTCGTCGTCG`.
-2. **firmware**: the raw SMBIOS table (`RSMB`) or the `HARDWARE\DESCRIPTION\System\BIOS` strings contain `QEMU`, `Standard PC`, `SeaBIOS`, `EDK II`, or `OVMF` (case-insensitive).
-3. **virtio-pci**: a `VEN_1AF4` device is enumerated under `Enum\PCI`.
-4. **winbridge-port**: `\\.\Global\org.winbridge.0` exists. Access denied or a sharing violation also counts as present, since the port exists but is held elsewhere.
-5. **no-display-gpu**: no `VEN_10DE`, `VEN_1002`, or `VEN_8086` device has the `Display` class.
-
-The hypervisor bit alone is not enough: Hyper-V and VBS set it on bare metal, so the cpuid-hypervisor signal also needs the KVM or TCG vendor leaf. `EDK II` also appears in some physical firmware, so the firmware signal is one of five and never decides alone. A signal that cannot be read does not fire, which keeps the hook disarmed when detection fails.
-
-### Bare-metal safety
-- When the gate is closed, the agent removes every WinBridge redirect it wrote, in both registry views, and clears the recovery record. This is best-effort: a redirect that cannot be removed (for example, from a non-elevated agent) is logged, and the launch continues.
-- Every launch starts the target with `DEBUG_ONLY_THIS_PROCESS` and detaches it, armed or not. Bare metal therefore never blocks a program from starting, even if a redirect survives.
-- Backstop: if the debugger-created process turns out to be this agent, or its image cannot be checked, the start is terminated and the launch fails with exit code 1. This fires only when the bypass fails, and it stops a recursion that would otherwise be unbounded.
-
-### Injection sequence
-1. Windows starts `winbridge-agent.exe --ifeo-debug <target command line>` because of the IFEO `Debugger` value. `main` dispatches this before flag parsing, so target arguments are never read as agent options.
-2. The agent sets `DebugSetProcessKillOnExit(FALSE)` before the target is created. If the agent faults, the target is detached and not killed.
-3. The agent creates the target with `DEBUG_ONLY_THIS_PROCESS`. It writes nothing to the registry for this start. [INFERENCE] The flag keeps the loader from consulting the target's IFEO `Debugger` value, so the start does not re-enter the agent. This comes from secondhand summaries of Windows behaviour and must be confirmed on the VM.
-4. The agent runs debug events to the initial loader breakpoint. For an armed target it injects the hook with `VirtualAllocEx`, `WriteProcessMemory`, and a remote `LoadLibraryW` thread. It then continues the breakpoint and calls `DebugActiveProcessStop`. An unarmed target is detached at the same point, without injection.
-5. The agent waits for the target to exit and returns its real exit code. It holds no lock while waiting, so a session ending during a long-running target is not blocked. A target that ends within 3 seconds with an NTSTATUS error code counts as an early crash for the guard.
-
-The detach step is not yet verified on a VM. The remote thread's create event may still be pending when the debugger detaches. This must be validated on the LTSC VM before the hook ships. The debug-flag bypass is likewise unverified on a VM.
-
-### Crash guard
-If a target exits with an NTSTATUS error code within 3 seconds of launch, that is one early crash. Three in a row disable the redirect for that executable, recorded as `disabled` in `%ProgramData%\WinBridge\gfx-guard.txt`. Removing that line re-arms it. A normal exit clears the count.
-
-### Recovery and uninstall
-- `HKLM\SOFTWARE\WinBridge\Gfx` has one empty subkey per armed executable. It is written before arming and cleared only after every redirect is removed.
-- `winbridge-agent.exe --uninstall-gfx` removes every redirect the agent wrote and clears the record.
-- Offline recovery from WinPE: load the `SYSTEM` and `SOFTWARE` hives. For each subkey of `HKLM\SOFTWARE\WinBridge\Gfx`, delete the `Debugger` value under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<exe>`. Repeat under `WOW6432Node`.
-- When an interactive session ends (WM_ENDSESSION), the agent removes all its redirects and clears the record. A non-interactive service session does not receive this message, so recovery then depends on `--uninstall-gfx` or the offline steps above.
+The earlier IFEO injector (`gfx_inject.rs`, an allow-list of executables, a debugger-style launch redirect) was written for the hand-written ICD, never ran on a guest and was removed with it. A per-application mechanism, if one is wanted later, needs a new design: IFEO has one key per image name, so it cannot express "every program except these".
 
 
 ## 7. Shared memory (guest side)

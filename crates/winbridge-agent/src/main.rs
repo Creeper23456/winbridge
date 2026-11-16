@@ -15,7 +15,6 @@ mod dnd;
 mod dragipc;
 mod dragout;
 mod dragprobe;
-mod gfx_inject;
 #[cfg(windows)]
 mod ivshmem;
 mod hostfiles;
@@ -37,8 +36,6 @@ use winbridge_proto::{caps, Message};
 
 fn main() {
     let has_console = logging::attach_console();
-    // IFEO starts this agent as `<agent> --ifeo-debug <target command line>`. Dispatch before flag
-    // parsing, so the target's own arguments are never read as agent flags.
     // The drag probe helper (started by the agent at medium integrity) has its own log and
     // takes nothing else from this program.
     let raw: Vec<String> = std::env::args().collect();
@@ -49,9 +46,6 @@ fn main() {
         std::process::exit(dragprobe::run(&pipe, agent_pid));
     }
     logging::init(has_console);
-    if let Some(target_cmd) = gfx_inject::ifeo_debug_request() {
-        std::process::exit(gfx_inject::run_debugger(&target_cmd) as i32);
-    }
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -62,8 +56,6 @@ fn main() {
         println!("  --port <DEVICE_PATH>   VirtIO-serial port path (default: \\\\.\\Global\\org.winbridge.0)");
         println!("  --test-ping            Run protocol ping self-test and exit");
         println!("  --version, -V          Print version");
-        println!("  --enable-gfx           Turn on the experimental GPU injection (writes IFEO entries; off by default)");
-        println!("  --uninstall-gfx        Remove every IFEO entry the injection created, then exit");
         println!("  --install-ivshmem <DIR>  Install the signed ivshmem driver package from DIR (add --force to replace another driver), then exit");
         println!("  --uninstall-ivshmem    Remove the ivshmem driver package this tool installed, then exit");
         println!("  --ivshmem-status       Print ivshmem devices, DACLs and bound drivers (read-only), then exit");
@@ -108,15 +100,6 @@ fn main() {
     #[cfg(windows)]
     if let Some(code) = ivshmem::run_cli(&args) {
         std::process::exit(code);
-    }
-    if args.iter().any(|a| a == "--uninstall-gfx") {
-        gfx_inject::uninstall();
-        return;
-    }
-    // The IFEO injection is experimental and has never run on a real guest: it stays off unless
-    // the agent is started with --enable-gfx.
-    if args.iter().any(|a| a == "--enable-gfx") {
-        gfx_inject::start_watcher();
     }
     // Before the first file or folder is created: the user, not Administrators, owns them.
     owner::adopt_user_ownership();
