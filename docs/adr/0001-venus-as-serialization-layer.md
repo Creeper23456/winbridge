@@ -126,6 +126,9 @@ Installed in the LTSC guest (4 vCPU, virtio-gpu for the desktop, 2 Venus slots) 
 |---|---|
 | `tri11.exe`, 120 frames, dumped | Pass; 2.32 ms per frame on average, 13.98 ms worst; 41,472 of 230,400 pixels differ from the background colour |
 | `teapot11.exe` (`--frames 0`), then `tri9.exe` started beside it, one slot each | Both run and hold a slot at the same time (two claims in the host logs). From two screenshots: the teapot's title and DXVK's HUD read 339.8 frames a second, 2.94 ms average and 8.46 ms worst over the last half second while it ran alone; tri9 read 340.7 frames a second, 2.93 ms and 6.92 ms with the teapot running. Not a controlled measurement. |
+| `teapot11.exe --frames 0` for 16 minutes, sampled each minute | No failure and no host warning. 990 one-second counter lines from the driver: about 4,300 submits and 3,000 renderer waits a second at the start and at the end (waits 0.26 ms on average in both), so no slowdown. The program's private memory stayed at 45.4-45.5 MB, handles at 207, threads 11-14; the host's `winbridge-venus` stayed at 162,172 KiB and its render server at 1,708 KiB. QEMU's resident set grew about 15 MB over the run (1.1 MB a minute), which may be the guest touching memory; one soak does not say. |
+| `teapot11.exe --size 640x360 --resize 1280x720`, 120 frames, dumped | Pass; the swapchain was recreated at 1280x720 and the dump has that size; 428,854 of 921,600 pixels differ from the background (46.5%, as for the other teapot sizes) |
+| `teapot11.exe --size 1920x1080`, 60 frames, dumped | Pass; 968,571 of 2,073,600 pixels differ from the background (46.7%) |
 
 Three things stood in the way, all in the guest or the host, none in the encoder:
 
@@ -133,7 +136,9 @@ Three things stood in the way, all in the guest or the host, none in the encoder
 2. **The slot's serial port is administrators only.** The virtio-serial driver creates `org.winbridge.venus.N` with the DACL `SY, BA`. A Vulkan process of the user runs with the filtered token, got access denied, and the driver enumerated no device. The elevated agent now opens the ports to the interactive users when it starts (live, like the ivshmem hardening; the port carries wake-up bytes only). Read back as `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x12019f;;;IU)`; the same probe as the user returned success on both ports.
 3. **The host missed a quick claim and leave.** It polled for the state CLAIMED; the failures of item 2 claimed the slot and closed it again within a poll, which left it CLOSED, and every later claim then waited for a slot that never became free. The host now treats CLOSED as the end of the wait and resets the slot (a regression test covers it).
 
-Not verified here: the hand-written pieces of the viewer on this VM (drag and drop, clipboard) with the slots present, a run longer than a few minutes, applications other than the three test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
+Clipboard with the shared-memory transport active: a text goes both ways, and 1 MiB of text from the host to the guest arrived with the same SHA-256. It took about 40 s from the host's copy to the viewer's "clipboard changed" line for 1 MiB when the owner was GTK 3 or `xclip`; why was not investigated (the viewer reads in 64 KiB pieces). Drag and drop and the dark colour scheme were not tried on this VM (the desktop's `color-scheme` is `default`; testing it means changing the user's desktop setting).
+
+Not verified here: Direct3D 10 programs, applications other than the three test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
 
 ## 4. Options considered
 
