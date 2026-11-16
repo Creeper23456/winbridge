@@ -1223,40 +1223,63 @@ fn selftest(as_user: bool) -> i32 {
         return failed.min(1);
     }
 
-    step("harden", harden_devices().map(|n| format!("{n} device(s) restricted")).map_err(|e| e.to_string()));
-    let a = map_device(SELFTEST_LEN);
-    let b = map_device(SELFTEST_LEN);
-    step("map first", a.as_ref().map(|x| format!("{:p} len {}", x.base(), x.len())).map_err(|e| e.to_string()));
-    step("map second", b.as_ref().map(|x| format!("{:p} len {}", x.base(), x.len())).map_err(|e| e.to_string()));
-    step(
-        "third map refused",
+    let devices = match harden_devices() {
+        Ok(n) => {
+            step("harden", Ok(format!("{n} device(s) restricted")));
+            n
+        }
+        Err(e) => {
+            step("harden", Err(e.to_string()));
+            0
+        }
+    };
+    // Every device maps once; the next mapping is refused while all are held.
+    let mut held = Vec::new();
+    for i in 0..devices {
         match map_device(SELFTEST_LEN) {
-            Err(IvshmemError::AlreadyAttached) => Ok("STATUS_DEVICE_ALREADY_ATTACHED while both are held".into()),
+            Ok(bar) => {
+                step(&format!("map device {}", i + 1), Ok(format!("{:p} len {}", bar.base(), bar.len())));
+                held.push(bar);
+            }
+            Err(e) => step(&format!("map device {}", i + 1), Err(e.to_string())),
+        }
+    }
+    step(
+        "extra map refused",
+        match map_device(SELFTEST_LEN) {
+            Err(IvshmemError::AlreadyAttached) => Ok(format!("STATUS_DEVICE_ALREADY_ATTACHED while {} device(s) are held", held.len())),
             Err(e) => Err(format!("wrong error: {e}")),
-            Ok(_) => Err("a third mapping succeeded".into()),
+            Ok(_) => Err("a mapping beyond the device count succeeded".into()),
         },
     );
-    if let (Ok(a), Ok(b)) = (a, b) {
-        step("pattern second", pattern_roundtrip(&b, 0).and_then(|()| pattern_roundtrip(&b, 128 << 20)).map(|()| "4 KiB at 0 and 128 MiB".into()));
-        step("pattern first", pattern_roundtrip(&a, 128 << 20).map(|()| "4 KiB at 128 MiB".into()));
-        step("header on first", match Region::attach(a, Side::Guest) {
+    for (i, bar) in held.iter().enumerate() {
+        step(
+            &format!("pattern device {}", i + 1),
+            pattern_roundtrip(bar, 0).and_then(|()| pattern_roundtrip(bar, 128 << 20)).map(|()| "4 KiB at 0 and 128 MiB".into()),
+        );
+    }
+    let mapped = held.len();
+    if let Some(first) = held.pop() {
+        step("header on a device", match Region::attach(first, Side::Guest) {
             Ok(r) => Ok(format!(
                 "Region::attach ok, {} lane(s): {:?}",
                 r.lanes().len(),
                 r.lanes().iter().map(|l| (l.id, l.size)).collect::<Vec<_>>()
             )),
+            // A fresh backing file has no header until a host viewer has created the region.
+            Err(winbridge_shm::RegionError::BadMagic) => Ok("no host header yet (BadMagic): expected on a fresh backing file".to_string()),
             Err(e) => Err(format!("Region::attach failed: {e:?}")),
         });
-        // `a` moved into the region and is dropped with it; `b` drops here.
-        drop(b);
+        // The mapping moved into the region and was dropped with it.
     }
-    // Everything released: both devices map again in this process.
-    let again = (map_device(SELFTEST_LEN), map_device(SELFTEST_LEN));
+    drop(held);
+    // Everything released: every device maps again in this process.
+    let again: Vec<_> = (0..mapped).map(|_| map_device(SELFTEST_LEN)).collect();
     step(
         "remap after drop",
-        match (&again.0, &again.1) {
-            (Ok(_), Ok(_)) => Ok("both devices mapped again".into()),
-            (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
+        match again.iter().find_map(|r| r.as_ref().err()) {
+            None => Ok(format!("{} device(s) mapped again", again.len())),
+            Some(e) => Err(e.to_string()),
         },
     );
     drop(again);
