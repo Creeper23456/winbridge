@@ -1,0 +1,61 @@
+From 3cc75691f4f7df3762b3be313b529db5181c2e2e Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 15:15:54 +0800
+Subject: [PATCH 9/9] venus: report ring waits to the WinBridge renderer
+ backend on Windows
+
+vn_relax_fini calls wbvn_stats_relax with the reason, the number of polls and
+the time spent, so the backend can count them when WBVN_STATS is set.
+---
+ src/virtio/vulkan/vn_common.c | 11 +++++++++++
+ src/virtio/vulkan/vn_common.h |  2 ++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index 1288dad..f4e3172 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -153,9 +153,18 @@ vn_watchdog_acquire(struct vn_watchdog *watchdog, bool alive)
+    return true;
+ }
+ 
++#ifdef _WIN32
++/* implemented by the WinBridge renderer backend; counts waits when WBVN_STATS is set */
++void
++wbvn_stats_relax(unsigned reason, uint32_t iters, int64_t ns);
++#endif
++
+ void
+ vn_relax_fini(struct vn_relax_state *state)
+ {
++#ifdef _WIN32
++   wbvn_stats_relax(state->reason, state->iter, os_time_get_nano() - state->start_ns);
++#endif
+    vn_watchdog_release(&state->instance->ring.watchdog);
+ }
+ 
+@@ -239,6 +248,8 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+       .iter = 0,
+       .profile = vn_relax_get_profile(reason),
+       .reason_str = vn_relax_reason_string(reason),
++      .reason = reason,
++      .start_ns = os_time_get_nano(),
+    };
+ }
+ 
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index a69990f..08ef6a1 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -280,6 +280,8 @@ struct vn_relax_state {
+    const struct vn_relax_profile profile;
+    const char *reason_str;
+    bool warn;
++   enum vn_relax_reason reason;
++   int64_t start_ns;
+ };
+ 
+ /* TLS ring
+-- 
+2.47.3
+

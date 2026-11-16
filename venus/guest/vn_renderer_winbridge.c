@@ -15,6 +15,7 @@
  */
 
 #include <windows.h>
+#include <stdio.h>
 
 #include "vn_renderer.h"
 #include "virtio/virtio-gpu/venus_hw.h"
@@ -118,6 +119,12 @@ struct wbvn {
    } reply;
 
    struct wbvn_buf scratch;
+   /* threads waiting for push_lock or mu; the pump stands aside while there are any */
+   volatile LONG contenders;
+   /* frames a flush has built and not written yet; guarded by push_lock */
+   struct wbvn_buf out;
+   /* counts the flushes that sent something (under push_lock); the pump stays awake while it moves */
+   volatile LONG flush_gen;
    uint32_t max_timeline_count;
    struct virgl_renderer_capset_venus capset;
 };
@@ -198,6 +205,200 @@ store64(void *p, uint64_t v)
    __atomic_store_n((uint64_t *)p, v, __ATOMIC_RELAXED);
 }
 
+/* ---------- statistics --------------------------------------------------------------- */
+
+/* With WBVN_STATS=<file> the backend appends a line of counter deltas to the file once a second
+ * and a total when the renderer is destroyed, and measures the channel's round trip when it
+ * starts. When the variable is unset every counter costs one branch. Names ending in _ns print
+ * as milliseconds; names ending in _max_ns are maxima over the interval. The counters before
+ * flush_n measure work the application asked for; the rest is the pump's background activity,
+ * which a line only reports together with the first kind. */
+#define WBVN_STAT_LIST(X)                                                                      \
+   X(submit_n) X(submit_ns) X(submit_bytes)                                                    \
+   X(wait_n) X(wait_ns) X(wait_max_ns)                                                         \
+   X(wait_h0) X(wait_h1) X(wait_h2) X(wait_h3) X(wait_h4)                                      \
+   X(req_n) X(req_ns)                                                                          \
+   X(relax_ring_n) X(relax_ring_iters) X(relax_ring_ns)                                        \
+   X(relax_tls_n) X(relax_tls_iters) X(relax_tls_ns)                                           \
+   X(relax_space_n) X(relax_space_iters) X(relax_space_ns)                                     \
+   X(relax_sem_n) X(relax_sem_iters) X(relax_sem_ns)                                           \
+   X(relax_query_n) X(relax_query_iters) X(relax_query_ns)                                     \
+   X(rd_msgs) X(rd_bytes) X(rdpush_n) X(rdpush_bytes) X(rdpush_ns) X(rdsignal_n)               \
+   X(push_msgs) X(push_bytes) X(push_ranges)                                                   \
+   X(send_n) X(send_ns) X(send_bytes) X(send_max_ns)                                           \
+   X(lock_n) X(lock_ns) X(lock_max_ns)                                                         \
+   X(flush_n) X(flush_ns) X(flush_sent_n)                                                      \
+   X(pump_loops) X(pump_sleeps) X(pump_sleep_ns)
+
+enum wbvn_stat {
+#define X(name) S_##name,
+   WBVN_STAT_LIST(X)
+#undef X
+   S_COUNT
+};
+
+static const char *const stat_names[S_COUNT] = {
+#define X(name) #name,
+   WBVN_STAT_LIST(X)
+#undef X
+};
+
+static bool g_stats_on;
+static FILE *g_stats_file;
+static int64_t g_qpc_freq;
+static int64_t g_stats_t0, g_stats_last;
+static volatile LONG64 g_stat[S_COUNT];
+static int64_t g_stat_prev[S_COUNT];
+static int64_t g_stat_peak[S_COUNT];
+
+/* Nanoseconds on a monotonic clock; 0 when statistics are off, so callers test the result. */
+static inline int64_t
+stat_now(void)
+{
+   if (!g_stats_on)
+      return 0;
+   LARGE_INTEGER c;
+   QueryPerformanceCounter(&c);
+   return (c.QuadPart / g_qpc_freq) * 1000000000 + (c.QuadPart % g_qpc_freq) * 1000000000 / g_qpc_freq;
+}
+
+static inline void
+stat_add(enum wbvn_stat s, int64_t v)
+{
+   if (g_stats_on)
+      InterlockedExchangeAdd64(&g_stat[s], v);
+}
+
+static inline void
+stat_max(enum wbvn_stat s, int64_t v)
+{
+   if (!g_stats_on)
+      return;
+   LONG64 cur = g_stat[s];
+   while (cur < v) {
+      const LONG64 seen = InterlockedCompareExchange64(&g_stat[s], v, cur);
+      if (seen == cur)
+         break;
+      cur = seen;
+   }
+}
+
+static bool
+stat_is_max(enum wbvn_stat s)
+{
+   const size_t n = strlen(stat_names[s]);
+   return n > 7 && !strcmp(stat_names[s] + n - 7, "_max_ns");
+}
+
+static void
+stats_init(void)
+{
+   char path[MAX_PATH];
+   if (g_stats_on || !GetEnvironmentVariableA("WBVN_STATS", path, sizeof(path)))
+      return;
+   LARGE_INTEGER f;
+   QueryPerformanceFrequency(&f);
+   g_qpc_freq = f.QuadPart;
+   g_stats_file = fopen(path, "a");
+   if (!g_stats_file)
+      return;
+   g_stats_on = true;
+   g_stats_t0 = g_stats_last = stat_now();
+}
+
+/* Writes the counters: once a second the change since the last line, at the end the totals.
+ * Only the pump thread calls it while the pump runs, and the destroy path after it ended. */
+static void
+stats_tick(bool final)
+{
+   if (!g_stats_on)
+      return;
+   const int64_t now = stat_now();
+   if (!final && now - g_stats_last < 1000000000)
+      return;
+   g_stats_last = now;
+
+   char line[4096];
+   int n = snprintf(line, sizeof(line), "%s t=%.1fs", final ? "TOTAL" : "interval",
+                    (double)(now - g_stats_t0) / 1e9);
+   bool active = final;
+   for (int i = 0; i < S_COUNT; i++) {
+      int64_t v;
+      if (stat_is_max(i)) {
+         v = InterlockedExchange64(&g_stat[i], 0);
+         if (v > g_stat_peak[i])
+            g_stat_peak[i] = v;
+         if (final)
+            v = g_stat_peak[i];
+      } else {
+         const int64_t total = g_stat[i];
+         v = final ? total : total - g_stat_prev[i];
+         g_stat_prev[i] = total;
+      }
+      if (!v)
+         continue;
+      if (i < S_flush_n && !stat_is_max(i))
+         active = true;
+      const char *name = stat_names[i];
+      const size_t len = strlen(name);
+      if (len > 3 && !strcmp(name + len - 3, "_ns"))
+         n += snprintf(line + n, sizeof(line) - n, " %.*s_ms=%.2f", (int)(len - 3), name,
+                       (double)v / 1e6);
+      else
+         n += snprintf(line + n, sizeof(line) - n, " %s=%lld", name, (long long)v);
+      if (n >= (int)sizeof(line) - 64)
+         break;
+   }
+   if (active) {
+      fprintf(g_stats_file, "%s\n", line);
+      fflush(g_stats_file);
+   }
+}
+
+/* Called by Mesa when a wait in vn_ring.c / vn_query_pool.c / vn_sync.c ends (see the
+ * `vn_relax` patch): `iters` polls, the first 255 only yield, the rest sleep. */
+void
+wbvn_stats_relax(unsigned reason, uint32_t iters, int64_t ns)
+{
+   if (!g_stats_on || reason > 4)
+      return;
+   const enum wbvn_stat base = S_relax_ring_n + reason * 3;
+   stat_add(base, 1);
+   stat_add(base + 1, iters);
+   stat_add(base + 2, ns);
+}
+
+/* The pump holds push_lock and mu for most of every iteration (flush_ns was 86% of the time in the
+ * first trace, and a submit took 3 ms on average). A thread that wants either may keep losing the
+ * race, because an SRW lock does not necessarily hand over to a waiter that has not run yet when
+ * the holder takes it again at once [INFERENCE; the A/B run is the evidence]. Threads announce
+ * themselves here and the pump yields until they hold the lock. lock_n counts only the waits
+ * that took 20 us or more. */
+static void
+lock_excl(struct wbvn *w, SRWLOCK *l)
+{
+   InterlockedIncrement(&w->contenders);
+   const int64_t t0 = stat_now();
+   AcquireSRWLockExclusive(l);
+   InterlockedDecrement(&w->contenders);
+   if (t0) {
+      const int64_t d = stat_now() - t0;
+      stat_add(S_lock_ns, d);
+      if (d >= 20000) {
+         stat_add(S_lock_n, 1);
+         stat_max(S_lock_max_ns, d);
+      }
+   }
+}
+
+static void
+lock_shared(struct wbvn *w, SRWLOCK *l)
+{
+   InterlockedIncrement(&w->contenders);
+   AcquireSRWLockShared(l);
+   InterlockedDecrement(&w->contenders);
+}
+
 /* ---------- port I/O ----------------------------------------------------------------- */
 
 static bool
@@ -228,23 +429,62 @@ static void
 wbvn_set_lost(struct wbvn *w)
 {
    InterlockedExchange(&w->lost, 1);
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    WakeAllConditionVariable(&w->cv);
    ReleaseSRWLockExclusive(&w->mu);
+}
+
+/* Appends one message, header and payload, to `b`. */
+static bool
+frame_put(struct wbvn_buf *b, uint32_t kind, uint32_t req, uint32_t arg, const void *payload,
+          size_t len)
+{
+   const struct wbvn_hdr h = { .len = (uint32_t)len, .kind = kind, .req = req, .arg = arg };
+   const size_t keep = b->len;
+   if (buf_put(b, &h, sizeof(h)) && (!len || buf_put(b, payload, len)))
+      return true;
+   b->len = keep;
+   return false;
+}
+
+/* Writes whole messages in one go. Every write on the port is a trip to the host, so the header
+ * and payload of a message, and the messages one flush produces, share one. */
+static bool
+wire_write(struct wbvn *w, const void *data, size_t len)
+{
+   bool ok;
+   const int64_t t0 = stat_now();
+   AcquireSRWLockExclusive(&w->write_lock);
+   ok = !w->lost && port_xfer(w, w->write_event, true, (void *)data, len);
+   ReleaseSRWLockExclusive(&w->write_lock);
+   if (t0) {
+      const int64_t d = stat_now() - t0;
+      stat_add(S_send_n, 1);
+      stat_add(S_send_ns, d);
+      stat_add(S_send_bytes, (int64_t)len);
+      stat_max(S_send_max_ns, d);
+   }
+   if (!ok)
+      wbvn_set_lost(w);
+   return ok;
 }
 
 static bool
 wbvn_send(struct wbvn *w, uint32_t kind, uint32_t req, uint32_t arg,
           const void *payload, size_t len)
 {
-   struct wbvn_hdr h = { .len = (uint32_t)len, .kind = kind, .req = req, .arg = arg };
-   bool ok;
-   AcquireSRWLockExclusive(&w->write_lock);
-   ok = !w->lost && port_xfer(w, w->write_event, true, &h, sizeof(h)) &&
-        (!len || port_xfer(w, w->write_event, true, (void *)payload, len));
-   ReleaseSRWLockExclusive(&w->write_lock);
-   if (!ok)
-      wbvn_set_lost(w);
+   struct wbvn_buf b = { 0 };
+   const bool ok = frame_put(&b, kind, req, arg, payload, len) && wire_write(w, b.data, b.len);
+   free(b.data);
+   return ok;
+}
+
+/* Writes the frames a flush built. The caller holds push_lock. */
+static bool
+wbvn_out_write(struct wbvn *w)
+{
+   const bool ok = !w->out.len || wire_write(w, w->out.data, w->out.len);
+   w->out.len = 0;
    return ok;
 }
 
@@ -255,15 +495,16 @@ wbvn_request(struct wbvn *w, uint32_t kind, uint32_t arg, const void *payload,
              size_t len, uint8_t **out, uint32_t *out_len)
 {
    int64_t result = -1;
+   const int64_t t0 = stat_now();
    AcquireSRWLockExclusive(&w->req_lock);
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    uint32_t req = ++w->req_seq;
    w->reply.done = false;
    w->reply.req = req;
    ReleaseSRWLockExclusive(&w->mu);
 
    if (wbvn_send(w, kind, req, arg, payload, len)) {
-      AcquireSRWLockExclusive(&w->mu);
+      lock_excl(w, &w->mu);
       DWORD64 start = GetTickCount64();
       while (!w->reply.done && !w->lost) {
          DWORD64 spent = GetTickCount64() - start;
@@ -285,7 +526,54 @@ wbvn_request(struct wbvn *w, uint32_t kind, uint32_t arg, const void *payload,
       ReleaseSRWLockExclusive(&w->mu);
    }
    ReleaseSRWLockExclusive(&w->req_lock);
+   if (t0) {
+      stat_add(S_req_n, 1);
+      stat_add(S_req_ns, stat_now() - t0);
+   }
    return result;
+}
+
+/* Measures the round trip of the channel with nothing else running: the host echoes the
+ * payload, so the large size also gives the throughput of a write and a read in series. */
+static void
+wbvn_stats_ping(struct wbvn *w)
+{
+   if (!g_stats_on)
+      return;
+   static const uint32_t sizes[] = { 16, 4096, 65536, 1048576 };
+   uint8_t *buf = calloc(1, sizes[3]);
+   if (!buf)
+      return;
+   for (unsigned s = 0; s < ARRAY_SIZE(sizes); s++) {
+      const int rounds = sizes[s] >= 65536 ? 16 : 64;
+      int64_t min = INT64_MAX, total = 0;
+      int done = 0;
+      for (; done < rounds; done++) {
+         const int64_t t0 = stat_now();
+         if (wbvn_request(w, WBVN_PING, 0, buf, sizes[s], NULL, NULL) != 0)
+            break;
+         const int64_t d = stat_now() - t0;
+         total += d;
+         if (d < min)
+            min = d;
+      }
+      if (done)
+         fprintf(g_stats_file, "ping %u B: min %.0f us avg %.0f us over %d\n", sizes[s],
+                 (double)min / 1e3, (double)total / done / 1e3, done);
+   }
+   int64_t smin = INT64_MAX, stotal = 0;
+   for (int i = 0; i < 32; i++) {
+      const int64_t t0 = stat_now();
+      Sleep(1);
+      const int64_t d = stat_now() - t0;
+      stotal += d;
+      if (d < smin)
+         smin = d;
+   }
+   fprintf(g_stats_file, "Sleep(1): min %.0f us avg %.0f us over 32\n", (double)smin / 1e3,
+           (double)stotal / 32 / 1e3);
+   fflush(g_stats_file);
+   free(buf);
 }
 
 /* ---------- mirror ------------------------------------------------------------------- */
@@ -372,39 +660,46 @@ scan_region(struct wbvn_region *s, struct wbvn_buf *b, uint32_t *status_clear)
    return ranges;
 }
 
+/* Appends a PUSH message made of the ranges in `body` to `out`. */
 static bool
-send_push(struct wbvn *w, struct wbvn_buf *body, uint32_t count)
+frame_put_push(struct wbvn_buf *out, const struct wbvn_buf *body, uint32_t count)
 {
-   struct wbvn_push_hdr h = { .count = count };
-   struct wbvn_buf msg = { 0 };
-   bool ok = buf_put(&msg, &h, sizeof(h)) && buf_put(&msg, body->data, body->len) &&
-             wbvn_send(w, WBVN_PUSH, 0, 0, msg.data, msg.len);
-   free(msg.data);
-   return ok;
+   stat_add(S_push_msgs, 1);
+   stat_add(S_push_bytes, body->len);
+   stat_add(S_push_ranges, count);
+   const struct wbvn_push_hdr ph = { .count = count };
+   const struct wbvn_hdr h = { .len = (uint32_t)(sizeof(ph) + body->len), .kind = WBVN_PUSH };
+   const size_t keep = out->len;
+   if (buf_put(out, &h, sizeof(h)) && buf_put(out, &ph, sizeof(ph)) &&
+       buf_put(out, body->data, body->len))
+      return true;
+   out->len = keep;
+   return false;
 }
 
-/* Sends the words the guest changed to the host. The ring goes last, and was read first,
- * so the tail never arrives ahead of the commands it covers. Returns true if anything was
- * sent. The caller holds push_lock. */
+/* Builds the messages that bring the host up to date into w->out: the words the guest changed.
+ * The ring goes last, and was read first, so the tail never arrives ahead of the commands it
+ * covers. Returns true if there is anything to send. The caller holds push_lock and writes
+ * w->out with wbvn_out_write, after adding messages of its own if it has any. */
 static bool
-wbvn_flush_push(struct wbvn *w)
+wbvn_flush_build(struct wbvn *w)
 {
    struct wbvn_buf ring = { 0 };
    struct wbvn_buf *body = &w->scratch;
+   struct wbvn_buf *out = &w->out;
    uint32_t ring_count = 0, count = 0;
    bool sent = false;
+   const int64_t flush_start = stat_now();
    body->len = 0;
 
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    /* roles first, so the host never sees ring data without knowing it is a ring */
    for (uint32_t id = 1; id < w->regions.cap; id++) {
       struct wbvn_region *s = w->regions.v[id];
       if (s && !s->role_sent && region_ring_id(s)) {
          s->role_sent = true;
          const uint64_t ring_id = region_ring_id(s);
-         ReleaseSRWLockExclusive(&w->mu);
-         wbvn_send(w, WBVN_SHM_ROLE, 0, s->res_id, &ring_id, sizeof(ring_id));
-         AcquireSRWLockExclusive(&w->mu);
+         sent |= frame_put(out, WBVN_SHM_ROLE, 0, s->res_id, &ring_id, sizeof(ring_id));
       }
    }
    for (uint32_t id = 1; id < w->regions.cap; id++) {
@@ -416,8 +711,7 @@ wbvn_flush_push(struct wbvn *w)
             ring_count += n;
          if (clear) {
             const uint32_t op[2] = { WBVN_RING_STATUS, clear };
-            wbvn_send(w, WBVN_STATUS_CLEAR, 0, s->res_id, op, sizeof(op));
-            sent = true;
+            sent |= frame_put(out, WBVN_STATUS_CLEAR, 0, s->res_id, op, sizeof(op));
          }
       }
    }
@@ -429,25 +723,41 @@ wbvn_flush_push(struct wbvn *w)
       if (n > 0)
          count += n;
       if (body->len >= WBVN_PUSH_CHUNK) {
-         ReleaseSRWLockExclusive(&w->mu);
-         send_push(w, body, count);
-         sent = true;
+         sent |= frame_put_push(out, body, count);
          body->len = 0;
          count = 0;
-         AcquireSRWLockExclusive(&w->mu);
+         if (out->len >= WBVN_PUSH_CHUNK) {
+            ReleaseSRWLockExclusive(&w->mu);
+            wbvn_out_write(w);
+            lock_excl(w, &w->mu);
+         }
       }
    }
    ReleaseSRWLockExclusive(&w->mu);
 
-   if (count) {
-      send_push(w, body, count);
-      sent = true;
-   }
-   if (ring_count) {
-      send_push(w, &ring, ring_count);
-      sent = true;
-   }
+   if (count)
+      sent |= frame_put_push(out, body, count);
+   if (ring_count)
+      sent |= frame_put_push(out, &ring, ring_count);
    free(ring.data);
+   if (sent)
+      w->flush_gen++;
+   if (flush_start) {
+      stat_add(S_flush_n, 1);
+      stat_add(S_flush_ns, stat_now() - flush_start);
+      if (sent)
+         stat_add(S_flush_sent_n, 1);
+   }
+   return sent;
+}
+
+/* Sends the words the guest changed to the host. Returns true if anything was sent. The caller
+ * holds push_lock. */
+static bool
+wbvn_flush_push(struct wbvn *w)
+{
+   const bool sent = wbvn_flush_build(w);
+   wbvn_out_write(w);
    return sent;
 }
 
@@ -473,7 +783,7 @@ wbvn_apply_push(struct wbvn *w, const uint8_t *p, uint32_t len)
       pos += sizeof(r) + r.len;
    }
 
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    for (uint32_t i = n; i-- > 0;) {
       memcpy(&r, ranges[i], sizeof(r));
       struct wbvn_region *s = tab_get(&w->regions, r.res_id);
@@ -499,7 +809,7 @@ wbvn_apply_signals(struct wbvn *w, const uint8_t *p, uint32_t len)
    if (len < sizeof(h))
       return;
    memcpy(&h, p, sizeof(h));
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    for (uint32_t i = 0; i < h.count; i++) {
       size_t at = sizeof(h) + (size_t)i * sizeof(struct wbvn_sync_point);
       struct wbvn_sync_point sp;
@@ -532,8 +842,10 @@ wbvn_reader(LPVOID arg)
          break;
       }
 
+      stat_add(S_rd_msgs, 1);
+      stat_add(S_rd_bytes, (int64_t)(sizeof(h) + h.len));
       if (h.kind & WBVN_REPLY) {
-         AcquireSRWLockExclusive(&w->mu);
+         lock_excl(w, &w->mu);
          if (!w->reply.done && h.req == w->reply.req) {
             w->reply.done = true;
             w->reply.arg = h.arg;
@@ -544,8 +856,15 @@ wbvn_reader(LPVOID arg)
          WakeAllConditionVariable(&w->cv);
          ReleaseSRWLockExclusive(&w->mu);
       } else if (h.kind == WBVN_PUSH) {
+         const int64_t t0 = stat_now();
          wbvn_apply_push(w, payload, h.len);
+         if (t0) {
+            stat_add(S_rdpush_n, 1);
+            stat_add(S_rdpush_bytes, h.len);
+            stat_add(S_rdpush_ns, stat_now() - t0);
+         }
       } else if (h.kind == WBVN_SYNC_SIGNAL) {
+         stat_add(S_rdsignal_n, 1);
          wbvn_apply_signals(w, payload, h.len);
       } else if (h.kind == WBVN_LOST) {
          free(payload);
@@ -565,11 +884,20 @@ wbvn_pump(LPVOID arg)
 {
    struct wbvn *w = arg;
    uint32_t idle = 0;
+   LONG seen = 0;
    while (!w->quit && !w->lost) {
+      if (w->contenders) {
+         SwitchToThread();
+         continue;
+      }
       AcquireSRWLockExclusive(&w->push_lock);
       bool sent = wbvn_flush_push(w);
       ReleaseSRWLockExclusive(&w->push_lock);
-      if (sent) {
+      stat_add(S_pump_loops, 1);
+      /* a flush by another thread is activity too: the application is running */
+      const LONG gen = w->flush_gen;
+      if (sent || gen != seen) {
+         seen = gen;
          idle = 0;
       } else if (idle < 4000) {
          idle++;
@@ -578,14 +906,21 @@ wbvn_pump(LPVOID arg)
          else
             YieldProcessor();
       } else {
+         const int64_t t0 = stat_now();
          Sleep(1);
+         if (t0) {
+            stat_add(S_pump_sleeps, 1);
+            stat_add(S_pump_sleep_ns, stat_now() - t0);
+         }
       }
+      stats_tick(false);
    }
    return 0;
 }
 
-/* A Sleep(1) lasts a whole 15.6 ms timer tick by default, and every wait for the host (the relax
- * loop in vn_ring, the pump) pays that once per round trip. Ask for 0.5 ms while a renderer lives. */
+/* Asks for a 0.5 ms timer resolution while a renderer lives. In the Build VM guest Sleep(1) still
+ * lasted 4.5 to 6 ms (WBVN_STATS measures it at start-up; the default tick is 15.6 ms) and so did
+ * a high-resolution waitable timer, so nothing on the hot path may depend on a timed sleep. */
 static void
 wbvn_timer_resolution(bool fine)
 {
@@ -611,6 +946,7 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       CloseHandle(w->pump);
       wbvn_timer_resolution(false);
    }
+   stats_tick(true);
    if (w->port != INVALID_HANDLE_VALUE) {
       /* unblocks the reader */
       CancelIoEx(w->port, NULL);
@@ -628,6 +964,7 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    free(w->regions.v);
    free(w->syncs.v);
    free(w->scratch.data);
+   free(w->out.data);
    free(w->reply.payload);
    vk_free(alloc, w);
 }
@@ -661,6 +998,7 @@ wbvn_submit(struct vn_renderer *renderer,
             const struct vn_renderer_submit_batch *batch)
 {
    struct wbvn *w = (struct wbvn *)renderer;
+   const int64_t submit_start = stat_now();
    if (w->lost)
       return VK_ERROR_DEVICE_LOST;
 
@@ -671,10 +1009,15 @@ wbvn_submit(struct vn_renderer *renderer,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
-   AcquireSRWLockExclusive(&w->push_lock);
-   wbvn_flush_push(w);
-   ok = wbvn_send(w, WBVN_SUBMIT, 0, 0, msg.data, msg.len);
+   lock_excl(w, &w->push_lock);
+   wbvn_flush_build(w);
+   ok = frame_put(&w->out, WBVN_SUBMIT, 0, 0, msg.data, msg.len) && wbvn_out_write(w);
    ReleaseSRWLockExclusive(&w->push_lock);
+   if (submit_start) {
+      stat_add(S_submit_n, 1);
+      stat_add(S_submit_ns, stat_now() - submit_start);
+      stat_add(S_submit_bytes, (int64_t)msg.len);
+   }
    free(msg.data);
    return ok ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
 }
@@ -684,9 +1027,16 @@ wbvn_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 {
    struct wbvn *w = (struct wbvn *)renderer;
    const DWORD64 start = GetTickCount64();
+   const int64_t wait_start = stat_now();
    VkResult result = VK_SUCCESS;
 
-   AcquireSRWLockExclusive(&w->mu);
+   /* What the sync waits for may still sit in the ring or in a mirrored buffer, because the pump
+    * has not pushed it yet. The host has to see it first. */
+   lock_excl(w, &w->push_lock);
+   wbvn_flush_push(w);
+   ReleaseSRWLockExclusive(&w->push_lock);
+
+   lock_excl(w, &w->mu);
    for (;;) {
       uint32_t reached = 0;
       for (uint32_t i = 0; i < wait->sync_count; i++) {
@@ -713,6 +1063,14 @@ wbvn_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
       SleepConditionVariableSRW(&w->cv, &w->mu, ms, 0);
    }
    ReleaseSRWLockExclusive(&w->mu);
+   if (wait_start) {
+      const int64_t d = stat_now() - wait_start;
+      stat_add(S_wait_n, 1);
+      stat_add(S_wait_ns, d);
+      stat_max(S_wait_max_ns, d);
+      stat_add(d < 100000 ? S_wait_h0 : d < 500000 ? S_wait_h1 : d < 2000000 ? S_wait_h2
+               : d < 10000000 ? S_wait_h3 : S_wait_h4, 1);
+   }
    return result;
 }
 
@@ -747,14 +1105,14 @@ static bool
 region_attach(struct wbvn *w, struct wbvn_region *r, uint32_t kind, const void *payload,
               size_t len)
 {
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    r->res_id = tab_add(&w->regions, r);
    ReleaseSRWLockExclusive(&w->mu);
    if (!r->res_id)
       return false;
    if (wbvn_request(w, kind, r->res_id, payload, len, NULL, NULL) == 0)
       return true;
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    tab_del(&w->regions, r->res_id);
    ReleaseSRWLockExclusive(&w->mu);
    return false;
@@ -764,9 +1122,9 @@ static void
 region_detach(struct wbvn *w, struct wbvn_region *r)
 {
    /* the host may still have to see the last words before the resource goes away */
-   AcquireSRWLockExclusive(&w->push_lock);
+   lock_excl(w, &w->push_lock);
    wbvn_flush_push(w);
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    tab_del(&w->regions, r->res_id);
    ReleaseSRWLockExclusive(&w->mu);
    ReleaseSRWLockExclusive(&w->push_lock);
@@ -850,7 +1208,7 @@ wbvn_bo_create_from_device_memory(struct vn_renderer *renderer,
       memcpy(msg.data + offsetof(struct wbvn_bo_create, batch_len), &batch_len, 4);
    }
 
-   AcquireSRWLockExclusive(&w->push_lock);
+   lock_excl(w, &w->push_lock);
    wbvn_flush_push(w);
    ok = ok && region_attach(w, &bo->r, WBVN_BO_CREATE, msg.data, msg.len);
    ReleaseSRWLockExclusive(&w->push_lock);
@@ -895,7 +1253,7 @@ wbvn_bo_flush(struct vn_renderer *renderer, struct vn_renderer_bo *bo,
               VkDeviceSize offset, VkDeviceSize size)
 {
    struct wbvn *w = (struct wbvn *)renderer;
-   AcquireSRWLockExclusive(&w->push_lock);
+   lock_excl(w, &w->push_lock);
    wbvn_flush_push(w);
    ReleaseSRWLockExclusive(&w->push_lock);
 }
@@ -915,7 +1273,7 @@ wbvn_sync_create(struct vn_renderer *renderer, uint64_t initial_val,
    if (!s)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    s->value = initial_val;
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    s->base.sync_id = tab_add(&w->syncs, s);
    ReleaseSRWLockExclusive(&w->mu);
    if (!s->base.sync_id) {
@@ -931,7 +1289,7 @@ wbvn_sync_destroy(struct vn_renderer *renderer, struct vn_renderer_sync *_sync)
 {
    struct wbvn *w = (struct wbvn *)renderer;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    tab_del(&w->syncs, s->base.sync_id);
    ReleaseSRWLockExclusive(&w->mu);
    free(s);
@@ -943,7 +1301,7 @@ wbvn_sync_write(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
 {
    struct wbvn *w = (struct wbvn *)renderer;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
-   AcquireSRWLockExclusive(&w->mu);
+   lock_excl(w, &w->mu);
    s->value = val;
    WakeAllConditionVariable(&w->cv);
    ReleaseSRWLockExclusive(&w->mu);
@@ -962,7 +1320,7 @@ wbvn_sync_read(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
 {
    struct wbvn *w = (struct wbvn *)renderer;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
-   AcquireSRWLockShared(&w->mu);
+   lock_shared(w, &w->mu);
    *val = s->value;
    ReleaseSRWLockShared(&w->mu);
    return VK_SUCCESS;
@@ -973,6 +1331,7 @@ wbvn_sync_read(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
 static VkResult
 wbvn_init(struct wbvn *w)
 {
+   stats_init();
    InitializeSRWLock(&w->write_lock);
    InitializeSRWLock(&w->push_lock);
    InitializeSRWLock(&w->mu);
@@ -1063,6 +1422,7 @@ wbvn_init(struct wbvn *w)
    w->base.sync_ops.write = wbvn_sync_write;
 
    wbvn_timer_resolution(true);
+   wbvn_stats_ping(w);
    w->pump = CreateThread(NULL, 0, wbvn_pump, w, 0, NULL);
    if (!w->pump)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
