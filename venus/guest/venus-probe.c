@@ -3,15 +3,30 @@
 /*
  * Loads the Venus ICD directly (no Vulkan loader) and walks the first calls a driver must get
  * right: instance, physical device, properties, memory types, queues, device, a buffer.
- * Usage: venus-probe.exe [path\to\vulkan_virtio.dll]
+ * Usage: venus-probe.exe [path\to\vulkan_virtio.dll]. It also builds on Linux against Mesa's
+ * libvulkan_virtio.so, which is how the command streams of both builds are compared.
  */
 
+#ifdef _WIN32
 #include <windows.h>
+#define LOAD_DRIVER(path) LoadLibraryA(path)
+#define DRIVER_SYMBOL(lib, name) GetProcAddress(lib, name)
+#define DRIVER_DEFAULT "vulkan_virtio.dll"
+typedef HMODULE driver_t;
+#else
+#include <dlfcn.h>
+#define LOAD_DRIVER(path) dlopen(path, RTLD_NOW)
+#define DRIVER_SYMBOL(lib, name) dlsym(lib, name)
+#define DRIVER_DEFAULT "libvulkan_virtio.so"
+typedef void *driver_t;
+#endif
 #include <stdio.h>
 #include <string.h>
 
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr)(VkInstance, const char *);
@@ -31,16 +46,16 @@ int
 main(int argc, char **argv)
 {
    setvbuf(stdout, NULL, _IONBF, 0);
-   const char *path = argc > 1 ? argv[1] : "vulkan_virtio.dll";
-   HMODULE dll = LoadLibraryA(path);
+   const char *path = argc > 1 ? argv[1] : DRIVER_DEFAULT;
+   driver_t dll = LOAD_DRIVER(path);
    if (!dll) {
-      printf("FAIL LoadLibrary(%s): %lu\n", path, GetLastError());
+      printf("FAIL cannot load %s\n", path);
       return 1;
    }
    PFN_icdNegotiate negotiate =
-      (PFN_icdNegotiate)GetProcAddress(dll, "vk_icdNegotiateLoaderICDInterfaceVersion");
+      (PFN_icdNegotiate)DRIVER_SYMBOL(dll, "vk_icdNegotiateLoaderICDInterfaceVersion");
    PFN_icdGetInstanceProcAddr gipa =
-      (PFN_icdGetInstanceProcAddr)GetProcAddress(dll, "vk_icdGetInstanceProcAddr");
+      (PFN_icdGetInstanceProcAddr)DRIVER_SYMBOL(dll, "vk_icdGetInstanceProcAddr");
    if (!negotiate || !gipa) {
       printf("FAIL the ICD does not export its entry points\n");
       return 1;
@@ -158,10 +173,11 @@ main(int argc, char **argv)
    CHECK(wait_idle(queue));
    destroy_fence(dev, fence, NULL);
 
-   /* Memory: fill a host visible buffer, copy it on the GPU into a second one, read it back.
-    * Exercises device memory creation, the mapping, the guest-to-host push before the submit
-    * and the host-to-guest push when the fence retires. */
-   {
+   /* Memory (skipped when the second argument is `basic`, which is what a Linux run on a driver
+    * that cannot map host-visible memory through vtest uses): fill a host visible buffer, copy it
+    * on the GPU into a second one, read it back. Exercises device memory creation, the mapping,
+    * the guest-to-host push before the submit and the host-to-guest push when the fence retires. */
+   if (argc < 3 || strcmp(argv[2], "basic") != 0) {
 #define DEV(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
       DEV(vkCreateBuffer);
       DEV(vkGetBufferMemoryRequirements);
