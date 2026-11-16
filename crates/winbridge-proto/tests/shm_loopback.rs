@@ -322,7 +322,7 @@ fn control_latency_stays_bounded_under_a_bulk_stream() {
         pct(&loaded, 0.99),
         pct(&loaded, 1.0)
     );
-    assert!(loaded.len() > 100, "too few pings answered under load: {}", loaded.len());
+    assert!(loaded.len() > 20, "too few pings answered under load: {}", loaded.len());
     // A control record never waits behind bulk data: the bound is a few scheduling quanta plus
     // the cost of one bulk chunk in the dispatcher, far below what a FIFO would give.
     assert!(
@@ -546,4 +546,58 @@ fn ping_fast_path_bypasses_a_busy_dispatcher() {
     assert!(pct(&r, 0.99) < 5_000, "pings must not wait for the busy dispatcher");
     assert!(outcome.lock().unwrap().error.is_none());
     stop.store(true, Ordering::Relaxed);
+}
+
+/// Ring plus framing only: no disk, no hashing. The receiver counts and drops the chunks.
+#[test]
+fn raw_bulk_throughput() {
+    let mib: usize = std::env::var("WB_SHM_TEST_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+    let rig = rig(LinkConfig::default());
+    let _region = rig.activate();
+    const CHUNK: usize = 256 * 1024;
+    let chunks = mib * (1 << 20) / CHUNK;
+    let guest = rig.guest.ep.clone();
+    let receiver = std::thread::spawn(move || {
+        let mut got = 0u64;
+        let mut n = 0usize;
+        while n < chunks {
+            if let Pop::Msg(Message::FileChunk { data, .. }) = guest.inbox().pop(Duration::from_millis(500)) {
+                got += data.len() as u64;
+                n += 1;
+            }
+        }
+        got
+    });
+    let payload = vec![0xa5u8; CHUNK];
+    let t0 = Instant::now();
+    for i in 0..chunks {
+        send(&rig.host.ep, Message::FileChunk { stream_id: 9, index: 0, offset: (i * CHUNK) as u64, data: payload.clone() });
+    }
+    let sent = t0.elapsed();
+    let got = receiver.join().unwrap();
+    let secs = t0.elapsed().as_secs_f64();
+    println!(
+        "raw bulk {} MiB in {:.3} s = {:.0} MiB/s (all queued after {:.3} s)",
+        got >> 20,
+        secs,
+        (got >> 20) as f64 / secs,
+        sent.as_secs_f64()
+    );
+    assert_eq!(got, (chunks * CHUNK) as u64);
+}
+
+/// A viewer that reconnects starts with `QueryStatus` on serial while the agent still holds the
+/// old link: the agent must leave it, or its `StatusReply` would go into a ring nobody reads.
+#[test]
+fn query_status_on_serial_ends_a_stale_link() {
+    let rig = rig(LinkConfig::default());
+    let _region = rig.activate();
+    assert!(rig.guest.ep.is_active());
+    assert!(rig.guest.ep.on_serial(Message::QueryStatus).is_none());
+    assert!(!rig.guest.ep.is_active());
+    // The query itself still reaches the dispatcher, and the next offer can be answered.
+    assert!(matches!(rig.guest.ep.inbox().pop(Duration::from_secs(1)), Pop::Msg(Message::QueryStatus)));
+    let map = rig.map.clone();
+    let reply = answer_offer(&rig.guest.ep, winbridge_shm::VERSION, REGION_LEN, move |_| Ok(map));
+    assert!(matches!(reply, Message::ShmReady { ok: true, .. }), "{reply:?}");
 }

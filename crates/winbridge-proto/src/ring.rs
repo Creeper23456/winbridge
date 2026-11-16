@@ -1202,6 +1202,7 @@ impl Endpoint {
             }
             m @ (Message::ShmOffer { .. } | Message::ShmReady { .. }) => Some(m),
             m => {
+                self.session_start_check(&m);
                 self.inbox.push(Source::Serial, m);
                 None
             }
@@ -1215,7 +1216,20 @@ impl Endpoint {
             Message::ShmKick | Message::ShmFallback { .. } | Message::ShmOffer { .. } | Message::ShmReady { .. } => {
                 Ok(self.on_serial(msg))
             }
-            m => self.inbox.try_push(Source::Serial, m).map(|()| None),
+            m => {
+                self.session_start_check(&m);
+                self.inbox.try_push(Source::Serial, m).map(|()| None)
+            }
+        }
+    }
+
+    /// The host sends everything over the lanes while a link is active, so a `QueryStatus` that
+    /// arrives on serial starts a new host session (viewer restart or reconnect): the old link
+    /// is stale and its replies would go nowhere. Leave it so the reply, and the host's new
+    /// offer, take the serial path.
+    fn session_start_check(&self, msg: &Message) {
+        if matches!(msg, Message::QueryStatus) && self.is_active() {
+            self.leave("the host started a new serial session");
         }
     }
 

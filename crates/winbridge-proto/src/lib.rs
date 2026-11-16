@@ -125,6 +125,7 @@ pub enum Message {
     DropFileChunk {
         transfer_id: u32,
         offset: u64,
+        #[serde(with = "bytes")]
         data: Vec<u8>,
     },
     /// Finalize drag-and-drop file transfer.
@@ -156,6 +157,7 @@ pub enum Message {
     ClipboardItem {
         clip_id: u32,
         format: ClipboardFormat,
+        #[serde(with = "bytes")]
         data: Vec<u8>,
     },
 
@@ -178,6 +180,7 @@ pub enum Message {
         stream_id: u32,
         index: u32,
         offset: u64,
+        #[serde(with = "bytes")]
         data: Vec<u8>,
     },
     /// Ends a file stream.
@@ -310,8 +313,7 @@ pub enum ProtoError {
 
 /// Encodes a message into a complete wire frame (magic + 4-byte length + payload).
 pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtoError> {
-    let payload = bincode::serialize(msg)?;
-    let payload_len = payload.len();
+    let payload_len = bincode::serialized_size(msg)? as usize;
     if payload_len > MAX_PAYLOAD_SIZE {
         return Err(ProtoError::PayloadTooLarge {
             size: payload_len,
@@ -319,11 +321,55 @@ pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtoError> {
         });
     }
 
+    // One allocation and one pass: header first, then the payload serialized in place.
     let mut frame = Vec::with_capacity(HEADER_LEN + payload_len);
     frame.extend_from_slice(&MAGIC);
     frame.extend_from_slice(&(payload_len as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
+    bincode::serialize_into(&mut frame, msg)?;
     Ok(frame)
+}
+
+/// `Vec<u8>` fields as one byte string. The bincode wire bytes are exactly those of the default
+/// sequence encoding (`u64` length, then the bytes), but serialization and deserialization copy
+/// the data in one step instead of visiting it byte by byte.
+mod bytes {
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(data)
+    }
+
+    struct Buf;
+
+    impl<'de> Visitor<'de> for Buf {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a byte string")
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
+            while let Some(b) = seq.next_element()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        d.deserialize_byte_buf(Buf)
+    }
 }
 
 /// Writes a framed message to a synchronous writer.
@@ -601,6 +647,18 @@ mod tests {
         assert!(decode_frame(&longer).is_err());
         assert!(decode_frame(&frame[..frame.len() - 1]).is_err());
         assert!(decode_frame(&frame[..4]).is_err());
+    }
+
+    /// Byte payloads keep the wire bytes of a plain `Vec<u8>` (an older peer must still decode them).
+    #[test]
+    fn byte_fields_keep_the_sequence_encoding() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Fast(#[serde(with = "bytes")] Vec<u8>);
+        for data in [vec![], vec![7u8], (0..=255u8).cycle().take(70_000).collect::<Vec<_>>()] {
+            let plain = bincode::serialize(&data).unwrap();
+            assert_eq!(bincode::serialize(&Fast(data.clone())).unwrap(), plain);
+            assert_eq!(bincode::deserialize::<Fast>(&plain).unwrap(), Fast(data));
+        }
     }
 
     /// `bincode` is positional: existing variants keep their index, the shared-memory
