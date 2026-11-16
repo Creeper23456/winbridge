@@ -419,9 +419,11 @@ impl<R: Renderer> Session<R> {
     fn on_push(&mut self, p: &[u8]) {
         let ranges = proto::parse_push(p);
         let mut moved = Vec::new();
+        // Last range first: the tail comes first in a push and must land after the commands it covers.
         for r in ranges.iter().rev() {
             match self.shms.get_mut(&r.res_id) {
                 Some(s) if r.offset as usize + r.data.len() <= s.size => {
+                    std::sync::atomic::fence(Ordering::Release);
                     s.apply(r.offset as usize, r.data);
                     let end = r.offset as usize + r.data.len();
                     if s.ring && r.offset <= proto::RING_TAIL && end > proto::RING_TAIL as usize {

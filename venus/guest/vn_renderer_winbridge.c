@@ -10,7 +10,8 @@
  * header for the ordering rules). Timeline syncs live in the guest; the host only reports
  * the points that its fences retired.
  *
- * Device memory is not implemented yet: `create_from_device_memory` fails.
+ * Host-visible device memory is a bo whose host copy is a mappable blob; it is mirrored by
+ * the same scan-and-push scheme and brought up to date when a fence retires.
  */
 
 #include <windows.h>
@@ -34,6 +35,8 @@
 
 /* Offset of the status word in a ring shmem (`struct layout` in `vn_ring_get_layout`). */
 #define WBVN_RING_STATUS 128u
+/* Offset of the tail word. The guest is its only writer. */
+#define WBVN_RING_TAIL 64u
 
 /* A table of pointers indexed by a small nonzero id. */
 struct wbvn_tab {
@@ -303,6 +306,12 @@ push_range(struct wbvn_buf *b, uint32_t res_id, uint32_t off, const uint64_t *wo
 static int
 scan_region(struct wbvn_region *s, struct wbvn_buf *b, uint32_t *status_clear)
 {
+   const bool ring = region_ring_id(s) != 0;
+   /* The tail is read before the write watch. Every command it covers was stored before the
+    * tail, so its page is flagged by the time the watch is read below, and the host never gets a
+    * tail whose commands are missing. The host applies a push's ranges last to first, so the
+    * tail goes first in the message. */
+   const uint64_t tail = ring ? load64(s->ptr + WBVN_RING_TAIL) : 0;
    ULONG_PTR count = s->size / WBVN_PAGE;
    DWORD gran = 0;
    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, s->ptr, s->size, s->dirty,
@@ -310,6 +319,13 @@ scan_region(struct wbvn_region *s, struct wbvn_buf *b, uint32_t *status_clear)
       return -1;
 
    int ranges = 0;
+   if (ring && tail != s->snap[WBVN_RING_TAIL / 8]) {
+      if (!push_range(b, s->res_id, WBVN_RING_TAIL, &tail, 1))
+         return -1;
+      s->snap[WBVN_RING_TAIL / 8] = tail;
+      ranges++;
+   }
+
    uint64_t page[WBVN_PAGE / 8];
    for (ULONG_PTR i = 0; i < count; i++) {
       const uint8_t *src = s->dirty[i];
@@ -317,6 +333,9 @@ scan_region(struct wbvn_region *s, struct wbvn_buf *b, uint32_t *status_clear)
       uint64_t *snap = s->snap + base_off / 8;
       for (uint32_t k = 0; k < WBVN_PAGE / 8; k++)
          page[k] = load64(src + k * 8);
+      /* only the tail value read above goes out; a newer one waits for the next scan */
+      if (ring && base_off == 0)
+         page[WBVN_RING_TAIL / 8] = snap[WBVN_RING_TAIL / 8];
 
       if (region_ring_id(s) && base_off == 0) {
          /* The status word has two writers. The host sets and clears IDLE and FATAL and the
