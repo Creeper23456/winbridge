@@ -43,3 +43,10 @@ From Linux you can type-check it with `cargo check --target x86_64-pc-windows-ms
 - Never commit private host paths, proxy credentials, personal tokens, or machine hostnames.
 - Do not run unconstrained recursive filesystem scans.
 - Use headless mock loopback or socket tests for unit and protocol verification.
+
+## Agent Workflow Rules
+- **Atomic commits.** One logical change per commit, each building and passing its own tests; never mix features, fixes, refactors, docs and unrelated formatting in one commit. Commit and push only when the user asks.
+- **Delegation chain.** A `task` subagent splits its own work and hands independent, parallelisable builds, tests, static checks and doc lookups to `task-smol` agents, then merges them into one report. Do not send the main agent a pile of unmerged results.
+- **Code belongs to the main agent.** The main agent writes and edits the code. Subagents run tests, builds, VM sessions, investigations and summaries; they do not edit repository source unless the main agent explicitly assigns them a file.
+- **No odd attribution.** No `Co-authored-by`, "Generated with", tool or model signatures in commits, source, docs or PR text.
+- **Investigate first, then decide with the user.** Find the answer with tools (code, docs, measurements, upstream sources) before asking. When a decision is the user's, present the evidence: options, measured numbers, risks, what was not verified, and a recommendation.
