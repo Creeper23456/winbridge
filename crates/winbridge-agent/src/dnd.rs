@@ -647,3 +647,75 @@ mod windows_drop {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("winbridge-dnd-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manager(root: &Path) -> DndManager {
+        let target_dir = root.join("drop");
+        fs::create_dir_all(&target_dir).unwrap();
+        DndManager {
+            transfers: HashMap::new(),
+            operations: HashMap::new(),
+            target_dir,
+            staging_root: root.join("stage"),
+        }
+    }
+
+    #[test]
+    fn a_dropped_folder_arrives_whole_under_the_first_free_name() {
+        let root = scratch("folder");
+        let photos = root.join("src").join("photos");
+        fs::create_dir_all(photos.join("sub")).unwrap();
+        fs::write(photos.join("a.txt"), b"alpha").unwrap();
+        fs::write(photos.join("sub").join("b.txt"), b"beta").unwrap();
+        let zip = root.join("sent.zip");
+        archive::pack(&[photos], archive::Dest::Windows, &zip, u64::MAX, &mut |_, _| true).unwrap();
+        let bytes = fs::read(&zip).unwrap();
+
+        let mut dnd = manager(&root);
+        fs::create_dir_all(root.join("drop").join("photos")).unwrap();
+        dnd.begin_drop(7, 0, 0, 1).unwrap();
+        dnd.start_archive(1, 7, bytes.len() as u64).unwrap();
+        let half = bytes.len() / 2;
+        dnd.write_chunk(1, 0, &bytes[..half]).unwrap();
+        dnd.write_chunk(1, half as u64, &bytes[half..]).unwrap();
+        let job = match dnd.finish_file(1, true).unwrap() {
+            Finished::Unpack(job) => job,
+            _ => panic!("a folder drop must be handed back for unpacking"),
+        };
+        assert_eq!(job.operation_id(), 7);
+
+        let mut phases = Vec::new();
+        let message = run_unpack(job, &mut |phase, _, _| phases.push(phase)).unwrap();
+        let moved = root.join("drop").join("photos (1)");
+        assert_eq!(fs::read(moved.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(moved.join("sub").join("b.txt")).unwrap(), b"beta");
+        assert!(message.contains("photos (1)"), "{}", message);
+        assert!(phases.contains(&archive::PHASE_UNPACK) && phases.contains(&archive::PHASE_DELETE));
+        assert!(!root.join("stage").join("7.zip").exists());
+        assert!(!root.join("stage").join("7").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_drop_cut_short_leaves_nothing_behind() {
+        let root = scratch("short");
+        let mut dnd = manager(&root);
+        dnd.begin_drop(3, 0, 0, 1).unwrap();
+        dnd.start_archive(1, 3, 100).unwrap();
+        dnd.write_chunk(1, 0, &[0u8; 40]).unwrap();
+        assert!(dnd.finish_file(1, true).is_err());
+        assert!(!root.join("stage").join("3.zip").exists());
+        assert_eq!(fs::read_dir(root.join("drop")).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
