@@ -1,0 +1,70 @@
+From 730d156b1df301060cf73a74d15917c11be6cd11 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 16:29:31 +0800
+Subject: [PATCH 10/10] venus: wait for the host's updates instead of sleeping
+ on Windows
+
+vn_relax sleeps with os_time_sleep after its busy-wait phase. On Windows that is Sleep(), which lasts at least one timer tick (4.5 to 6 ms measured in the build VM) however short the request. Every wait that goes through vn_relax ends with something the host sent, so the WinBridge backend counts the updates it applies and lets the wait sleep on that count: it returns as soon as one arrives, or after the requested time.
+---
+ src/virtio/vulkan/vn_common.c | 15 +++++++++++++++
+ src/virtio/vulkan/vn_common.h |  3 +++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index f4e3172..100d7f3 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -157,6 +157,14 @@ vn_watchdog_acquire(struct vn_watchdog *watchdog, bool alive)
+ /* implemented by the WinBridge renderer backend; counts waits when WBVN_STATS is set */
+ void
+ wbvn_stats_relax(unsigned reason, uint32_t iters, int64_t ns);
++/* The number of host updates the backend has applied so far. */
++uint64_t
++wbvn_push_gen(void);
++/* Waits until that number differs from `seen` or about `us` microseconds passed, and returns
++ * it. A sleep would last at least one timer tick (4.5 to 6 ms in the build VM) however short
++ * it is asked to be, and every wait here ends with an update from the host. */
++uint64_t
++wbvn_relax_wait(uint64_t seen, uint32_t us);
+ #endif
+ 
+ void
+@@ -250,6 +258,9 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+       .reason_str = vn_relax_reason_string(reason),
+       .reason = reason,
+       .start_ns = os_time_get_nano(),
++#ifdef _WIN32
++      .wake_gen = wbvn_push_gen(),
++#endif
+    };
+ }
+ 
+@@ -300,7 +311,11 @@ vn_relax(struct vn_relax_state *state)
+    }
+ 
+    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
++#ifdef _WIN32
++   state->wake_gen = wbvn_relax_wait(state->wake_gen, base_sleep_us << shift);
++#else
+    os_time_sleep(base_sleep_us << shift);
++#endif
+ }
+ 
+ struct vn_ring *
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 08ef6a1..ea0af64 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -282,6 +282,9 @@ struct vn_relax_state {
+    bool warn;
+    enum vn_relax_reason reason;
+    int64_t start_ns;
++#ifdef _WIN32
++   uint64_t wake_gen;
++#endif
+ };
+ 
+ /* TLS ring
+-- 
+2.47.3
+

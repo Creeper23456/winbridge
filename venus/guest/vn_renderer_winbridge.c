@@ -124,6 +124,8 @@ struct wbvn {
    uint8_t kick_byte;
    OVERLAPPED kick_ov;
    uint64_t beat_at; /* GetTickCount64 of the last heartbeat */
+   /* counts the host updates (pushes and signals) applied so far; guarded by mu */
+   uint64_t push_gen;
 
    SRWLOCK write_lock;
    /* serialises mirror scans with the messages that carry them */
@@ -1066,6 +1068,8 @@ wbvn_apply_push(struct wbvn *w, const uint8_t *p, uint32_t len)
          store64(s->ptr + r.offset + o, v);
       }
    }
+   w->push_gen++;
+   WakeAllConditionVariable(&w->cv);
    ReleaseSRWLockExclusive(&w->mu);
    free(ranges);
 }
@@ -1088,8 +1092,40 @@ wbvn_apply_signals(struct wbvn *w, const uint8_t *p, uint32_t len)
       if (s && s->value < sp.value)
          s->value = sp.value;
    }
+   w->push_gen++;
    WakeAllConditionVariable(&w->cv);
    ReleaseSRWLockExclusive(&w->mu);
+}
+
+/* For Mesa's `vn_relax` (patch 0010): its waits end with something the host sent, so they sleep
+ * until a host update has been applied. The count is read before the caller looks at the state
+ * and compared under the lock, so an update that lands in between is not missed. */
+uint64_t
+wbvn_push_gen(void)
+{
+   struct wbvn *w = g_renderer;
+   if (!w)
+      return 0;
+   lock_shared(w, &w->mu);
+   const uint64_t gen = w->push_gen;
+   ReleaseSRWLockShared(&w->mu);
+   return gen;
+}
+
+uint64_t
+wbvn_relax_wait(uint64_t seen, uint32_t us)
+{
+   struct wbvn *w = g_renderer;
+   if (!w) {
+      Sleep((us + 999) / 1000);
+      return seen;
+   }
+   lock_excl(w, &w->mu);
+   if (w->push_gen == seen && !w->lost)
+      SleepConditionVariableSRW(&w->cv, &w->mu, (us + 999) / 1000, 0);
+   const uint64_t gen = w->push_gen;
+   ReleaseSRWLockExclusive(&w->mu);
+   return gen;
 }
 
 /* Handles one message from the host; `payload` points into the reader's buffer. Returns false
