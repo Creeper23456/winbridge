@@ -290,6 +290,13 @@ impl ViewerWindow {
             render_framebuffer(&fb_for_draw, cr, width as f64, height as f64);
             input_for_draw.refresh_cursor();
         });
+        if stats::enabled() {
+            // Keeps the frame clock running, so the log shows how fast this desktop ticks it.
+            drawing_area.add_tick_callback(|_, _| {
+                stats::frame_tick();
+                glib::ControlFlow::Continue
+            });
+        }
 
         // Pointer enter / leave / motion. Capture is decided by the router from these.
         let motion_ctrl = EventControllerMotion::new();

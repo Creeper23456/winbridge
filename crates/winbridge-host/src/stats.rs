@@ -28,9 +28,19 @@ const GAP_LIMITS: [Duration; 5] = [
     Duration::from_millis(40),
 ];
 static GAPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static FRAME_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn enable() {
     ENABLED.store(true, Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Relaxed)
+}
+
+/// The canvas's frame clock ticked (only counted while a tick callback keeps it running).
+pub fn frame_tick() {
+    FRAME_TICKS.fetch_add(1, Relaxed);
 }
 
 /// The clock for a measurement: `None` (and no cost) when the counters are off.
@@ -94,8 +104,9 @@ pub fn start() {
                 continue;
             }
             let gaps: Vec<u64> = GAPS.iter().map(|g| g.swap(0, Relaxed)).collect();
+            let ticks = FRAME_TICKS.swap(0, Relaxed);
             info!(
-                "display: {} updates ({} px on average, {} KiB/s, {:.1} ms in the handler), {} scanouts; {} draws ({:.1} ms, {:.1} ms of it copying the framebuffer); gaps between updates <8/<15/<20/<28/<40/more ms: {:?}",
+                "display: {} updates ({} px on average, {} KiB/s, {:.1} ms in the handler), {} scanouts; {} draws ({:.1} ms, {:.1} ms of it copying the framebuffer); frame clock ticks {}; gaps between updates <8/<15/<20/<28/<40/more ms: {:?}",
                 updates,
                 pixels.checked_div(updates).unwrap_or(0),
                 bytes / 1024,
@@ -104,6 +115,7 @@ pub fn start() {
                 draws,
                 draw_ns as f64 / 1e6,
                 copy_ns as f64 / 1e6,
+                ticks,
                 gaps,
             );
         }
