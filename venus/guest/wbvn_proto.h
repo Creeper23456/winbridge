@@ -2,10 +2,12 @@
 
 /*
  * WinBridge Venus channel (WBVN), version 1.
- *
- * Byte stream over the virtio-serial port `org.winbridge.venus.0`, little endian.
- * Every message is a 16-byte header followed by `len` payload bytes. The Rust host side
- * (`crates/winbridge-venus/src/proto.rs`) must stay identical to this file.
+ * A byte stream, little endian, carried by the records of two lanes in an ivshmem region (the
+ * guest to host lane and the host to guest lane, see `wbvn_ring.h`); a message may span several
+ * records and a record may hold several messages. A virtio-serial port `org.winbridge.venus.N`
+ * carries one wake-up byte whenever the peer has said that it sleeps. Every message is a
+ * 16-byte header followed by `len` payload bytes. The Rust host side
+ * (`crates/winbridge-venus/src/proto.rs`, `slot.rs`) must stay identical to this file.
  *
  * Venus shared memory is mirrored, not shared: each side keeps a snapshot of what the other
  * side last saw and sends the 8-byte words it changed (`WBVN_PUSH`). Ranges are applied in
@@ -15,6 +17,39 @@
 
 #ifndef WBVN_PROTO_H
 #define WBVN_PROTO_H
+
+/* ---- the ivshmem slot (`crates/winbridge-venus/src/slot.rs`) ----
+ *
+ * A guest Vulkan process maps one 64 MiB ivshmem device. The region is a `winbridge-shm` region
+ * (header page, lane directory at 0x40, rings after the header page): lane 1 carries guest to
+ * host, lane 2 host to guest, 16 MiB of data each. The host lays the region out and publishes
+ * the slot block last. */
+#define WBVN_SLOT_LEN (64ull << 20)
+#define WBVN_LANE_G2H 1u
+#define WBVN_LANE_H2G 2u
+#define WBVN_LANE_SIZE (16ull << 20)
+/* region header (`winbridge-shm`) */
+#define WBVN_SHM_MAGIC 0x004d454d48534257ull /* "WBSHMEM\0" */
+#define WBVN_SHM_VERSION 1u
+#define WBVN_SHM_HEADER_LEN 4096u
+#define WBVN_SHM_ROLE_CLIENT 3u
+#define WBVN_SHM_CAP_VENUS 1ull
+#define WBVN_SHM_DIR 0x40u
+#define WBVN_SHM_DIR_ENTRY 32u
+/* slot block in the header page */
+#define WBVN_SLOT_BLOCK 0x800u
+#define WBVN_SLOT_MAGIC 0x544f4c534e564257ull /* "WBVNSLOT" */
+#define WBVN_SLOT_VERSION 1u
+#define WBVN_SLOT_OFF_MAGIC 0x00u
+#define WBVN_SLOT_OFF_VERSION 0x08u
+#define WBVN_SLOT_OFF_ID 0x0Cu
+#define WBVN_SLOT_OFF_STATE 0x10u
+#define WBVN_SLOT_OFF_NONCE 0x18u
+#define WBVN_SLOT_OFF_HEARTBEAT 0x20u
+/* states: the host frees the slot, a guest claims it and closes it, the host resets it */
+#define WBVN_SLOT_FREE 0u
+#define WBVN_SLOT_CLAIMED 1u
+#define WBVN_SLOT_CLOSED 2u
 
 #include <stdint.h>
 

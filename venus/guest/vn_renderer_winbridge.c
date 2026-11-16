@@ -5,26 +5,39 @@
  *
  * Replaces the POSIX-only virtgpu and vtest backends. The renderer is a host process that
  * owns virglrenderer's Venus context; this file talks to it over the WBVN channel
- * (`wbvn_proto.h`) on a virtio-serial port. There is no mapping shared with the host, so every
- * venus shmem is a local allocation that is mirrored in both directions (see the protocol
- * header for the ordering rules). Timeline syncs live in the guest; the host only reports
- * the points that its fences retired.
+ * (`wbvn_proto.h`). The channel is the two lanes of an ivshmem region that this process maps
+ * for itself (a "slot", `wbvn_ring.h`); a virtio-serial port carries a wake-up byte when the
+ * peer sleeps. The guest cannot map the memory the renderer uses, so every venus shmem is a
+ * local allocation that is mirrored in both directions (see the protocol header for the
+ * ordering rules). Timeline syncs live in the guest; the host only reports the points that
+ * its fences retired.
  *
  * Host-visible device memory is a bo whose host copy is a mappable blob; it is mirrored by
  * the same scan-and-push scheme and brought up to date when a fence retires.
  */
 
 #include <windows.h>
+#include <winioctl.h>
+#include <setupapi.h>
 #include <stdio.h>
 
 #include "vn_renderer.h"
 #include "virtio/virtio-gpu/venus_hw.h"
 #include "wbvn_proto.h"
+#include "wbvn_ring.h"
 
-#define WBVN_PORT L"\\\\.\\Global\\org.winbridge.venus.0"
+#pragma comment(lib, "setupapi.lib")
 
-/* A single read or write on the port moves at most this much. */
-#define WBVN_MAX_IO (1u << 20)
+/* The serial port of slot N; it carries wake-up bytes only. */
+#define WBVN_PORT_FORMAT L"\\\\.\\Global\\org.winbridge.venus.%u"
+/* How long a claim waits for the host to free or set up a slot (WBVN_CONNECT_MS overrides). */
+#define WBVN_CONNECT_MS 5000
+/* How long the reader polls for the host before it sleeps (WBVN_SPIN_US overrides). */
+#define WBVN_SPIN_US 150
+/* A sleeping reader wakes at least this often, in case a wake-up byte was lost. */
+#define WBVN_KICK_TIMEOUT_MS 20
+/* A message goes into the ring in records of at most this size. */
+#define WBVN_RECORD_MAX (1u << 20)
 /* A mirror message for non-ring shmems is cut at about this size. */
 #define WBVN_PUSH_CHUNK (4u << 20)
 /* How long a request waits for the host's answer. */
@@ -89,6 +102,7 @@ struct wbvn {
    struct vn_renderer base;
    struct vn_instance *instance;
 
+   /* the serial port of the slot; it carries wake-up bytes only */
    HANDLE port;
    HANDLE read_event;
    HANDLE write_event;
@@ -96,6 +110,20 @@ struct wbvn {
    HANDLE pump;
    volatile LONG quit;
    volatile LONG lost;
+
+   /* the ivshmem device this process owns; the driver maps a device for one process only */
+   HANDLE bar_dev;
+   uint8_t *bar;
+   uint32_t slot_id;
+   uint64_t nonce;
+   struct wbvn_ring tx; /* guest to host */
+   struct wbvn_ring rx; /* host to guest */
+   int64_t spin_ticks;  /* QueryPerformanceCounter ticks the reader polls for */
+   /* the reader has a one-byte read pending on the port, to be woken by a wake-up byte */
+   bool kick_armed;
+   uint8_t kick_byte;
+   OVERLAPPED kick_ov;
+   uint64_t beat_at; /* GetTickCount64 of the last heartbeat */
 
    SRWLOCK write_lock;
    /* serialises mirror scans with the messages that carry them */
@@ -228,7 +256,8 @@ store64(void *p, uint64_t v)
    X(send_n) X(send_ns) X(send_bytes) X(send_max_ns)                                           \
    X(lock_n) X(lock_ns) X(lock_max_ns)                                                         \
    X(flush_n) X(flush_ns) X(flush_sent_n)                                                      \
-   X(pump_loops) X(pump_sleeps) X(pump_sleep_ns)
+   X(pump_loops) X(pump_sleeps) X(pump_sleep_ns)                                               \
+   X(kick_tx_n) X(kick_rx_n) X(rd_sleep_n) X(rd_sleep_ns) X(ringfull_n)
 
 enum wbvn_stat {
 #define X(name) S_##name,
@@ -242,6 +271,11 @@ static const char *const stat_names[S_COUNT] = {
    WBVN_STAT_LIST(X)
 #undef X
 };
+
+/* The renderer of this process, for DllMain: when the process ends without destroying its
+ * instance, the slot is closed at once instead of when the host notices a stopped heartbeat. */
+struct wbvn;
+static struct wbvn *volatile g_renderer;
 
 static bool g_stats_on;
 static FILE *g_stats_file;
@@ -399,30 +433,230 @@ lock_shared(struct wbvn *w, SRWLOCK *l)
    InterlockedDecrement(&w->contenders);
 }
 
-/* ---------- port I/O ----------------------------------------------------------------- */
+/* ---------- the slot ----------------------------------------------------------------- */
 
-static bool
-port_xfer(struct wbvn *w, HANDLE event, bool write, void *buf, size_t len)
+/* GUID_DEVINTERFACE_IVSHMEM and the IOCTLs of the ivshmem driver (its Public.h) */
+static const GUID wbvn_ivshmem_guid = { 0xdf576976, 0x569d, 0x4672,
+                                        { 0x95, 0xa0, 0xf5, 0x7e, 0x4e, 0xa0, 0xb2, 0x10 } };
+#define WBVN_IOCTL(fn) CTL_CODE(FILE_DEVICE_UNKNOWN, fn, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define WBVN_IOCTL_SIZE WBVN_IOCTL(0x801)
+#define WBVN_IOCTL_MMAP WBVN_IOCTL(0x802)
+#define WBVN_IOCTL_RELEASE WBVN_IOCTL(0x803)
+#define WBVN_CACHE_CACHED 1
+
+/* IVSHMEM_MMAP */
+struct wbvn_ivshmem_mmap {
+   uint16_t peer_id;
+   uint64_t size;
+   void *ptr;
+   uint16_t vectors;
+};
+
+#define SLOT_LD32(bar, off) \
+   __atomic_load_n((const uint32_t *)((bar) + WBVN_SLOT_BLOCK + (off)), __ATOMIC_ACQUIRE)
+#define SLOT_ST32(bar, off, v) \
+   __atomic_store_n((uint32_t *)((bar) + WBVN_SLOT_BLOCK + (off)), (v), __ATOMIC_RELEASE)
+#define SLOT_LD64(bar, off) \
+   __atomic_load_n((const uint64_t *)((bar) + WBVN_SLOT_BLOCK + (off)), __ATOMIC_ACQUIRE)
+#define SLOT_ST64(bar, off, v) \
+   __atomic_store_n((uint64_t *)((bar) + WBVN_SLOT_BLOCK + (off)), (v), __ATOMIC_RELEASE)
+
+static inline int64_t
+qpc_ticks(void)
 {
-   uint8_t *p = buf;
-   while (len) {
-      DWORD want = len > WBVN_MAX_IO ? WBVN_MAX_IO : (DWORD)len;
-      DWORD got = 0;
-      OVERLAPPED ov = { .hEvent = event };
-      BOOL ok = write ? WriteFile(w->port, p, want, &got, &ov)
-                      : ReadFile(w->port, p, want, &got, &ov);
-      if (!ok) {
-         if (GetLastError() != ERROR_IO_PENDING)
-            return false;
-         if (!GetOverlappedResult(w->port, &ov, &got, TRUE))
-            return false;
+   LARGE_INTEGER c;
+   QueryPerformanceCounter(&c);
+   return c.QuadPart;
+}
+
+static DWORD
+env_uint(const char *name, DWORD fallback)
+{
+   char v[32];
+   const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+   return n && n < sizeof(v) ? (DWORD)strtoul(v, NULL, 10) : fallback;
+}
+
+static void
+wbvn_unmap(struct wbvn *w)
+{
+   DWORD got;
+   if (w->bar)
+      DeviceIoControl(w->bar_dev, WBVN_IOCTL_RELEASE, NULL, 0, NULL, 0, &got, NULL);
+   if (w->bar_dev)
+      CloseHandle(w->bar_dev);
+   w->bar = NULL;
+   w->bar_dev = NULL;
+}
+
+/* Checks the region the host laid out and finds its two lanes. Returns NULL, or what is wrong. */
+static const char *
+slot_check(const uint8_t *bar, uint64_t len, uint64_t lane[2][2])
+{
+   if (len < WBVN_SLOT_LEN)
+      return "the device is smaller than a slot";
+   const uint64_t magic = __atomic_load_n((const uint64_t *)bar, __ATOMIC_ACQUIRE);
+   if (!magic)
+      return "the host has not set the slot up";
+   if (magic != WBVN_SHM_MAGIC || *(const uint32_t *)(bar + 8) != WBVN_SHM_VERSION ||
+       *(const uint32_t *)(bar + 0xC) != WBVN_SHM_HEADER_LEN)
+      return "the region is not a WinBridge region";
+   const uint64_t declared = *(const uint64_t *)(bar + 0x18);
+   if (declared < WBVN_SHM_HEADER_LEN || declared > len)
+      return "the region length is wrong";
+   if (*(const uint32_t *)(bar + 0x24) != WBVN_SHM_ROLE_CLIENT ||
+       !(*(const uint64_t *)(bar + 0x10) & WBVN_SHM_CAP_VENUS))
+      return "the region is not a Venus slot";
+   const uint32_t count = *(const uint32_t *)(bar + 0x28);
+   if (count > 64)
+      return "the region has too many lanes";
+   bool g2h = false, h2g = false;
+   for (uint32_t i = 0; i < count; i++) {
+      const uint8_t *e = bar + WBVN_SHM_DIR + i * WBVN_SHM_DIR_ENTRY;
+      const uint16_t id = *(const uint16_t *)e;
+      const uint8_t dir = e[2];
+      const uint64_t off = *(const uint64_t *)(e + 8), size = *(const uint64_t *)(e + 16);
+      if (off < WBVN_SHM_HEADER_LEN || (off & 63) || size < 64 || (size & (size - 1)) ||
+          off > declared || size > declared - off - WBVN_RING_HEADER)
+         return "a lane lies outside the region";
+      if (id == WBVN_LANE_G2H && dir == 1) {
+         lane[0][0] = off;
+         lane[0][1] = size;
+         g2h = true;
+      } else if (id == WBVN_LANE_H2G && dir == 0) {
+         lane[1][0] = off;
+         lane[1][1] = size;
+         h2g = true;
       }
-      if (!got && !write)
-         return false;
-      p += got;
-      len -= got;
    }
-   return true;
+   if (!g2h || !h2g)
+      return "the region lacks the Venus lanes";
+   if (SLOT_LD64(bar, WBVN_SLOT_OFF_MAGIC) != WBVN_SLOT_MAGIC ||
+       SLOT_LD32(bar, WBVN_SLOT_OFF_VERSION) != WBVN_SLOT_VERSION)
+      return "the slot block is missing";
+   return NULL;
+}
+
+/* One attempt to claim the slot behind a device interface. Returns NULL on success, else why not;
+ * `*retry` says whether waiting may help (the host is not ready, or has not freed the slot). */
+static const char *
+wbvn_try_device(struct wbvn *w, const wchar_t *path, bool *sized, bool *retry)
+{
+   DWORD got;
+   const HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+   if (h == INVALID_HANDLE_VALUE)
+      return "cannot open an ivshmem device";
+   uint64_t size = 0;
+   if (!DeviceIoControl(h, WBVN_IOCTL_SIZE, NULL, 0, &size, sizeof(size), &got, NULL) ||
+       size != WBVN_SLOT_LEN) {
+      CloseHandle(h);
+      return "no ivshmem device has the size of a Venus slot";
+   }
+   *sized = true;
+   struct wbvn_ivshmem_mmap m = { 0 };
+   uint8_t mode = WBVN_CACHE_CACHED;
+   if (!DeviceIoControl(h, WBVN_IOCTL_MMAP, &mode, sizeof(mode), &m, sizeof(m), &got, NULL) ||
+       !m.ptr) {
+      CloseHandle(h);
+      return "every Venus slot is in use by another process";
+   }
+   w->bar_dev = h;
+   w->bar = m.ptr;
+
+   uint64_t lane[2][2];
+   const char *why = slot_check(w->bar, m.size, lane);
+   if (why) {
+      *retry = true;
+      goto fail;
+   }
+   /* The driver maps a device for one process, and this process holds the mapping: the previous
+    * owner of a claimed slot is gone. Closing the slot makes the host reset it. */
+   if (SLOT_LD32(w->bar, WBVN_SLOT_OFF_STATE) == WBVN_SLOT_CLAIMED)
+      SLOT_ST32(w->bar, WBVN_SLOT_OFF_STATE, WBVN_SLOT_CLOSED);
+   uint32_t expect = WBVN_SLOT_FREE;
+   if (!__atomic_compare_exchange_n((uint32_t *)(w->bar + WBVN_SLOT_BLOCK + WBVN_SLOT_OFF_STATE),
+                                    &expect, WBVN_SLOT_CLAIMED, false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      why = "the host has not freed the slot";
+      *retry = true;
+      goto fail;
+   }
+   w->slot_id = SLOT_LD32(w->bar, WBVN_SLOT_OFF_ID);
+   w->nonce = ((uint64_t)GetCurrentProcessId() << 32) ^ (uint64_t)qpc_ticks();
+   SLOT_ST64(w->bar, WBVN_SLOT_OFF_NONCE, w->nonce);
+   if (!wbvn_ring_attach(&w->tx, w->bar + lane[0][0], lane[0][1], true) ||
+       !wbvn_ring_attach(&w->rx, w->bar + lane[1][0], lane[1][1], false)) {
+      SLOT_ST32(w->bar, WBVN_SLOT_OFF_STATE, WBVN_SLOT_CLOSED);
+      why = "a lane is not empty";
+      goto fail;
+   }
+   return NULL;
+
+fail:
+   wbvn_unmap(w);
+   return why;
+}
+
+/* Finds a free slot among the ivshmem devices and claims it. */
+static bool
+wbvn_attach(struct wbvn *w)
+{
+   const HDEVINFO set = SetupDiGetClassDevsW(&wbvn_ivshmem_guid, NULL, NULL,
+                                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+   if (set == INVALID_HANDLE_VALUE) {
+      vn_log(w->instance, "cannot list the ivshmem devices (error %lu)", GetLastError());
+      return false;
+   }
+   const char *why = "no ivshmem device is present";
+   const DWORD64 deadline = GetTickCount64() + env_uint("WBVN_CONNECT_MS", WBVN_CONNECT_MS);
+   bool done = false;
+   for (;;) {
+      bool sized = false, retry = false;
+      for (DWORD i = 0; !done; i++) {
+         SP_DEVICE_INTERFACE_DATA did = { .cbSize = sizeof(did) };
+         if (!SetupDiEnumDeviceInterfaces(set, NULL, &wbvn_ivshmem_guid, i, &did))
+            break;
+         DWORD need = 0;
+         SetupDiGetDeviceInterfaceDetailW(set, &did, NULL, 0, &need, NULL);
+         SP_DEVICE_INTERFACE_DETAIL_DATA_W *det = need ? malloc(need) : NULL;
+         if (!det)
+            continue;
+         det->cbSize = sizeof(*det);
+         if (SetupDiGetDeviceInterfaceDetailW(set, &did, det, need, NULL, NULL)) {
+            const char *r = wbvn_try_device(w, det->DevicePath, &sized, &retry);
+            if (!r)
+               done = true;
+            else
+               why = r;
+         }
+         free(det);
+      }
+      if (done || !sized || !retry || GetTickCount64() >= deadline)
+         break;
+      Sleep(10);
+   }
+   SetupDiDestroyDeviceInfoList(set);
+   if (!done)
+      vn_log(w->instance, "cannot claim a Venus slot: %s", why);
+   return done;
+}
+
+/* ---------- wake-ups and the heartbeat ------------------------------------------------ */
+
+/* Sends the host a wake-up byte. The caller holds write_lock. */
+static void
+wbvn_kick(struct wbvn *w)
+{
+   const uint8_t b = 1;
+   DWORD got = 0;
+   OVERLAPPED ov = { .hEvent = w->write_event };
+   if (!WriteFile(w->port, &b, 1, &got, &ov)) {
+      if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(w->port, &ov, &got, TRUE))
+         return;
+   }
+   stat_add(S_kick_tx_n, 1);
 }
 
 static void
@@ -447,21 +681,55 @@ frame_put(struct wbvn_buf *b, uint32_t kind, uint32_t req, uint32_t arg, const v
    return false;
 }
 
-/* Writes whole messages in one go. Every write on the port is a trip to the host, so the header
- * and payload of a message, and the messages one flush produces, share one. */
+/* Writes whole messages into the guest to host lane, in records of WBVN_RECORD_MAX at most.
+ * The caller sends header and payload of a message, and the messages one flush produces, in one
+ * call, so the host finds them together. */
 static bool
 wire_write(struct wbvn *w, const void *data, size_t len)
 {
-   bool ok;
+   bool ok = true;
    const int64_t t0 = stat_now();
+   const uint8_t *p = data;
+   uint32_t spins = 0;
+   DWORD64 stalled = 0;
    AcquireSRWLockExclusive(&w->write_lock);
-   ok = !w->lost && port_xfer(w, w->write_event, true, (void *)data, len);
+   while (len && ok) {
+      if (w->lost) {
+         ok = false;
+         break;
+      }
+      const uint32_t n = len > WBVN_RECORD_MAX ? WBVN_RECORD_MAX : (uint32_t)len;
+      bool kick;
+      const int r = wbvn_ring_push(&w->tx, p, n, &kick);
+      if (r == WBVN_RING_OK) {
+         if (kick)
+            wbvn_kick(w);
+         p += n;
+         len -= n;
+         spins = 0;
+         stalled = 0;
+      } else if (r == WBVN_RING_CLOSED) {
+         ok = false;
+      } else {
+         /* the host has not drained the lane yet */
+         if (!stalled) {
+            stalled = GetTickCount64();
+            stat_add(S_ringfull_n, 1);
+         } else if (GetTickCount64() - stalled > WBVN_REPLY_TIMEOUT_MS) {
+            ok = false;
+         }
+         if (++spins < 2000)
+            YieldProcessor();
+         else
+            SwitchToThread();
+      }
+   }
    ReleaseSRWLockExclusive(&w->write_lock);
    if (t0) {
       const int64_t d = stat_now() - t0;
       stat_add(S_send_n, 1);
       stat_add(S_send_ns, d);
-      stat_add(S_send_bytes, (int64_t)len);
+      stat_add(S_send_bytes, (int64_t)(p - (const uint8_t *)data));
       stat_max(S_send_max_ns, d);
    }
    if (!ok)
@@ -824,54 +1092,167 @@ wbvn_apply_signals(struct wbvn *w, const uint8_t *p, uint32_t len)
    ReleaseSRWLockExclusive(&w->mu);
 }
 
+/* Handles one message from the host; `payload` points into the reader's buffer. Returns false
+ * when the session is over. */
+static bool
+wbvn_handle_message(struct wbvn *w, const struct wbvn_hdr *h, const uint8_t *payload)
+{
+   stat_add(S_rd_msgs, 1);
+   stat_add(S_rd_bytes, (int64_t)(sizeof(*h) + h->len));
+   if (h->kind & WBVN_REPLY) {
+      uint8_t *copy = h->len ? malloc(h->len) : NULL;
+      if (h->len && !copy)
+         return false;
+      if (copy)
+         memcpy(copy, payload, h->len);
+      lock_excl(w, &w->mu);
+      if (!w->reply.done && h->req == w->reply.req) {
+         w->reply.done = true;
+         w->reply.arg = h->arg;
+         w->reply.payload = copy;
+         w->reply.len = h->len;
+         copy = NULL;
+      }
+      WakeAllConditionVariable(&w->cv);
+      ReleaseSRWLockExclusive(&w->mu);
+      free(copy);
+   } else if (h->kind == WBVN_PUSH) {
+      const int64_t t0 = stat_now();
+      wbvn_apply_push(w, payload, h->len);
+      if (t0) {
+         stat_add(S_rdpush_n, 1);
+         stat_add(S_rdpush_bytes, h->len);
+         stat_add(S_rdpush_ns, stat_now() - t0);
+      }
+   } else if (h->kind == WBVN_SYNC_SIGNAL) {
+      stat_add(S_rdsignal_n, 1);
+      wbvn_apply_signals(w, payload, h->len);
+   } else if (h->kind == WBVN_LOST) {
+      return false;
+   }
+   return true;
+}
+
+/* Tells the host this process is alive, and notices when the host took the slot away. */
+static void
+wbvn_heartbeat(struct wbvn *w)
+{
+   const uint64_t now = GetTickCount64();
+   if (now - w->beat_at < 100)
+      return;
+   w->beat_at = now;
+   if (SLOT_LD64(w->bar, WBVN_SLOT_OFF_MAGIC) != WBVN_SLOT_MAGIC ||
+       SLOT_LD32(w->bar, WBVN_SLOT_OFF_STATE) != WBVN_SLOT_CLAIMED ||
+       SLOT_LD64(w->bar, WBVN_SLOT_OFF_NONCE) != w->nonce) {
+      if (!w->quit)
+         wbvn_set_lost(w);
+      return;
+   }
+   __atomic_fetch_add((uint64_t *)(w->bar + WBVN_SLOT_BLOCK + WBVN_SLOT_OFF_HEARTBEAT), 1,
+                      __ATOMIC_ACQ_REL);
+}
+
+/* Waits for the host to write: polls for a short while, then sleeps until a wake-up byte comes.
+ * `partial` means a message is half in; the rest is on its way, so it only polls. */
+static void
+wbvn_reader_idle(struct wbvn *w, bool partial)
+{
+   const int64_t t0 = qpc_ticks();
+   const int64_t limit = partial ? w->spin_ticks * 300 + 1 : w->spin_ticks;
+   do {
+      if (wbvn_ring_ready(&w->rx) || w->quit || w->lost)
+         return;
+      for (int i = 0; i < 32; i++)
+         YieldProcessor();
+   } while (qpc_ticks() - t0 < limit);
+
+   /* Flag, look again, then wait: the host either sees the flag and sends a byte, or we see
+    * its record. */
+   wbvn_ring_set_sleeping(&w->rx, true);
+   if (!wbvn_ring_ready(&w->rx) && !w->quit && !w->lost) {
+      const int64_t s0 = stat_now();
+      if (!w->kick_armed) {
+         memset(&w->kick_ov, 0, sizeof(w->kick_ov));
+         w->kick_ov.hEvent = w->read_event;
+         DWORD got;
+         if (ReadFile(w->port, &w->kick_byte, 1, &got, &w->kick_ov) ||
+             GetLastError() == ERROR_IO_PENDING)
+            w->kick_armed = true;
+      }
+      if (w->kick_armed) {
+         if (WaitForSingleObject(w->read_event, WBVN_KICK_TIMEOUT_MS) == WAIT_OBJECT_0) {
+            DWORD got;
+            GetOverlappedResult(w->port, &w->kick_ov, &got, FALSE);
+            w->kick_armed = false;
+            stat_add(S_kick_rx_n, 1);
+         }
+      } else {
+         /* no wake-up port: fall back to the timer */
+         Sleep(1);
+      }
+      if (s0) {
+         stat_add(S_rd_sleep_n, 1);
+         stat_add(S_rd_sleep_ns, stat_now() - s0);
+      }
+   }
+   wbvn_ring_set_sleeping(&w->rx, false);
+}
+
+/* Reads the host to guest lane, a byte stream of messages in records, and handles each message. */
 static DWORD WINAPI
 wbvn_reader(LPVOID arg)
 {
    struct wbvn *w = arg;
+   struct wbvn_buf acc = { 0 };
+   size_t pos = 0;
    for (;;) {
-      struct wbvn_hdr h;
-      if (!port_xfer(w, w->read_event, false, &h, sizeof(h)))
-         break;
-      if (h.len > WBVN_MAX_PAYLOAD)
-         break;
-      uint8_t *payload = h.len ? malloc(h.len) : NULL;
-      if (h.len && !payload)
-         break;
-      if (h.len && !port_xfer(w, w->read_event, false, payload, h.len)) {
-         free(payload);
-         break;
+      wbvn_heartbeat(w);
+      bool got = false;
+      for (;;) {
+         const uint8_t *p;
+         uint32_t n;
+         const int r = wbvn_ring_peek(&w->rx, &p, &n);
+         if (r == WBVN_RING_CLOSED || (r == WBVN_RING_OK && !buf_put(&acc, p, n)))
+            goto done;
+         if (r != WBVN_RING_OK)
+            break;
+         wbvn_ring_consume(&w->rx);
+         got = true;
       }
-
-      stat_add(S_rd_msgs, 1);
-      stat_add(S_rd_bytes, (int64_t)(sizeof(h) + h.len));
-      if (h.kind & WBVN_REPLY) {
-         lock_excl(w, &w->mu);
-         if (!w->reply.done && h.req == w->reply.req) {
-            w->reply.done = true;
-            w->reply.arg = h.arg;
-            w->reply.payload = payload;
-            w->reply.len = h.len;
-            payload = NULL;
+      bool partial = false;
+      for (;;) {
+         struct wbvn_hdr h;
+         if (acc.len - pos < sizeof(h)) {
+            partial = acc.len > pos;
+            break;
          }
-         WakeAllConditionVariable(&w->cv);
-         ReleaseSRWLockExclusive(&w->mu);
-      } else if (h.kind == WBVN_PUSH) {
-         const int64_t t0 = stat_now();
-         wbvn_apply_push(w, payload, h.len);
-         if (t0) {
-            stat_add(S_rdpush_n, 1);
-            stat_add(S_rdpush_bytes, h.len);
-            stat_add(S_rdpush_ns, stat_now() - t0);
+         memcpy(&h, acc.data + pos, sizeof(h));
+         if (h.len > WBVN_MAX_PAYLOAD)
+            goto done;
+         if (acc.len - pos < sizeof(h) + h.len) {
+            partial = true;
+            break;
          }
-      } else if (h.kind == WBVN_SYNC_SIGNAL) {
-         stat_add(S_rdsignal_n, 1);
-         wbvn_apply_signals(w, payload, h.len);
-      } else if (h.kind == WBVN_LOST) {
-         free(payload);
-         break;
+         if (!wbvn_handle_message(w, &h, acc.data + pos + sizeof(h)))
+            goto done;
+         pos += sizeof(h) + h.len;
       }
-      free(payload);
+      if (pos == acc.len) {
+         acc.len = 0;
+         pos = 0;
+      } else if (pos >= (1u << 20)) {
+         memmove(acc.data, acc.data + pos, acc.len - pos);
+         acc.len -= pos;
+         pos = 0;
+      }
+      if (got)
+         continue;
+      if (w->quit || w->lost)
+         break;
+      wbvn_reader_idle(w, partial);
    }
+done:
+   free(acc.data);
    if (!w->quit)
       wbvn_set_lost(w);
    return 0;
@@ -940,6 +1321,8 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 {
    struct wbvn *w = (struct wbvn *)renderer;
 
+   if (g_renderer == w)
+      g_renderer = NULL;
    InterlockedExchange(&w->quit, 1);
    if (w->pump) {
       WaitForSingleObject(w->pump, INFINITE);
@@ -948,12 +1331,18 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    }
    stats_tick(true);
    if (w->port != INVALID_HANDLE_VALUE) {
-      /* unblocks the reader */
+      /* wakes a reader that sleeps on the port */
       CancelIoEx(w->port, NULL);
    }
    if (w->reader) {
       WaitForSingleObject(w->reader, 5000);
       CloseHandle(w->reader);
+   }
+   if (w->bar) {
+      /* All we sent is in the lane; the host reads it out before it honours the close. */
+      if (SLOT_LD64(w->bar, WBVN_SLOT_OFF_NONCE) == w->nonce)
+         SLOT_ST32(w->bar, WBVN_SLOT_OFF_STATE, WBVN_SLOT_CLOSED);
+      wbvn_unmap(w);
    }
    if (w->port != INVALID_HANDLE_VALUE)
       CloseHandle(w->port);
@@ -1338,12 +1727,22 @@ wbvn_init(struct wbvn *w)
    InitializeSRWLock(&w->req_lock);
    InitializeConditionVariable(&w->cv);
 
-   w->port = CreateFileW(WBVN_PORT, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+   if (!wbvn_attach(w))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   WCHAR port_name[96];
+   swprintf(port_name, ARRAYSIZE(port_name), WBVN_PORT_FORMAT, w->slot_id);
+   w->port = CreateFileW(port_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
                          FILE_FLAG_OVERLAPPED, NULL);
    if (w->port == INVALID_HANDLE_VALUE) {
-      vn_log(w->instance, "cannot open the venus port (error %lu)", GetLastError());
+      vn_log(w->instance, "cannot open the wake-up port of slot %u (error %lu)", w->slot_id,
+             GetLastError());
       return VK_ERROR_INITIALIZATION_FAILED;
    }
+   LARGE_INTEGER qpc_freq;
+   QueryPerformanceFrequency(&qpc_freq);
+   w->spin_ticks = (int64_t)env_uint("WBVN_SPIN_US", WBVN_SPIN_US) * qpc_freq.QuadPart / 1000000;
+   w->beat_at = GetTickCount64();
    w->read_event = CreateEventW(NULL, TRUE, FALSE, NULL);
    w->write_event = CreateEventW(NULL, TRUE, FALSE, NULL);
    if (!w->read_event || !w->write_event)
@@ -1435,6 +1834,12 @@ wbvn_init(struct wbvn *w)
 BOOL WINAPI
 DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
+   if (reason == DLL_PROCESS_DETACH && reserved) {
+      /* the process is ending: the other threads are gone, and the host must free the slot */
+      struct wbvn *w = g_renderer;
+      if (w && w->bar && SLOT_LD64(w->bar, WBVN_SLOT_OFF_NONCE) == w->nonce)
+         SLOT_ST32(w->bar, WBVN_SLOT_OFF_STATE, WBVN_SLOT_CLOSED);
+   }
    if (reason == DLL_PROCESS_ATTACH) {
       char cur[256];
       DWORD n = GetEnvironmentVariableA("VN_PERF", cur, sizeof(cur));
@@ -1464,6 +1869,7 @@ vn_renderer_create_winbridge(struct vn_instance *instance,
       return result;
    }
 
+   g_renderer = w;
    *renderer = &w->base;
    if (VN_DEBUG(INIT))
       vn_log(instance, "winbridge backend initialized");
