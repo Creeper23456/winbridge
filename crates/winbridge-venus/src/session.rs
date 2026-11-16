@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// Shmems up to this size are scanned for renderer writes (rings, reply pools). Larger ones
-/// (the command-stream pool) are only ever written by the guest.
-pub const SCAN_MAX: usize = 2 << 20;
+/// Shmems up to this size are scanned for renderer writes (rings, reply pools). Mesa's reply pool
+/// is 1 MiB and grows to the next power of two for a larger reply, so replies up to 4 MiB reach the
+/// guest; its command-stream pool is 8 MiB or more and only ever written by the guest.
+pub const SCAN_MAX: usize = 4 << 20;
 /// Runs closer than this many words are sent as one.
 const RUN_GAP_WORDS: usize = 8;
 /// The one context id of a session.
