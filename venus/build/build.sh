@@ -90,7 +90,7 @@ stage_sysroot() {
         rm -rf "$sysroot"
         "$work/xwin/bin/xwin" --accept-license --cache-dir "$work/xwin-cache" \
             --manifest-version "$VS_MANIFEST_VERSION" --crt-version "$CRT_VERSION" \
-            --sdk-version "$SDK_VERSION" --arch x86_64 --variant desktop \
+            --sdk-version "$SDK_VERSION" --arch x86_64,x86 --variant desktop \
             splat --use-winsysroot-style --preserve-ms-arch-notation --output "$sysroot"
     fi
     locate_sysroot
@@ -107,64 +107,72 @@ stage_overlay() {
 }
 
 # The compiler, linker and resource compiler as meson sees them, with the sysroot and the overlay
-# built in, and the cross file that names them.
-stage_toolchain() {
-    locate_sysroot
-    say "compiler wrappers and cross file"
-    mkdir -p "$work/bin"
-    cat >"$work/bin/clang-cl" <<EOF
+# built in, and the cross file that names them. One set per target:
+#   write_toolchain BINDIR CROSSFILE CLANG-TRIPLE LIB-DIR MESON-CPU-FAMILY MESON-CPU [EXTRA-C-FLAGS]
+write_toolchain() {
+    local bin=$1 ini=$2 triple=$3 libarch=$4 family=$5 cpu=$6 extra=${7:-}
+    mkdir -p "$bin"
+    cat >"$bin/clang-cl" <<EOF
 #!/bin/bash
-exec "$llvm/clang-cl" --target=x86_64-pc-windows-msvc -winsysroot "$sysroot" \\
+exec "$llvm/clang-cl" --target=$triple -winsysroot "$sysroot" \\
   -Xclang -ivfsoverlay -Xclang "$work/overlay.json" -fuse-ld=lld "\$@"
 EOF
-    cat >"$work/bin/clang" <<EOF
+    cat >"$bin/clang" <<EOF
 #!/bin/bash
 exec "$llvm/clang" "\$@"
 EOF
-    cat >"$work/bin/lld-link" <<EOF
+    cat >"$bin/lld-link" <<EOF
 #!/bin/bash
 exec "$llvm/lld" -flavor link \\
-  -libpath:"$crt/lib/x64" \\
-  -libpath:"$sdk/Lib/$sdkver/ucrt/x64" \\
-  -libpath:"$sdk/Lib/$sdkver/um/x64" "\$@"
+  -libpath:"$crt/lib/$libarch" \\
+  -libpath:"$sdk/Lib/$sdkver/ucrt/$libarch" \\
+  -libpath:"$sdk/Lib/$sdkver/um/$libarch" "\$@"
 EOF
-    cat >"$work/bin/llvm-rc" <<EOF
+    cat >"$bin/llvm-rc" <<EOF
 #!/bin/bash
 exec "$llvm/llvm-rc" \\
-  --preprocessor="$work/bin/clang" \\
-  --preprocessor-arg="--target=x86_64-pc-windows-msvc" \\
+  --preprocessor="$bin/clang" \\
+  --preprocessor-arg="--target=$triple" \\
   --preprocessor-arg="-winsysroot" --preprocessor-arg="$sysroot" \\
   --preprocessor-arg="-ivfsoverlay" --preprocessor-arg="$work/overlay.json" \\
   /I "$crt/include" \\
   /I "$sdk/Include/$sdkver/ucrt" /I "$sdk/Include/$sdkver/shared" /I "$sdk/Include/$sdkver/um" "\$@"
 EOF
-    ln -sf "$llvm/llvm-lib" "$work/bin/llvm-lib"
-    chmod +x "$work/bin/clang-cl" "$work/bin/clang" "$work/bin/lld-link" "$work/bin/llvm-rc"
-    cat >"$work/cross.ini" <<EOF
+    ln -sf "$llvm/llvm-lib" "$bin/llvm-lib"
+    chmod +x "$bin/clang-cl" "$bin/clang" "$bin/lld-link" "$bin/llvm-rc"
+    cat >"$ini" <<EOF
 [binaries]
-c = '$work/bin/clang-cl'
-cpp = '$work/bin/clang-cl'
-ar = '$work/bin/llvm-lib'
+c = '$bin/clang-cl'
+cpp = '$bin/clang-cl'
+ar = '$bin/llvm-lib'
 strip = '/bin/true'
-windres = '$work/bin/llvm-rc'
-c_ld = '$work/bin/lld-link'
-cpp_ld = '$work/bin/lld-link'
+windres = '$bin/llvm-rc'
+c_ld = '$bin/lld-link'
+cpp_ld = '$bin/lld-link'
 python = '$work/venv/bin/python3'
 python3 = '$work/venv/bin/python3'
 
 [host_machine]
 system = 'windows'
-cpu_family = 'x86_64'
-cpu = 'x86_64'
+cpu_family = '$family'
+cpu = '$cpu'
 endian = 'little'
 
 [built-in options]
-c_args = ['/FI$here/windows_compat.h', '-DVK_USE_PLATFORM_WIN32_KHR', '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH']
-cpp_args = ['/FI$here/windows_compat.h', '-DVK_USE_PLATFORM_WIN32_KHR', '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH']
+c_args = ['/FI$here/windows_compat.h', '-DVK_USE_PLATFORM_WIN32_KHR', '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'$extra]
+cpp_args = ['/FI$here/windows_compat.h', '-DVK_USE_PLATFORM_WIN32_KHR', '-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'$extra]
 c_link_args = ['/ignore:4217']
 cpp_link_args = ['/ignore:4217']
 b_lundef = true
 EOF
+}
+
+stage_toolchain() {
+    locate_sysroot
+    say "compiler wrappers and cross files"
+    write_toolchain "$work/bin" "$work/cross.ini" x86_64-pc-windows-msvc x64 x86_64 x86_64
+    # 32-bit code runs on every CPU Windows 11 supports: SSE2 and FXSR are given (the x64 baseline has them)
+    write_toolchain "$work/bin32" "$work/cross32.ini" i686-pc-windows-msvc x86 x86 i686 ", '-msse2', '-mfxsr'"
 }
 
 # Mesa at the pinned revision, our patches in order, and the two files of the WinBridge backend.
@@ -190,29 +198,49 @@ stage_mesa() {
         "$repo/venus/guest/wbvn_ring.h" "$src/src/virtio/vulkan/"
 }
 
-stage_build() {
-    local src=$work/mesa build=$work/build
-    export PATH="$work/bin:$PATH"
-    say "configure"
+# build_arch BUILD-DIR CROSSFILE BINDIR OUT-DIR
+build_arch() {
+    local src=$work/mesa build=$1 ini=$2 bin=$3 out=$4
+    PATH="$bin:$PATH"
+    say "configure $(basename "$build")"
     local setup=(setup)
-    [ -f "$build/build.ninja" ] && setup=(setup --reconfigure)
+    if [ -f "$build/build.ninja" ]; then
+        # meson keeps the options of the first configure on --reconfigure, the compiler flags of a
+        # changed cross file included: start again when the cross file is not the one used
+        if cmp -s "$ini" "$build/cross.used"; then setup=(setup --reconfigure); else setup=(setup --wipe); fi
+    fi
     # The static CRT and zlib make the DLLs depend on system libraries only: the guest needs no Visual C++
     # runtime, and opengl32.dll with libgallium_wgl.dll work from any program directory without other files.
-    "$work/venv/bin/meson" "${setup[@]}" "$build" "$src" --cross-file "$work/cross.ini" \
+    "$work/venv/bin/meson" "${setup[@]}" "$build" "$src" --cross-file "$ini" \
         --buildtype debugoptimized -Db_vscrt=mt -Ddefault_library=static \
         -Dvulkan-drivers=virtio -Dgallium-drivers=zink -Dplatforms=windows \
         -Dopengl=true -Degl=disabled -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
         -Dvalgrind=disabled -Dlibunwind=disabled -Dbuild-tests=false -Dmicrosoft-clc=disabled \
         -Dtools= -Dxmlconfig=disabled
-    say "build"
+    cp "$ini" "$build/cross.used"
+    say "build $(basename "$build")"
     ninja -C "$build" src/virtio/vulkan/vulkan_virtio.dll src/gallium/targets/libgl-gdi/opengl32.dll \
         src/gallium/targets/wgl/libgallium_wgl.dll
-    mkdir -p "$work/out"
+    rm -rf "$out"
+    mkdir -p "$out"
     cp "$build/src/virtio/vulkan/vulkan_virtio.dll" "$build/src/virtio/vulkan/vulkan_virtio.pdb" \
         "$build/src/gallium/targets/libgl-gdi/opengl32.dll" "$build/src/gallium/targets/libgl-gdi/opengl32.pdb" \
         "$build/src/gallium/targets/wgl/libgallium_wgl.dll" "$build/src/gallium/targets/wgl/libgallium_wgl.pdb" \
-        "$work/out/"
-    say "done: $work/out"
+        "$out/"
+    say "done: $out"
+}
+
+# The 64-bit DLLs go to out/, the 32-bit ones (for 32-bit programs, which are common among OpenGL and
+# DirectX 9 software) to out32/. WBVN_ARCHS="x64" or "x86" builds only one.
+stage_build() {
+    local a
+    for a in ${WBVN_ARCHS:-x64 x86}; do
+        case $a in
+            x64) build_arch "$work/build" "$work/cross.ini" "$work/bin" "$work/out" ;;
+            x86) build_arch "$work/build32" "$work/cross32.ini" "$work/bin32" "$work/out32" ;;
+            *) die "unknown architecture $a (x64 or x86)" ;;
+        esac
+    done
 }
 
 mkdir -p "$work"
