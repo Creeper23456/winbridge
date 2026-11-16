@@ -1,89 +1,171 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `winbridge-venus --socket PATH --virgl-lib LIB [--render-server PATH] [--record FILE] [--stats]`
+//! `winbridge-venus --shm FILE --socket PATH [--slot N] [--record FILE] [--stats] --virgl-lib LIB [--render-server PATH]`
 //! `winbridge-venus --replay FILE --virgl-lib LIB [--render-server PATH] [--stats]`
 //!
-//! Connects to the QEMU chardev socket of the `org.winbridge.venus.0` virtio-serial port (QEMU is
-//! the listener, `server=on`) and runs the guest's Venus context on virglrenderer. Reconnects
-//! when the guest side closes. `--record` keeps what the guest sent; `--replay` feeds such a
-//! recording to a session without a guest, with the original timing, so host-side problems can be
-//! reproduced in seconds.
+//! Serves one Venus client slot. `FILE` is the backing file of the slot's `ivshmem-plain`
+//! device (64 MiB); the guest's Vulkan process maps that device and talks to this process
+//! through the two lanes in it (`slot.rs`). `PATH` is the QEMU chardev socket of the slot's
+//! `org.winbridge.venus.N` virtio-serial port (QEMU is the listener, `server=on`); it carries
+//! only wake-up bytes. Each guest that claims the slot gets a fresh Venus context on
+//! virglrenderer; when it closes or dies the slot is reset and the next one is served.
+//!
+//! `--record` keeps what the guest sent; `--replay` feeds such a recording to a session without
+//! a guest, with the original timing, so host-side problems can be reproduced in seconds.
 
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use winbridge_venus::channel::StreamChannel;
 use winbridge_venus::session::Session;
+use winbridge_venus::slot::{ShmChannel, Slot, CLAIMED};
 use winbridge_venus::virgl::Virgl;
 
-const USAGE: &str = "usage: winbridge-venus (--socket PATH [--record FILE] [--stats] | --replay FILE) --virgl-lib LIB [--render-server PATH]";
+const USAGE: &str = "usage: winbridge-venus (--shm FILE --socket PATH [--slot N] [--record FILE] [--stats] | --replay FILE [--stats]) --virgl-lib LIB [--render-server PATH]";
 
-fn main() {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
-    let (mut socket, mut lib, mut server, mut record, mut replay, mut stats) = (None, None, None, None, None, false);
+struct Args {
+    shm: Option<String>,
+    socket: Option<String>,
+    slot: u32,
+    lib: Option<String>,
+    server: Option<String>,
+    record: Option<String>,
+    replay: Option<String>,
+    stats: bool,
+}
+
+fn parse_args() -> Args {
+    let mut a = Args { shm: None, socket: None, slot: 0, lib: None, server: None, record: None, replay: None, stats: false };
     let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--socket" => socket = args.next(),
-            "--virgl-lib" => lib = args.next(),
-            "--render-server" => server = args.next(),
-            "--record" => record = args.next(),
-            "--replay" => replay = args.next(),
-            "--stats" => stats = true,
-            _ => {
-                eprintln!("{USAGE}");
-                std::process::exit(2);
-            }
-        }
-    }
-    let Some(lib) = lib else {
+    let usage = || -> ! {
         eprintln!("{USAGE}");
         std::process::exit(2);
     };
-    if socket.is_none() == replay.is_none() {
-        eprintln!("{USAGE}");
-        std::process::exit(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--shm" => a.shm = args.next(),
+            "--socket" => a.socket = args.next(),
+            "--slot" => a.slot = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
+            "--virgl-lib" => a.lib = args.next(),
+            "--render-server" => a.server = args.next(),
+            "--record" => a.record = args.next(),
+            "--replay" => a.replay = args.next(),
+            "--stats" => a.stats = true,
+            _ => usage(),
+        }
     }
-    if let Some(server) = server {
+    let live = a.shm.is_some() && a.socket.is_some() && a.replay.is_none();
+    let replay = a.shm.is_none() && a.socket.is_none() && a.replay.is_some();
+    if a.lib.is_none() || live == replay {
+        usage();
+    }
+    a
+}
+
+fn main() {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    let args = parse_args();
+    if let Some(server) = &args.server {
         // Read by virglrenderer when it starts the render server, before any other thread exists.
         std::env::set_var("RENDER_SERVER_EXEC_PATH", server);
     }
-    let mut virgl = match Virgl::open(&lib) {
+    let mut virgl = match Virgl::open(args.lib.as_deref().unwrap()) {
         Ok(v) => v,
         Err(e) => {
             error!("{e}");
             std::process::exit(1);
         }
     };
-    if let Some(path) = replay {
-        replay_file(&mut virgl, &path, stats);
+    if let Some(path) = &args.replay {
+        replay_file(&mut virgl, path, args.stats);
         return;
     }
-    let socket = socket.unwrap();
+    serve(&mut virgl, &args);
+}
+
+/// True if the peer of `s` has closed it (a wake-up socket never carries data toward us that we
+/// would lose by peeking).
+fn socket_closed(s: &UnixStream) -> bool {
+    let mut b = [0u8; 1];
+    // SAFETY: `b` is valid for one byte.
+    let n = unsafe { libc::recv(s.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n == 0
+}
+
+fn connect(path: &str) -> UnixStream {
     loop {
-        let stream = match UnixStream::connect(&socket) {
-            Ok(s) => s,
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
+        match UnixStream::connect(path) {
+            Ok(s) => {
+                info!("connected to {path}");
+                return s;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+}
+
+/// Serves the slot for ever: wait for a guest, run its session, reset, repeat.
+fn serve(virgl: &mut Virgl, args: &Args) -> ! {
+    let (shm, socket) = (args.shm.as_deref().unwrap(), args.socket.as_deref().unwrap());
+    let slot = match Slot::open(Path::new(shm), args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let mut kick: Option<UnixStream> = None;
+    loop {
+        let k = match kick.take() {
+            Some(k) if !socket_closed(&k) => k,
+            _ => connect(socket),
+        };
+        let region = match slot.reset() {
+            Ok(r) => r,
+            Err(e) => {
+                error!("{e}");
+                std::process::exit(1);
             }
         };
-        info!("connected to {socket}");
-        let mut session = Session::new(&mut virgl, stream);
-        if stats {
+        let block = slot.block();
+        info!("slot {} is free", slot.id());
+        while block.state() != CLAIMED {
+            if socket_closed(&k) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if block.state() != CLAIMED {
+            warn!("the wake-up socket closed while the slot was free");
+            continue;
+        }
+        info!("a guest claimed slot {} (nonce {:#x})", slot.id(), block.nonce());
+        let channel = match k.try_clone().map_err(|e| e.to_string()).and_then(|k2| ShmChannel::new(&region, block.clone(), k2)) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let mut session = Session::new(&mut *virgl, channel);
+        if args.stats {
             session.enable_stats();
         }
-        if let Some(path) = &record {
+        if let Some(path) = &args.record {
             match std::fs::File::create(path) {
                 Ok(f) => session.record_to(f),
                 Err(e) => error!("cannot record to {path}: {e}"),
             }
         }
         match session.run() {
-            Ok(()) => info!("guest closed the channel"),
+            Ok(()) => info!("the guest left slot {}", slot.id()),
             Err(e) => error!("session ended: {e}"),
         }
-        std::thread::sleep(Duration::from_millis(500));
+        drop(session);
+        kick = Some(k);
     }
 }
 
@@ -123,7 +205,7 @@ fn replay_file(virgl: &mut Virgl, path: &str, stats: bool) {
         std::thread::sleep(Duration::from_secs(5));
         let _ = guest.shutdown(std::net::Shutdown::Both);
     });
-    let mut session = Session::new(virgl, host);
+    let mut session = Session::new(virgl, StreamChannel::new(host));
     if stats {
         session.enable_stats();
     }

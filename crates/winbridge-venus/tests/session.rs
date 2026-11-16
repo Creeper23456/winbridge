@@ -7,6 +7,7 @@ use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use winbridge_venus::channel::StreamChannel;
 use winbridge_venus::proto::{self, Hdr, PushBuilder, HDR_LEN};
 use winbridge_venus::session::{Renderer, Session};
 
@@ -131,7 +132,7 @@ fn start(mock: &Mock) -> (Guest, std::thread::JoinHandle<()>) {
     let m = mock.clone();
     let t = std::thread::spawn(move || {
         let mut m = m;
-        Session::new(&mut m, b).run().unwrap();
+        Session::new(&mut m, StreamChannel::new(b)).run().unwrap();
     });
     let mut g = Guest(a);
     let (h, p) = g.request(proto::HELLO, 0, &proto::VERSION.to_le_bytes());

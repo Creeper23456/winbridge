@@ -8,12 +8,13 @@
 //! last range first. The ring is scanned before the other shmems and sent after them, so a ring
 //! head never becomes visible ahead of the reply it covers.
 
+use crate::channel::Channel;
 use crate::proto::{self, Hdr, PushBuilder, HDR_LEN};
 use crate::stats::Stats;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -198,11 +199,13 @@ struct Fence {
     submitted: Instant,
 }
 
-pub struct Session<R: Renderer> {
+pub struct Session<R: Renderer, C: Channel> {
     r: R,
-    stream: UnixStream,
+    chan: C,
     rbuf: Vec<u8>,
     rpos: usize,
+    /// Scratch for a message that goes out as one write.
+    wbuf: Vec<u8>,
     hello: bool,
     shms: HashMap<u32, Shm>,
     fences: VecDeque<Fence>,
@@ -214,10 +217,13 @@ pub struct Session<R: Renderer> {
     stats: Stats,
 }
 
-impl<R: Renderer> Session<R> {
-    pub fn new(r: R, stream: UnixStream) -> Session<R> {
+/// Messages up to this payload size are sent header and payload in one write.
+const COALESCE_MAX: usize = 64 << 10;
+
+impl<R: Renderer, C: Channel> Session<R, C> {
+    pub fn new(r: R, chan: C) -> Session<R, C> {
         let now = Instant::now();
-        Session { r, stream, rbuf: Vec::new(), rpos: 0, hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None, stats: Stats::new() }
+        Session { r, chan, rbuf: Vec::new(), rpos: 0, wbuf: Vec::new(), hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_state: now, record: None, stats: Stats::new() }
     }
 
     /// Appends everything the guest sends to `file` as `(microseconds, length, bytes)` records,
@@ -248,7 +254,7 @@ impl<R: Renderer> Session<R> {
             };
             let ctx_fd = if self.hello { self.r.poll_fd(CTX) } else { -1 };
             let timeout = if Instant::now() < self.busy_until { BUSY_POLL } else { IDLE_POLL };
-            self.wait_readable(ctx_fd, timeout)?;
+            self.chan.wait(ctx_fd, timeout)?;
             lap(&mut phases[0]);
             if !self.read_available()? {
                 return Ok(());
@@ -284,56 +290,28 @@ impl<R: Renderer> Session<R> {
         }
     }
 
-    fn wait_readable(&self, ctx_fd: RawFd, timeout: Duration) -> io::Result<()> {
-        let mut fds = [
-            libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: ctx_fd, events: libc::POLLIN, revents: 0 },
-        ];
-        let ts = libc::timespec { tv_sec: timeout.as_secs() as _, tv_nsec: timeout.subsec_nanos() as _ };
-        // SAFETY: `fds` and `ts` are valid for the call; a negative fd is ignored by poll.
-        let r = unsafe { libc::ppoll(fds.as_mut_ptr(), 2, &ts, std::ptr::null()) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads whatever the socket holds. Returns false when the guest closed the channel.
+    /// Reads whatever the channel holds. Returns false when the guest closed the channel.
     fn read_available(&mut self) -> io::Result<bool> {
         if self.rpos > 0 && self.rpos == self.rbuf.len() {
             self.rbuf.clear();
             self.rpos = 0;
         }
-        let mut chunk = vec![0u8; 256 << 10];
-        loop {
-            // SAFETY: `chunk` is valid for its length.
-            let n = unsafe { libc::recv(self.stream.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT) };
-            if n == 0 {
-                return Ok(false);
-            }
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                return match e.kind() {
-                    io::ErrorKind::WouldBlock => Ok(true),
-                    io::ErrorKind::Interrupted => continue,
-                    _ => Err(e),
-                };
-            }
-            self.rbuf.extend_from_slice(&chunk[..n as usize]);
+        let before = self.rbuf.len();
+        let open = self.chan.read_available(&mut self.rbuf)?;
+        if self.rbuf.len() > before {
             if let Some((file, start)) = self.record.as_mut() {
-                let mut rec = Vec::with_capacity(12 + n as usize);
+                let got = &self.rbuf[before..];
+                let mut rec = Vec::with_capacity(12 + got.len());
                 rec.extend_from_slice(&(start.elapsed().as_micros() as u64).to_le_bytes());
-                rec.extend_from_slice(&(n as u32).to_le_bytes());
-                rec.extend_from_slice(&chunk[..n as usize]);
+                rec.extend_from_slice(&(got.len() as u32).to_le_bytes());
+                rec.extend_from_slice(got);
                 if let Err(e) = file.write_all(&rec) {
                     warn!("cannot record the guest stream: {e}");
                     self.record = None;
                 }
             }
         }
+        Ok(open)
     }
 
     fn next_frame(&mut self) -> Option<(Hdr, Vec<u8>)> {
@@ -360,8 +338,14 @@ impl<R: Renderer> Session<R> {
     fn send(&mut self, kind: u32, req: u32, arg: u32, payload: &[u8]) -> io::Result<()> {
         let started = Instant::now();
         let hdr = Hdr { len: payload.len() as u32, kind, req, arg };
-        let mut s = &self.stream;
-        let result = s.write_all(&hdr.encode()).and_then(|()| s.write_all(payload));
+        let result = if payload.len() <= COALESCE_MAX {
+            self.wbuf.clear();
+            self.wbuf.extend_from_slice(&hdr.encode());
+            self.wbuf.extend_from_slice(payload);
+            self.chan.write_all(&self.wbuf)
+        } else {
+            self.chan.write_all(&hdr.encode()).and_then(|()| self.chan.write_all(payload))
+        };
         self.stats.sent(HDR_LEN + payload.len(), started.elapsed());
         result
     }
