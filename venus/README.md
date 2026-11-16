@@ -19,19 +19,15 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 |---|---|
 | `guest/vn_renderer_winbridge.c`, `guest/wbvn_proto.h` | The `vn_renderer` backend and the WBVN wire protocol. Copy them into `src/virtio/vulkan/` of the Mesa tree. |
 | `guest/venus-probe.c` | Loads the driver directly and runs instance, device, submit and a buffer copy through the GPU. |
-| `patches/0001`-`0008` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply with `git am`, in order. |
+| `patches/0001`-`0009` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply in order (`build/build.sh` does). |
 | `patches/virglrenderer/` | Patches to virglrenderer for the host: `0001` and `0002` are needed on NVIDIA 550, `0003` is the command trace. |
 | `tools/compare-command-traces.py` | Compares command traces of the Windows and the Linux driver. |
+| `build/` | The reproducible build of `vulkan_virtio.dll` from Linux: `build.sh`, the pins, the compiler flags. See `build/README.md`. |
 | `../scripts/install-venus-icd.ps1` | Installs and registers the driver in the guest. |
 
 ## Build
 
-The driver is cross-compiled from Linux with `clang-cl` and `lld-link` (LLVM 19) against the MSVC
-runtime and Windows SDK headers and libraries copied from a Windows install. Nothing is built
-inside the guest. Configure Mesa with the Vulkan driver `virtio` on the Windows platform, with a
-meson cross file that points the compiler, linker and resource tools at those wrappers, then
-`ninja src/virtio/vulkan/vulkan_virtio.dll`. The result imports only KERNEL32, USER32, GDI32,
-the UCRT api-sets and VCRUNTIME140.
+`WBVN_ACCEPT_MS_LICENSE=1 build/build.sh` cross-compiles the driver with `clang-cl` and `lld-link` (LLVM 19) against the MSVC runtime and Windows SDK that it downloads with xwin, and leaves `vulkan_virtio.dll` in the work directory. Nothing is built inside the guest. The result imports only KERNEL32, USER32, GDI32, the UCRT api-sets and VCRUNTIME140. What the script needs and pins is in `build/README.md`.
 
 ## Run
 
@@ -43,6 +39,10 @@ patches and are needed on NVIDIA 550.
 
 Guest: run `powershell -ExecutionPolicy Bypass -File scripts/install-venus-icd.ps1 -SourceDll vulkan_virtio.dll` from an elevated
 PowerShell. Applications then find the driver through the Vulkan loader.
+
+## Measuring
+
+`WBVN_STATS=FILE` in the guest's environment makes the driver append one line of counters per second to FILE (submits, renderer waits with a histogram, ring waits, writes, lock waits, reader and pump activity), a line of totals at the end, and at start-up the channel's ping round trips and the length of `Sleep(1)`. `winbridge-venus --stats` logs the host's side once a second: the serve loop by phase, messages and bytes by kind, `submit_cmd`, fence latency with a histogram and the time spent writing. `--stats` also works with `--replay`, which feeds a recording made with `--record` to the host without a guest. Section 3.7 of the ADR shows what these found.
 
 ## Licences
 
