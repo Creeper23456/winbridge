@@ -19,7 +19,9 @@ Mesa's Venus driver (`src/virtio/vulkan`, MIT) generates the encoding of the who
 3. **Memory (amended 2026-11-16, replaces "no blob").** Shmem (command rings, command-stream pools) and `VkDeviceMemory` are *mirrored* between guest and host by copy, not shared: the guest copy is a `VirtualAlloc(MEM_WRITE_WATCH)` region diffed against a snapshot, pushed at submit/flush; GPU writes come back when a fence retires. Host-visible `VkDeviceMemory` is a mappable HOST3D blob on the host, mapped by the bridge. NVIDIA 550 exports dma-bufs it cannot mmap, so the host runs a virglrenderer patch (`VKR_DEBUG=opaque`, `venus/patches/virglrenderer/0001`) that exports an opaque fd instead. Guest event, semaphore and query feedback are disabled (`VN_PERF=no_event_feedback,no_semaphore_feedback,no_query_feedback`) because they would poll mapped device memory.
 4. **Sync fences are created without sync-fd export** (`VKR_DEBUG=nofenceexport`, patch `0002`). Evidence: replaying a recorded guest session (`--record`/`--replay`) segfaulted at a fixed offset in `libnvidia-glcore.so.550.163.01` in the `vkr-queue` thread (`vkWaitForFences`) on every run; with `VK_EXPORT_FENCE_CREATE_INFO` removed the same replay and the VM probe both pass. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when the variable is unset. Cause inside the driver is not known.
 5. The existing hand-written ICD stays as the fallback until Venus passes the acceptance in section 5.
-6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus six local patches (`venus/patches/`) cross-compiles clean (457 of 457 objects) and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
+6. Toolchain: **`clang-cl` (`--target=x86_64-pc-windows-msvc`)**, decided by the user on 2026-11-16. The only reason to prefer `cl` was Windows compatibility and familiarity; `clang-cl` produces the same ABI, links the same CRT and SDK and emits PDBs, and code signing does not depend on the compiler. Native `cl` is dropped. Result: Mesa 26.3.0 plus eight local patches (`venus/patches/`) cross-compiles clean and the resulting `vulkan_virtio.dll` loads and runs in the build VM.
+7. **Presentation uses Mesa's software WSI** (`wsi_common_win32.cpp`, the GDI path lavapipe and dzn use), enabled for Venus by patch `0007`: `VK_KHR_win32_surface` and `VK_KHR_swapchain` are exposed, swapchain images are linear host-visible images that the guest reads through the mirrored mapping and blits to the window. The backend reports `has_implicit_fencing = true` (no sync files exist); the software WSI waits on a fence before it reads an image and a bo is brought up to date when that fence retires. Fence imports with fd `-1` mean "already signaled", as upstream defines.
+8. **Only cached host-visible memory types are exposed** (patch `0008`). The host reads mirrored memory after every fence; on NVIDIA 550 the write-combined and BAR host-visible types are uncached for CPU reads, and one fence retire that scanned about 10 MiB of them took about 490 ms (measured through host-side phase timing in a replay of a recorded session). Non-cached types keep their index but lose `HOST_VISIBLE` and `HOST_COHERENT`.
 
 ## 3. Evidence
 
@@ -58,6 +60,18 @@ Limits of this test: it clears an image and does not copy back or sample; it pro
 - Backends: `vn_renderer_virtgpu.c` needs DRM (no Windows equivalent); `vn_renderer_vtest.c` is POSIX sockets; neither is reusable as is.
 - Remaining errors after those switches (for example `_Interlocked*` intrinsics in `u_atomic.h`) were not worked through; the estimates of what a header patch set would unlock are [INFERENCE].
 
+### 3.4 Venus in the build VM (measured 2026-11-16)
+
+Mesa Venus `vulkan_virtio.dll` installed with `scripts/install-venus-icd.ps1`, host `winbridge-venus` on virglrenderer with the two patches, NVIDIA RTX 3060 Ti, driver 550.163.01:
+
+| Test | Result |
+|---|---|
+| `venus-probe.exe`: instance, device, empty submit, buffer copy through the GPU | Pass, exit 0 |
+| DXVK 3.1.1 d3d11 triangle (`tri11.exe`, 640x360, 120 frames), three runs | Pass 3 of 3; frame **bit-identical** to the frame the hand-written ICD produced (0 of 230400 pixels differ); avg 37.3, 41.0, 43.2 ms per frame, first frame 330-420 ms |
+| Hand-written ICD, same program | avg 4.48 ms per frame |
+
+The Venus path is about nine times slower per frame than the hand-written ICD. Causes not yet separated: round trips through the pump thread, fence retire and copy-back of the swapchain image, serial throughput. Defects found and fixed on the way, each with its evidence in the commit history: `Sleep(1)` lasting 15.6 ms (timer resolution), uncached memory scan (8), sync-file semantics (7), ring tail pushed ahead of its commands (the guest read the tail after the write-watch list, so a tail could arrive without the page behind it; one in several runs ended in `vkUpdateDescriptorSets resulted in CS error`).
+
 ## 4. Options considered
 
 | Option | Effect | Cost / risk |
@@ -70,13 +84,13 @@ Limits of this test: it clears an image and does not copy back or sample; it pro
 ## 5. Acceptance before anything is pushed
 
 1. Command-stream consistency in a Linux container: the same Vulkan call sequence must produce the same Venus byte stream as Mesa's own driver (record with the logging tap used in 3.1), and the same stream through virglrenderer must render the same image.
-2. The DXVK d3d11 triangle runs through the new path in the build VM and matches the current ICD's result.
+2. The DXVK d3d11 triangle runs through the new path in the build VM and matches the current ICD's result. **Done** (section 3.4).
 3. A teapot-class test (depth, textures, constant buffers) renders on both paths.
 4. Mesa and venus-protocol copyright and licence headers are preserved; nothing in the repository carries private paths or host names.
 
 ## 6. Open design items
 
-- **Memory types exposed to the guest (decided).** All host types are exposed, including `HOST_VISIBLE`; the mirrored design in section 2.3 makes mapping work. Cost: copies at submit/fence, so large frequently written buffers are slower than true sharing. Hiding `HOST_VISIBLE` types remains an alternative if the copy cost proves too high.
+- **Memory types exposed to the guest (decided).** Cached host-visible types are exposed and the others are hidden by clearing their host-visible bits (section 2.8); the mirrored design in section 2.3 makes mapping work. Cost: copies at submit and fence, so large frequently written buffers are slower than true sharing.
 - **Where mirrored memory is synchronised:** guest writes are pushed at submit and at `vkFlushMappedMemoryRanges`; host writes are scanned and returned when a fence retires. Bos above 2 MiB are not host-scanned.
 - **Synchronisation primitives** of the new `vn_renderer` (timeline counters over the ring, wait in the guest) and how the wake-up interacts with the poll-and-kick scheme in `docs/IVSHMEM-TRANSPORT.md` (idle wake-up latency is acceptable; steady state must not degrade).
 - **Toolchain:** decided, `clang-cl` cross-compiling from Linux (`lld-link`) against MSVC and Windows SDK headers and libraries copied from a Windows install; nothing is built inside the guest. The sysroot currently lives outside the repository and a reproducible build script is still to be written.
@@ -85,6 +99,6 @@ Limits of this test: it clears an image and does not copy back or sample; it pro
 ## 7. Not verified
 
 - Venus on a driver of 570.86 or later (not tried).
-- A full draw-and-readback path through Venus on NVIDIA 550 (only clears, fences and a buffer copy were run).
+- Frame time of the Venus path (about 40 ms against 4.5 ms) is measured but its causes are not separated; bos above 2 MiB are not host-scanned.
 - Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`); probe wall time of about 41 s in the VM is not analysed.
 - Container tooling: docker was unusable without root, so the build used a user prefix; the byte-for-byte stream comparison of 5.1 has not been run.
