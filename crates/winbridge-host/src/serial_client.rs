@@ -15,9 +15,9 @@ use winbridge_proto::async_io::{read_frame_async, write_frame_async};
 use winbridge_proto::clip::{self, ClipBundle};
 use winbridge_proto::ring::{Endpoint, Inbox, LinkConfig, Pop, Routed, REGION_LEN};
 use winbridge_proto::Message;
+use winbridge_shm::file::{self as shmfile, FileMapping};
 
 use crate::shm::{HostShm, ShmSettings, OFFER_TIMEOUT};
-use crate::shmfile::{self, FileMapping};
 use crate::transfer::{self, Direction, Transfer};
 
 const DROP_CHUNK_SIZE: usize = 256 * 1024; // 256 KB file streaming chunks

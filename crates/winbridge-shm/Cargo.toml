@@ -7,9 +7,8 @@ license.workspace = true
 repository.workspace = true
 description = "Shared-memory (ivshmem) lane transport core for WinBridge"
 
-# No runtime dependencies: the core only needs `core`/`std` and builds for
-# x86_64-pc-windows-msvc with the static CRT.
-
-# Host-only test helpers: map /dev/shm or temp files in place of the BAR.
-[target.'cfg(unix)'.dev-dependencies]
+# The core needs only `core`/`std` and builds for x86_64-pc-windows-msvc with the static CRT.
+# The file mapping of the host side (`file`) exists on Unix only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 memmap2 = "0.9"

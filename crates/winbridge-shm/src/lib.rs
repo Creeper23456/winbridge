@@ -87,6 +87,8 @@
 //! peer `Region::attach` on its own mapping of the same memory; each takes
 //! `producer(id)` / `consumer(id)` for the lanes it may use.
 
+#[cfg(unix)]
+pub mod file;
 mod mapping;
 mod region;
 mod ring;

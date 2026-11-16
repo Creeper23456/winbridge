@@ -1638,7 +1638,6 @@ dependencies = [
  "gtk4",
  "ksni",
  "libc",
- "memmap2",
  "serde",
  "serde_json",
  "tokio",
@@ -1667,6 +1666,7 @@ dependencies = [
 name = "winbridge-shm"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
 ]
 

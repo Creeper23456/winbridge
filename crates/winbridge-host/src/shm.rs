@@ -21,6 +21,9 @@ use winbridge_shm::{Mapping, Region};
 /// How long the host waits for `ShmReady` before it stays on serial.
 pub const OFFER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default backing file of the control region (the `memory-backend-file` of the ivshmem device).
+pub const DEFAULT_PATH: &str = "/dev/shm/winbridge-ctl";
+
 /// User settings for the shared-memory transport.
 #[derive(Debug, Clone)]
 pub struct ShmSettings {
@@ -34,7 +37,7 @@ impl Default for ShmSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            path: std::path::PathBuf::from(crate::shmfile::DEFAULT_PATH),
+            path: std::path::PathBuf::from(DEFAULT_PATH),
         }
     }
 }

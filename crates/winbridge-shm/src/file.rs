@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The shared-memory backing file (`/dev/shm/winbridge-ctl`, the `memory-backend-file` of QEMU's
-//! `ivshmem-plain` device) mapped into the host process.
+//! A shared-memory backing file (the `memory-backend-file` of QEMU's `ivshmem-plain` device, for
+//! example `/dev/shm/winbridge-ctl`) mapped into a host process.
 //!
-//! The file is created and sized by the VM launcher; the host only opens an existing file and
+//! The file is created and sized by the VM launcher; this module only opens an existing file and
 //! refuses one that is not what it expects: a symlink (never followed), anything but a regular
 //! file, a file owned by another user, a world-writable file, or one whose size differs from the
 //! region length.
@@ -11,17 +11,16 @@
 use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::MmapRaw;
-use winbridge_shm::Mapping;
 
-/// Default backing file of the control region.
-pub const DEFAULT_PATH: &str = "/dev/shm/winbridge-ctl";
+use crate::Mapping;
 
-/// A read-write shared mapping of the backing file.
-#[derive(Debug)]
+/// A read-write shared mapping of the backing file. Clones share the one mapping.
+#[derive(Clone, Debug)]
 pub struct FileMapping {
-    map: MmapRaw,
+    map: Arc<MmapRaw>,
 }
 
 // SAFETY: the pointer and length of the mapping never change while the value lives, and the
@@ -65,14 +64,13 @@ pub fn open(path: &Path, expected_len: u64) -> Result<FileMapping, String> {
         ));
     }
     let map = MmapRaw::map_raw(&file).map_err(|e| format!("mapping {}: {}", path.display(), e))?;
-    Ok(FileMapping { map })
+    Ok(FileMapping { map: Arc::new(map) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use winbridge_shm::Mapping;
 
     fn dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("wb-shmfile-{}-{tag}", std::process::id()));

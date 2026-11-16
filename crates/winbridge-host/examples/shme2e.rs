@@ -21,10 +21,6 @@
 //!     --socket /tmp/wbtest.sock --shm-file /dev/shm/wbtest-ctl --mode shm --bulk-mb 1024
 //! ```
 
-#[path = "../src/shmfile.rs"]
-#[allow(dead_code)]
-mod shmfile;
-
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -326,7 +322,7 @@ fn main() {
         Mode::Shm => {
             let Some(cap) = cap else { die("the agent did not announce the shared-memory capability") };
             println!("agent capability: shm protocol {}, instance {:08x}", cap.shm_protocol, cap.instance);
-            let map = shmfile::open(&args.shm_file, REGION_LEN).unwrap_or_else(|e| die(&e));
+            let map = winbridge_shm::file::open(&args.shm_file, REGION_LEN).unwrap_or_else(|e| die(&e));
             let region = create_region(map, 1).unwrap_or_else(|e| die(&format!("cannot create the region: {e}")));
             let t0 = Instant::now();
             ep.send_serial(Message::ShmOffer { shm_version: winbridge_shm::VERSION, region_len: REGION_LEN });

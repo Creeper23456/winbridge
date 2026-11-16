@@ -22,7 +22,6 @@ mod qmp;
 mod router;
 mod serial_client;
 mod shm;
-mod shmfile;
 mod theme;
 mod transfer;
 mod tray;
