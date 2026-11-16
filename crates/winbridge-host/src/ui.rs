@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use serde_json::json;
+use winbridge_proto::archive;
 use winbridge_proto::Message;
 
 /// What the periodic drag probe should do now.
@@ -161,6 +162,8 @@ pub struct ViewerWindow {
     transfer_label: Label,
     /// The running host-to-guest drop and how many more `DropResult`s (one per file) it awaits.
     drop_pending: Cell<Option<(Transfer, u32)>>,
+    /// What the running folder drop left out, shown when the guest has answered.
+    drop_note: Arc<Mutex<Option<String>>>,
 }
 
 impl ViewerWindow {
@@ -266,6 +269,7 @@ impl ViewerWindow {
             transfer_progress: transfer_progress.clone(),
             transfer_label: transfer_label.clone(),
             drop_pending: Cell::new(None),
+            drop_note: Arc::new(Mutex::new(None)),
         });
 
         // The header follows capture changes (released / game mode).
@@ -543,6 +547,30 @@ impl ViewerWindow {
                 if paths.is_empty() {
                     return false;
                 }
+                if paths.iter().any(|p| p.is_dir()) {
+                    // A folder travels as one zip: pack, send, unpack and delete fill the bar.
+                    let xfer = transfer::begin("Packing for Windows", Direction::ToGuest, archive::BAR_TOTAL, None);
+                    let note_slot = viewer_for_drop.upgrade().map(|viewer| {
+                        viewer.drop_pending.set(Some((xfer, 1)));
+                        viewer.drop_note.clone()
+                    });
+                    let transfer_id = counter_for_drop.fetch_add(1, Ordering::SeqCst);
+                    let s_clone = serial_for_drop.clone();
+                    tokio::spawn(async move {
+                        let result = s_clone
+                            .send_drop_archive(paths, transfer_id, guest_x, guest_y, xfer, |note| {
+                                if let Some(slot) = &note_slot {
+                                    *slot.lock().unwrap() = note;
+                                }
+                            })
+                            .await;
+                        if let Err(e) = result {
+                            warn!("Drag-and-drop folder transfer failed: {}", e);
+                            xfer.fail(&e);
+                        }
+                    });
+                    return true;
+                }
                 let total: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
                 let label = match paths.len() {
                     1 => "Sending 1 file to Windows".to_string(),
@@ -675,12 +703,25 @@ impl ViewerWindow {
             return;
         }
         if !success {
+            self.drop_note.lock().unwrap().take();
             xfer.fail(&message);
         } else if remaining <= 1 {
-            xfer.finish();
+            match self.drop_note.lock().unwrap().take() {
+                Some(note) => xfer.finish_with_note(&note),
+                None => xfer.finish(),
+            }
         } else {
             self.drop_pending.set(Some((xfer, remaining - 1)));
         }
+    }
+
+    /// The guest reported a step of a folder transfer that runs there (unpacking a dropped zip).
+    pub fn on_archive_progress(&self, phase: u8, done: u64, total: u64) {
+        let Some((xfer, _)) = self.drop_pending.get() else {
+            return;
+        };
+        xfer.set_label(format!("{} in Windows", archive::phase_name(phase)));
+        xfer.progress(archive::bar(phase, done, total), archive::BAR_TOTAL);
     }
 
     /// Refreshes the transfer bar and the input lock from the transfer hub. Main thread only.
@@ -703,6 +744,9 @@ impl ViewerWindow {
         }
         if !notices.is_empty() {
             self.show_error("File transfer failed", &notices.join("\n"));
+        }
+        for note in transfer::take_notes() {
+            self.show_note(&note);
         }
     }
 
@@ -862,6 +906,12 @@ impl ViewerWindow {
             .buttons(["OK"])
             .build()
             .choose(Some(&self.window), None::<&gio::Cancellable>, |_| {});
+    }
+
+    /// A finished transfer left a note (some files were left out): its first line is the title.
+    fn show_note(&self, note: &str) {
+        let (title, detail) = note.split_once('\n').unwrap_or((note, ""));
+        self.show_error(title, detail);
     }
 
     /// Close button: offer shutdown, minimize, or cancel. The window stays open until the VM is gone.
@@ -1309,10 +1359,12 @@ fn render_framebuffer(
     target_width: f64,
     target_height: f64,
 ) {
+    let t = stats::begin();
     let (width, height, stride, data) = {
         let guard = fb_arc.lock().unwrap();
         (guard.width, guard.height, guard.stride, guard.data.clone())
     };
+    let copy_ns = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
 
     if width == 0 || height == 0 || data.is_empty() {
         return;
@@ -1335,6 +1387,7 @@ fn render_framebuffer(
         let _ = cr.paint();
         cr.restore().unwrap();
     }
+    stats::draw(t, copy_ns);
 }
 
 #[cfg(test)]
@@ -1359,12 +1412,10 @@ mod tests {
         assert_eq!(p.update(t0 + PROBE_WINDOW, true, true, false), ProbeAction::GiveUp);
         assert_eq!(p.update(t0 + PROBE_WINDOW + Duration::from_secs(1), true, true, false), ProbeAction::Idle);
     }
-    let t = stats::begin();
 
     #[test]
     fn stops_on_release_reentry_or_host_drag_and_restarts() {
         let t0 = Instant::now();
-    let copy_ns = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
         for (down, outside, host) in [(false, true, false), (true, false, false), (true, true, true)] {
             let mut p = ProbeState::default();
             assert_eq!(p.update(t0, true, true, false), ProbeAction::Probe);
@@ -1380,4 +1431,3 @@ mod tests {
         assert_eq!(p.update(t0 + PROBE_WINDOW, true, true, false), ProbeAction::Probe);
     }
 }
-    stats::draw(t, copy_ns);

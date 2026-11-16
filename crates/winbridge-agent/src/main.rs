@@ -364,6 +364,13 @@ fn main() {
                 }
             }
 
+            Message::DropArchiveStart { transfer_id, operation_id, total_bytes } => {
+                if let Err(e) = dnd.start_archive(transfer_id, operation_id, total_bytes) {
+                    warn!("Could not start the dropped folder: {}", e);
+                    let _ = out.send(Message::DropResult { success: false, message: e });
+                }
+            }
+
             Message::DropFileChunk { transfer_id, offset, data } => {
                 if let Err(e) = dnd.write_chunk(transfer_id, offset, &data) {
                     warn!("Dropped file chunk failed: {}", e);
@@ -371,12 +378,21 @@ fn main() {
             }
 
             Message::DropFileFinish { transfer_id, success, error: _ } => {
-                let (ok, msg) = match dnd.finish_file(transfer_id, success) {
-                    Ok(Some(message)) => (true, message),
-                    Ok(None) => (true, "File received; waiting for remaining files".into()),
-                    Err(e) => (false, e),
-                };
-                let _ = out.send(Message::DropResult { success: ok, message: msg });
+                match dnd.finish_file(transfer_id, success) {
+                    Ok(dnd::Finished::Unpack(job)) => spawn_unpacker(out.clone(), job),
+                    Ok(dnd::Finished::Saved(message)) => {
+                        let _ = out.send(Message::DropResult { success: true, message });
+                    }
+                    Ok(dnd::Finished::Waiting) => {
+                        let _ = out.send(Message::DropResult {
+                            success: true,
+                            message: "File received; waiting for remaining files".into(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = out.send(Message::DropResult { success: false, message: e });
+                    }
+                }
             }
 
             Message::DropText { text, x, y } => {
@@ -389,6 +405,38 @@ fn main() {
 
             _ => {}
         }
+    }
+}
+
+/// Unpacks a received folder drop on a worker thread (the message loop must not wait for it),
+/// reports the unpack and delete steps to the host's progress bar (at most ten times a second)
+/// and answers the drop.
+fn spawn_unpacker(out: Outgoing, job: dnd::UnpackJob) {
+    let id = job.operation_id();
+    let answer = out.clone();
+    let spawned = std::thread::Builder::new().name("winbridge-drop-unpack".into()).spawn(move || {
+        let mut last: Option<(u8, std::time::Instant)> = None;
+        let mut report = |phase: u8, done: u64, total: u64| {
+            let due = match last {
+                Some((p, at)) => p != phase || done >= total || at.elapsed() >= std::time::Duration::from_millis(100),
+                None => true,
+            };
+            if due {
+                last = Some((phase, std::time::Instant::now()));
+                let _ = out.send(Message::ArchiveProgress { id, phase, done, total });
+            }
+        };
+        let (success, message) = match dnd::run_unpack(job, &mut report) {
+            Ok(message) => (true, message),
+            Err(e) => {
+                warn!("Folder drop {} failed: {}", id, e);
+                (false, e)
+            }
+        };
+        let _ = out.send(Message::DropResult { success, message });
+    });
+    if let Err(e) = spawned {
+        let _ = answer.send(Message::DropResult { success: false, message: format!("cannot start unpacking: {}", e) });
     }
 }
 

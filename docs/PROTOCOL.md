@@ -156,7 +156,7 @@ File and text drops include guest-screen pixel coordinates, not GTK widget coord
 - An Explorer window selects its current location when `IShellWindows` identifies a filesystem directory.
 - Any other window selects `%USERPROFILE%\Downloads\WinBridge` for staging. After all files arrive, the agent starts a real OLE drag with a Shell `CF_HDROP` data object and injects mouse input at the original point. The application must accept OLE file drops for this to succeed; rejected or failed drops remain in the staging directory.
 
-Every destination file is created with create-new semantics. An existing name is never overwritten; the agent appends ` (1)`, ` (2)`, and so on before the extension. Drops are regular files, not recursive directory transfers.
+Every destination file is created with create-new semantics. An existing name is never overwritten; the agent appends ` (1)`, ` (2)`, and so on before the extension. Files of a drop travel one by one; a drop that contains a folder travels as a zip (below).
 
 #### `DropBegin`
 - **Direction:** Host $\to$ Agent
@@ -204,6 +204,24 @@ Every destination file is created with create-new semantics. An existing name is
 - **Fields:**
   - `success: bool`: `true` if saved successfully; `false` otherwise.
   - `message: String`: Human-readable status (e.g. `Saved to C:\Users\User\Downloads\WinBridge\report.pdf`).
+
+#### Folder drops and drags (zip)
+A drop or drag that contains a folder travels as one zip (`proto::archive`, stored without compression) instead of as separate files. The sender leaves out what the other system could not create (names Windows forbids, links, unreadable files, paths longer than 200 characters) and names the first few of them; the receiver refuses an archive with an unsafe entry. Four steps fill the progress bar in order: pack (30 %), send (35 %), unpack (30 %), delete the zip (5 %). A transfer that left files out ends with a notice that lists them.
+
+#### `DropArchiveStart`
+- **Direction:** Host $\to$ Agent
+- **Description:** Starts the zip of a folder drop within a preceding `DropBegin`. `DropFileChunk` and `DropFileFinish` follow with the same `transfer_id`. After the last chunk the agent unpacks the zip into the operation's staging directory, deletes it and moves the top-level items to the drop location (a folder takes the first free name: `name`, `name (1)`, ...).
+- **Fields:** `transfer_id: u32`, `operation_id: u32`, `total_bytes: u64`.
+
+#### `ArchiveBegin`
+- **Direction:** Agent $\to$ Host
+- **Description:** Starts the zip of a folder dragged out of the guest; `FileChunk` messages with `index: 0` and `FilesEnd` follow on the same `stream_id`.
+- **Fields:** `stream_id: u32`, `total_bytes: u64`, `skipped: u32` (entries left out), `listed: Vec<String>` (the first few, with the reason).
+
+#### `ArchiveProgress`
+- **Direction:** Agent $\to$ Host
+- **Description:** Progress of a step the guest runs itself (packing a dragged folder, unpacking a dropped one). The host maps it to the bar.
+- **Fields:** `id: u32` (the drop's `operation_id` or the drag's id), `phase: u8` (1 pack, 2 send, 3 unpack, 4 delete), `done: u64`, `total: u64`.
 
 ---
 
@@ -296,7 +314,7 @@ Scheduling (one writer thread per direction): control is strict priority; bulk i
 
 ### 3.5 Lane mapping
 
-`Message::is_bulk()` decides. **Bulk lane:** `ClipboardOffer`, `ClipboardItem`, `ClipFilesManifest` (a clipboard snapshot is one ordered stream; items can be tens of MiB), `FilesBegin`, `FileEntry`, `FileChunk`, `FilesEnd`, `DropBegin`, `DropFileStart`, `DropFileChunk`, `DropFileFinish`. **Control lane:** everything else (`Ping`, `Pong`, resolution, DPI, status, `DropText`, `DropResult`, `ClipFilesRequest`, all `Guest*` drag messages). The four `Shm*` messages never use a lane.
+`Message::is_bulk()` decides. **Bulk lane:** `ClipboardOffer`, `ClipboardItem`, `ClipFilesManifest` (a clipboard snapshot is one ordered stream; items can be tens of MiB), `FilesBegin`, `FileEntry`, `FileChunk`, `FilesEnd`, `DropBegin`, `DropFileStart`, `DropArchiveStart`, `ArchiveBegin`, `DropFileChunk`, `DropFileFinish`. **Control lane:** everything else (`Ping`, `Pong`, resolution, DPI, status, `DropText`, `DropResult`, `ArchiveProgress`, `ClipFilesRequest`, all `Guest*` drag messages). The four `Shm*` messages never use a lane.
 
 Messages of one stream always share one lane, so their order is kept. **The order between a control message and a bulk message is not guaranteed** on this transport and no code may rely on it (for example a `ClipFilesRequest` can overtake the `ClipboardOffer` it refers to; both sides treat an unknown or stale `clip_id` as an error they already handle). A control message larger than the control record cap (for example a huge `DropText`) is sent over serial.
 

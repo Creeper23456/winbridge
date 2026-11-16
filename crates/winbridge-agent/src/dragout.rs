@@ -44,6 +44,8 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess};
+    use std::io::Read;
+    use winbridge_proto::archive;
     use winbridge_proto::files::{self, FileEntryInfo};
     use winbridge_proto::Message;
 
@@ -139,13 +141,15 @@ mod imp {
                         let offer = shared.offer.lock().unwrap();
                         offer.as_ref().filter(|o| o.id == drag_id).map(|o| o.paths.clone())
                     };
-                    let entries = paths
-                        .ok_or_else(|| "the drag is no longer available".to_string())
-                        .and_then(|paths| files::scan(&paths, DRAG_CAP_BYTES));
-                    let result = entries.and_then(|entries: Vec<FileEntryInfo>| {
-                        info!("Guest drag {}: streaming {} dragged entries to the host", drag_id, entries.len());
-                        files::send_stream(drag_id, &entries, &mut |msg| (shared.sink)(msg))
-                    });
+                    let result = match paths {
+                        None => Err("the drag is no longer available".to_string()),
+                        // A drag with a folder travels as one zip.
+                        Some(paths) if paths.iter().any(|p| p.is_dir()) => send_archive(&shared, drag_id, &paths),
+                        Some(paths) => files::scan(&paths, DRAG_CAP_BYTES).and_then(|entries: Vec<FileEntryInfo>| {
+                            info!("Guest drag {}: streaming {} dragged entries to the host", drag_id, entries.len());
+                            files::send_stream(drag_id, &entries, &mut |msg| (shared.sink)(msg))
+                        }),
+                    };
                     if let Err(e) = result {
                         warn!("Dragged files could not be sent: {}", e);
                         // A stream that never began still needs an ending for the host to give up.
@@ -154,6 +158,62 @@ mod imp {
                 })
                 .ok();
         }
+    }
+
+    /// Where the zip of a folder drag is built before it is streamed.
+    fn outgoing_dir() -> PathBuf {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("WinBridge")
+            .join("outgoing")
+    }
+
+    /// Answers the fetch of a drag that contains a folder with one zip: packs it (the first step
+    /// of the host's bar, reported at most ten times a second), then streams it as `ArchiveBegin`,
+    /// `FileChunk`s and `FilesEnd`. The host unpacks it and deletes its copy.
+    fn send_archive(shared: &Shared, drag_id: u32, paths: &[PathBuf]) -> Result<(), String> {
+        let zip = outgoing_dir().join(format!("{}.zip", drag_id));
+        let mut last: Option<Instant> = None;
+        let packed = archive::pack(paths, archive::Dest::Linux, &zip, DRAG_CAP_BYTES, &mut |done, total| {
+            if done >= total || last.is_none_or(|at| at.elapsed() >= Duration::from_millis(100)) {
+                last = Some(Instant::now());
+                shared.send(Message::ArchiveProgress { id: drag_id, phase: archive::PHASE_PACK, done, total });
+            }
+            true
+        });
+        let sent = packed.and_then(|report| send_zip(shared, drag_id, &zip, &report));
+        let _ = std::fs::remove_file(&zip);
+        sent
+    }
+
+    fn send_zip(shared: &Shared, drag_id: u32, zip: &std::path::Path, report: &archive::Report) -> Result<(), String> {
+        if report.files == 0 && report.dirs == 0 {
+            return Err(report.notice().unwrap_or_else(|| "nothing to send".to_string()));
+        }
+        let mut file = File::open(zip).map_err(|e| format!("{}: {}", zip.display(), e))?;
+        let total = file.metadata().map_err(|e| format!("{}: {}", zip.display(), e))?.len();
+        info!(
+            "Guest drag {}: sending a zip of {} bytes ({} files, {} folders, {} left out)",
+            drag_id, total, report.files, report.dirs, report.skipped
+        );
+        (shared.sink)(Message::ArchiveBegin {
+            stream_id: drag_id,
+            total_bytes: total,
+            skipped: report.skipped,
+            listed: report.listed.clone(),
+        })?;
+        let mut buf = vec![0u8; files::CHUNK_SIZE];
+        let mut offset = 0u64;
+        loop {
+            let n = file.read(&mut buf).map_err(|e| format!("{}: {}", zip.display(), e))?;
+            if n == 0 {
+                break;
+            }
+            (shared.sink)(Message::FileChunk { stream_id: drag_id, index: 0, offset, data: buf[..n].to_vec() })?;
+            offset += n as u64;
+        }
+        (shared.sink)(Message::FilesEnd { stream_id: drag_id, success: true, error: None })
     }
 
     /// Keeps one helper alive: start, serve, and on any failure restart with a back-off.

@@ -14,13 +14,17 @@ use tracing::{info, warn};
 use winbridge_proto::async_io::{read_frame_async, write_frame_async};
 use winbridge_proto::clip::{self, ClipBundle};
 use winbridge_proto::ring::{Endpoint, Inbox, LinkConfig, Pop, Routed, REGION_LEN};
+use winbridge_proto::archive;
 use winbridge_proto::Message;
 use winbridge_shm::file::{self as shmfile, FileMapping};
 
+use crate::clipboard;
 use crate::shm::{HostShm, ShmSettings, OFFER_TIMEOUT};
 use crate::transfer::{self, Direction, Transfer};
 
 const DROP_CHUNK_SIZE: usize = 256 * 1024; // 256 KB file streaming chunks
+/// Largest folder drop (content bytes) the viewer packs.
+const ARCHIVE_CAP_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Outgoing path of the handle: a lane when shared memory is active, else the serial queue.
 /// With shared memory off every message takes the serial queue, as before.
@@ -209,7 +213,7 @@ impl SerialClientHandle {
         sent: &mut u64,
         total: u64,
     ) -> Result<(), String> {
-        let mut file = File::open(&path)
+        let file = File::open(&path)
             .await
             .map_err(|e| format!("Failed to open drop file {:?}: {}", path, e))?;
 
@@ -240,30 +244,37 @@ impl SerialClientHandle {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut offset = 0;
-        let mut buf = vec![0u8; DROP_CHUNK_SIZE];
+        let base = *sent;
+        let offset = self
+            .stream_drop_body(file, transfer_id, &mut |offset| xfer.progress(base + offset, total))
+            .await?;
+        *sent = base + offset;
 
+        Ok(())
+    }
+
+    /// Streams the rest of a drop file after its start message: the chunks and the finish
+    /// message. `progress` gets the bytes sent so far and says whether to go on; on a stop the
+    /// guest is told to drop the partial file. Returns the bytes sent.
+    async fn stream_drop_body(
+        &self,
+        mut file: File,
+        transfer_id: u32,
+        progress: &mut (dyn FnMut(u64) -> bool + Send),
+    ) -> Result<u64, String> {
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; DROP_CHUNK_SIZE];
         loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| format!("Read chunk failed: {}", e))?;
+            let n = file.read(&mut buf).await.map_err(|e| format!("Read chunk failed: {}", e))?;
             if n == 0 {
                 break;
             }
-
             self.tx
-                .send(Message::DropFileChunk {
-                    transfer_id,
-                    offset,
-                    data: buf[0..n].to_vec(),
-                })
+                .send(Message::DropFileChunk { transfer_id, offset, data: buf[0..n].to_vec() })
                 .await
                 .map_err(|e| e.to_string())?;
-
             offset += n as u64;
-            *sent += n as u64;
-            if !xfer.progress(*sent, total) {
+            if !progress(offset) {
                 // Cancelled or timed out: tell the guest to drop the partial file.
                 let _ = self
                     .tx
@@ -276,16 +287,71 @@ impl SerialClientHandle {
                 return Err("cancelled".to_string());
             }
         }
-
         self.tx
-            .send(Message::DropFileFinish {
-                transfer_id,
-                success: true,
-                error: None,
-            })
+            .send(Message::DropFileFinish { transfer_id, success: true, error: None })
             .await
             .map_err(|e| e.to_string())?;
+        Ok(offset)
+    }
 
+    /// Sends dropped items that include a folder as one zip: packs them (the first step of the
+    /// bar), streams the zip as one drop file (the second) and leaves unpacking and clean-up to
+    /// the guest, whose `ArchiveProgress` messages move the bar on. `on_note` gets the notice
+    /// about what was left out, before anything is sent (so it is in place when the guest's
+    /// answer arrives). Fails when nothing could be packed or the transfer was cancelled.
+    pub async fn send_drop_archive(
+        &self,
+        paths: Vec<PathBuf>,
+        transfer_id: u32,
+        x: u32,
+        y: u32,
+        xfer: Transfer,
+        on_note: impl FnOnce(Option<String>),
+    ) -> Result<(), String> {
+        let zip = clipboard::cache_root().join("drop-out").join(format!("{}.zip", transfer_id));
+        xfer.set_label("Packing for Windows");
+        let pack_to = zip.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            archive::pack(&paths, archive::Dest::Windows, &pack_to, ARCHIVE_CAP_BYTES, &mut |done, total| {
+                xfer.progress(archive::bar(archive::PHASE_PACK, done, total), archive::BAR_TOTAL)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        if report.files == 0 && report.dirs == 0 {
+            let _ = std::fs::remove_file(&zip);
+            return Err(report.notice().unwrap_or_else(|| "nothing to send".to_string()));
+        }
+        info!(
+            "Packed the drop into {:?}: {} file(s), {} folder(s), {} bytes, {} left out",
+            zip, report.files, report.dirs, report.bytes, report.skipped
+        );
+        on_note(report.notice());
+        let sent = self.stream_drop_archive(&zip, transfer_id, x, y, xfer).await;
+        let _ = std::fs::remove_file(&zip);
+        sent?;
+        xfer.set_label("Windows is unpacking the folder");
+        xfer.progress(archive::bar(archive::PHASE_UNPACK, 0, 1), archive::BAR_TOTAL);
+        Ok(())
+    }
+
+    async fn stream_drop_archive(&self, zip: &std::path::Path, transfer_id: u32, x: u32, y: u32, xfer: Transfer) -> Result<(), String> {
+        let file = File::open(zip).await.map_err(|e| format!("{}: {}", zip.display(), e))?;
+        let total_bytes = file.metadata().await.map_err(|e| format!("{}: {}", zip.display(), e))?.len();
+        xfer.set_label("Sending to Windows");
+        self.tx
+            .send(Message::DropBegin { transfer_id, x, y, file_count: 1 })
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("Starting folder drop {} at guest ({}, {}): {} bytes of zip", transfer_id, x, y, total_bytes);
+        self.tx
+            .send(Message::DropArchiveStart { transfer_id, operation_id: transfer_id, total_bytes })
+            .await
+            .map_err(|e| e.to_string())?;
+        self.stream_drop_body(file, transfer_id, &mut |sent| {
+            xfer.progress(archive::bar(archive::PHASE_SEND, sent, total_bytes), archive::BAR_TOTAL)
+        })
+        .await?;
         Ok(())
     }
 

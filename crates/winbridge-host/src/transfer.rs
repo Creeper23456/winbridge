@@ -78,6 +78,7 @@ impl View {
 struct Core {
     entries: Vec<Entry>,
     notices: Vec<String>,
+    notes: Vec<String>,
     next_id: u64,
 }
 
@@ -133,6 +134,15 @@ impl Core {
         let before = self.entries.len();
         self.entries.retain(|e| e.id != id);
         self.entries.len() != before
+    }
+
+    /// Ends a transfer normally and leaves `note` for the user.
+    fn finish_with_note(&mut self, id: u64, note: &str) -> bool {
+        let ended = self.finish(id);
+        if ended {
+            self.notes.push(note.to_string());
+        }
+        ended
     }
 
     /// Ends a transfer with an error the user must see.
@@ -320,6 +330,15 @@ impl Transfer {
             HUB.notify();
         }
     }
+
+    /// Ends the transfer successfully with a note the user must see (some files were left out,
+    /// say). No-op when it already ended.
+    pub fn finish_with_note(self, note: &str) {
+        if HUB.core.lock().unwrap().finish_with_note(self.0, note) {
+            info!("Transfer {} finished with a note: {}", self.0, note.lines().next().unwrap_or(""));
+            HUB.notify();
+        }
+    }
 }
 
 /// The Cancel button: ends every transfer and runs their abort hooks.
@@ -334,6 +353,11 @@ pub fn cancel_all() {
 pub fn take_view() -> (Option<View>, Vec<String>) {
     let mut core = HUB.core.lock().unwrap();
     (core.view(), std::mem::take(&mut core.notices))
+}
+
+/// The notes that finished transfers left for the user (not errors): shown once.
+pub fn take_notes() -> Vec<String> {
+    std::mem::take(&mut HUB.core.lock().unwrap().notes)
 }
 
 #[cfg(test)]
@@ -390,6 +414,17 @@ mod tests {
         assert!(core.fail(id, "disk full"));
         assert!(!core.fail(id, "again"));
         assert_eq!(core.notices, vec!["Sending 2 files to Windows: disk full".to_string()]);
+        assert_eq!(core.view(), None);
+    }
+
+    #[test]
+    fn finish_with_a_note_ends_the_transfer_and_records_the_note_not_an_error() {
+        let mut core = Core::default();
+        let id = begin(&mut core, Instant::now(), 10);
+        assert!(core.finish_with_note(id, "2 left out"));
+        assert!(!core.finish_with_note(id, "again"));
+        assert_eq!(core.notes, vec!["2 left out".to_string()]);
+        assert!(core.notices.is_empty());
         assert_eq!(core.view(), None);
     }
 

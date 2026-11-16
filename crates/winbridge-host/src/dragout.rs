@@ -17,12 +17,14 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use std::cell::RefCell;
+use std::io::Write;
 use std::path::PathBuf;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+use winbridge_proto::archive;
 use winbridge_proto::files::Receiver;
 use winbridge_proto::Message;
 
@@ -37,6 +39,8 @@ type FetchResult = Result<Vec<PathBuf>, String>;
 struct Sink {
     expect: Option<u32>,
     receiver: Option<(u32, Receiver)>,
+    /// A folder drag: the zip being received.
+    archive: Option<ArchiveIn>,
     result: Option<(u32, FetchResult)>,
     /// The progress-hub transfer of the running fetch, with bytes received and the stream total.
     xfer: Option<Transfer>,
@@ -44,8 +48,56 @@ struct Sink {
     total: u64,
 }
 
-static SINK: Mutex<Sink> =
-    Mutex::new(Sink { expect: None, receiver: None, result: None, xfer: None, done: 0, total: 0 });
+static SINK: Mutex<Sink> = Mutex::new(Sink {
+    expect: None,
+    receiver: None,
+    archive: None,
+    result: None,
+    xfer: None,
+    done: 0,
+    total: 0,
+});
+
+/// The zip of a folder drag on its way in (`ArchiveBegin`, `FileChunk`s with index 0, `FilesEnd`).
+struct ArchiveIn {
+    zip: PathBuf,
+    file: std::fs::File,
+    written: u64,
+    total: u64,
+    /// Entries the guest left out before packing, and the first few with the reason.
+    skipped: u32,
+    listed: Vec<String>,
+}
+
+impl ArchiveIn {
+    fn create(id: u32, total: u64, skipped: u32, listed: Vec<String>) -> Result<Self, String> {
+        if total > DRAG_CAP_BYTES {
+            return Err(format!("the zip of {} bytes exceeds the limit", total));
+        }
+        let zip = cache_root().join("drag-in").join(format!("{}.zip", id));
+        if let Some(parent) = zip.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+        }
+        let file = std::fs::File::create(&zip).map_err(|e| format!("{}: {}", zip.display(), e))?;
+        Ok(Self { zip, file, written: 0, total, skipped, listed })
+    }
+
+    fn write(&mut self, index: u32, offset: u64, data: &[u8]) -> Result<(), String> {
+        if index != 0 || offset != self.written || self.written + data.len() as u64 > self.total {
+            return Err("a chunk of the zip is out of order or too large".to_string());
+        }
+        self.file.write_all(data).map_err(|e| format!("{}: {}", self.zip.display(), e))?;
+        self.written += data.len() as u64;
+        Ok(())
+    }
+}
+
+/// Drops a half-received zip.
+fn discard_archive(sink: &mut Sink) {
+    if let Some(received) = sink.archive.take() {
+        let _ = std::fs::remove_file(&received.zip);
+    }
+}
 
 /// Registers that the file stream `id` is the answer to a `GuestDragFetch`.
 fn expect(id: u32) {
@@ -55,6 +107,7 @@ fn expect(id: u32) {
     }
     sink.expect = Some(id);
     sink.receiver = None;
+    discard_archive(&mut sink);
     sink.result = None;
     sink.done = 0;
     sink.total = 0;
@@ -72,6 +125,7 @@ fn abort(id: u32, why: Abort) {
     };
     warn!("Guest drag fetch {} abandoned: {}", id, reason);
     sink.receiver = None;
+    discard_archive(&mut sink);
     sink.expect = None;
     sink.xfer = None;
     sink.result = Some((id, Err(reason.to_string())));
@@ -95,6 +149,7 @@ pub fn handle(msg: &Message) -> bool {
     let fail = |sink: &mut Sink, id: u32, error: String| {
         warn!("Guest drag transfer failed: {}", error);
         sink.receiver = None;
+        discard_archive(sink);
         sink.expect = None;
         if let Some(xfer) = sink.xfer.take() {
             xfer.fail(&error);
@@ -102,6 +157,21 @@ pub fn handle(msg: &Message) -> bool {
         sink.result = Some((id, Err(error)));
     };
     match msg {
+        Message::ArchiveBegin { stream_id, total_bytes, skipped, listed } if *stream_id == expected => {
+            match ArchiveIn::create(*stream_id, *total_bytes, *skipped, listed.clone()) {
+                Ok(received) => {
+                    sink.archive = Some(received);
+                    sink.done = 0;
+                    sink.total = *total_bytes;
+                    if let Some(xfer) = sink.xfer {
+                        xfer.set_label("Receiving files from Windows");
+                        xfer.progress(archive::bar(archive::PHASE_SEND, 0, *total_bytes), archive::BAR_TOTAL);
+                    }
+                }
+                Err(e) => fail(&mut sink, *stream_id, e),
+            }
+            true
+        }
         Message::FilesBegin { stream_id, entries, total_bytes } if *stream_id == expected => {
             let root = cache_root().join("drag-in").join(stream_id.to_string());
             let _ = std::fs::remove_dir_all(&root);
@@ -129,7 +199,16 @@ pub fn handle(msg: &Message) -> bool {
         Message::FileChunk { stream_id, index, offset, data } if *stream_id == expected => {
             let mut failure = None;
             let st: &mut Sink = &mut sink;
-            if let Some((_, receiver)) = st.receiver.as_mut() {
+            if let Some(a) = st.archive.as_mut() {
+                match a.write(*index, *offset, data) {
+                    Ok(()) => {
+                        if let Some(xfer) = st.xfer {
+                            xfer.progress(archive::bar(archive::PHASE_SEND, a.written, a.total), archive::BAR_TOTAL);
+                        }
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            } else if let Some((_, receiver)) = st.receiver.as_mut() {
                 match receiver.chunk(*index, *offset, data) {
                     Ok(()) => {
                         st.done += data.len() as u64;
@@ -146,6 +225,25 @@ pub fn handle(msg: &Message) -> bool {
             true
         }
         Message::FilesEnd { stream_id, success, error } if *stream_id == expected => {
+            if let Some(received) = sink.archive.take() {
+                if !*success || received.written != received.total {
+                    let error = error.clone().unwrap_or_else(|| {
+                        format!("the zip is incomplete: {} of {} bytes", received.written, received.total)
+                    });
+                    let _ = std::fs::remove_file(&received.zip);
+                    fail(&mut sink, *stream_id, error);
+                } else {
+                    let xfer = sink.xfer;
+                    let id = *stream_id;
+                    let spawned = std::thread::Builder::new()
+                        .name("winbridge-drag-unzip".into())
+                        .spawn(move || unpack_archive(id, received, xfer));
+                    if let Err(e) = spawned {
+                        fail(&mut sink, id, format!("cannot start unpacking: {}", e));
+                    }
+                }
+                return true;
+            }
             let outcome = match sink.receiver.take() {
                 Some((_, receiver)) => receiver.finish(*success, error.clone()),
                 None => Err(error.clone().unwrap_or_else(|| "the guest sent no files".to_string())),
@@ -162,6 +260,69 @@ pub fn handle(msg: &Message) -> bool {
         }
         _ => false,
     }
+}
+
+/// Progress of a step the guest runs itself (packing the dragged folder). True when `id` is the
+/// running fetch.
+pub fn progress(id: u32, phase: u8, done: u64, total: u64) -> bool {
+    let sink = SINK.lock().unwrap();
+    if sink.expect != Some(id) {
+        return false;
+    }
+    if let Some(xfer) = sink.xfer {
+        xfer.set_label(format!("{} in Windows", archive::phase_name(phase)));
+        xfer.progress(archive::bar(phase, done, total), archive::BAR_TOTAL);
+    }
+    true
+}
+
+/// Unpacks the received zip below the drag's staging directory and deletes it (the last two
+/// steps of the bar), then answers the waiting drop. Runs on its own thread: the link reader
+/// must not wait for it.
+fn unpack_archive(id: u32, received: ArchiveIn, xfer: Option<Transfer>) {
+    let ArchiveIn { zip, file, skipped, listed, .. } = received;
+    drop(file);
+    let root = cache_root().join("drag-in").join(id.to_string());
+    let _ = std::fs::remove_dir_all(&root);
+    let step = |phase: u8, done: u64, total: u64| {
+        xfer.is_none_or(|x| x.progress(archive::bar(phase, done, total), archive::BAR_TOTAL))
+    };
+    if let Some(x) = xfer {
+        x.set_label("Unpacking");
+    }
+    let outcome = archive::unpack(&zip, &root, archive::Dest::Linux, DRAG_CAP_BYTES, &mut |d, t| {
+        step(archive::PHASE_UNPACK, d, t)
+    })
+    .and_then(|tops| {
+        if let Some(x) = xfer {
+            x.set_label("Deleting the zip");
+        }
+        step(archive::PHASE_DELETE, 0, 1);
+        std::fs::remove_file(&zip).map_err(|e| format!("{}: {}", zip.display(), e))?;
+        step(archive::PHASE_DELETE, 1, 1);
+        Ok(tops)
+    });
+    let _ = std::fs::remove_file(&zip);
+    if outcome.is_err() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    let mut sink = SINK.lock().unwrap();
+    if sink.expect != Some(id) {
+        // Cancelled or timed out meanwhile: nobody waits for the files.
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    sink.expect = None;
+    if let Some(xfer) = sink.xfer.take() {
+        match &outcome {
+            Ok(_) => match archive::notice(skipped, &listed) {
+                Some(note) => xfer.finish_with_note(&note),
+                None => xfer.finish(),
+            },
+            Err(e) => xfer.fail(e),
+        }
+    }
+    sink.result = Some((id, outcome));
 }
 
 mod imp {

@@ -233,6 +233,19 @@ fn main() -> glib::ExitCode {
                     clipboard::CLIP_IN.handle_files(&msg);
                 }
             }
+            msg @ Message::ArchiveBegin { .. } => {
+                if !dragout::handle(&msg) {
+                    warn!("A folder archive arrived that no drag asked for; ignored");
+                }
+            }
+            Message::ArchiveProgress { id, phase, done, total } => {
+                // Steps the guest runs itself: packing a dragged folder, unpacking a dropped zip.
+                if !dragout::progress(id, phase, done, total) {
+                    glib::idle_add_once(move || {
+                        with_viewer(|v| v.on_archive_progress(phase, done, total));
+                    });
+                }
+            }
             Message::GuestDragNone => {
                 info!("Guest reports no drag in progress (GuestDragNone)");
                 glib::idle_add_once(|| {

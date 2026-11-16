@@ -98,7 +98,7 @@ To drive guest desktop resolution, DPI scaling, clipboard exchange, and drag-and
    - Calls Win32 `ChangeDisplaySettingsExW` and CCD API `DisplayConfigSetDeviceInfo` on demand.
 4. **Drop Receiver:**
    - Maps host drop coordinates into guest pixels and hit-tests the root window. Files go directly to the Desktop or an Explorer filesystem folder when applicable; other applications receive a Shell `CF_HDROP` OLE drag staged under Downloads.
-   - Uses short-lived single-threaded apartments for `IShellWindows` lookup and OLE drag-and-drop. Mouse release is injected on every drag exit path; rejected OLE drops remain in the staging directory. Existing files are preserved with numeric suffixes. Native text drops into guest applications and directory drops into guest applications are not implemented (guest-to-host drags are described below).
+   - Uses short-lived single-threaded apartments for `IShellWindows` lookup and OLE drag-and-drop. Mouse release is injected on every drag exit path; rejected OLE drops remain in the staging directory. Existing files are preserved with numeric suffixes. A drop that contains a folder arrives as one zip, is unpacked on a worker thread and moved as a folder (see `PROTOCOL.md`, folder drops). Native text drops into guest applications are not implemented (guest-to-host drags are described below).
 
 ---
 

@@ -18,6 +18,7 @@ pub struct ManifestEntry {
     pub size: u64,
 }
 
+pub mod archive;
 pub mod clip;
 pub mod files;
 pub mod caps;
@@ -263,6 +264,34 @@ pub enum Message {
         success: bool,
         error: Option<String>,
     },
+    /// Host -> guest: the dropped items travel as one zip (`proto::archive`). Its bytes follow as
+    /// `DropFileChunk` and `DropFileFinish` of `transfer_id` (a drop operation `operation_id`
+    /// that began with `DropBegin` and `file_count` 1); the guest unpacks it into the staging
+    /// directory of the operation, deletes it and moves the top-level items to the drop location.
+    DropArchiveStart {
+        transfer_id: u32,
+        operation_id: u32,
+        total_bytes: u64,
+    },
+    /// Guest -> host: progress of a folder-transfer step that runs in the guest. `id` is the
+    /// drag id while the guest packs a dragged folder, the drop operation id while it unpacks a
+    /// dropped zip; `phase` is `archive::PHASE_*`.
+    ArchiveProgress {
+        id: u32,
+        phase: u8,
+        done: u64,
+        total: u64,
+    },
+    /// Guest -> host: answer to `GuestDragFetch` for a drag that contains folders. Instead of
+    /// `FilesBegin` the guest sends one zip of `total_bytes` bytes: `FileChunk`s with index 0 and
+    /// a `FilesEnd`, all with `stream_id`. `skipped` entries were left out (`listed` names the
+    /// first few with the reason).
+    ArchiveBegin {
+        stream_id: u32,
+        total_bytes: u64,
+        skipped: u32,
+        listed: Vec<String>,
+    },
 }
 
 impl Message {
@@ -289,6 +318,8 @@ impl Message {
                 | Message::DropFileStart { .. }
                 | Message::DropFileChunk { .. }
                 | Message::DropFileFinish { .. }
+                | Message::DropArchiveStart { .. }
+                | Message::ArchiveBegin { .. }
         )
     }
 
@@ -543,6 +574,14 @@ mod tests {
                 success: false,
                 error: Some("mode rejected".to_string()),
             },
+            Message::DropArchiveStart { transfer_id: 5, operation_id: 4, total_bytes: 123_456 },
+            Message::ArchiveProgress { id: 4, phase: 3, done: 10, total: 20 },
+            Message::ArchiveBegin {
+                stream_id: 9,
+                total_bytes: 654_321,
+                skipped: 2,
+                listed: vec!["dir/a:b.txt: a character Windows does not allow".to_string()],
+            },
             Message::QueryStatus,
             Message::StatusReply {
                 current_width: 2560,
@@ -643,6 +682,8 @@ mod tests {
             Message::FilesBegin { stream_id: 1, entries: 1, total_bytes: 1 },
             Message::FileChunk { stream_id: 1, index: 0, offset: 0, data: vec![0] },
             Message::ClipboardOffer { clip_id: 1, formats: vec![] },
+            Message::DropArchiveStart { transfer_id: 1, operation_id: 1, total_bytes: 1 },
+            Message::ArchiveBegin { stream_id: 1, total_bytes: 1, skipped: 0, listed: vec![] },
             Message::DropFileChunk { transfer_id: 1, offset: 0, data: vec![] },
         ];
         assert!(bulk.iter().all(Message::is_bulk));
@@ -651,6 +692,7 @@ mod tests {
             Message::QueryStatus,
             Message::ClipFilesRequest { clip_id: 1 },
             Message::DropResult { success: true, message: String::new() },
+            Message::ArchiveProgress { id: 1, phase: 3, done: 1, total: 2 },
             Message::ShmKick,
         ];
         assert!(control.iter().all(|m| !m.is_bulk()));

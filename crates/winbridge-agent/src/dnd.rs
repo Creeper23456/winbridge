@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use crate::owner;
 use std::path::{Path, PathBuf};
+use winbridge_proto::archive;
 #[allow(unused_imports)]
 use tracing::{info, warn};
 
@@ -17,6 +18,8 @@ pub struct ActiveTransfer {
     pub received_bytes: u64,
     pub total_bytes: u64,
     operation_id: u32,
+    /// The file is the zip of a folder drop.
+    archive: bool,
 }
 
 struct DropOperation {
@@ -125,10 +128,35 @@ impl DndManager {
                 received_bytes: 0,
                 total_bytes,
                 operation_id,
+                archive: false,
             },
         );
 
         Ok(dest_path.to_string_lossy().to_string())
+    }
+
+    /// Handles the start of a folder drop: the zip of the operation is received into the staging
+    /// root (not into the operation's directory, which it is unpacked into).
+    pub fn start_archive(&mut self, transfer_id: u32, operation_id: u32, total_bytes: u64) -> Result<(), String> {
+        if self.transfers.contains_key(&transfer_id) {
+            return Err(format!("Transfer {} is already active", transfer_id));
+        }
+        if !self.operations.contains_key(&operation_id) {
+            return Err(format!("Unknown drop operation {}", operation_id));
+        }
+        fs::create_dir_all(&self.staging_root)
+            .map_err(|e| format!("Failed to create {:?}: {}", self.staging_root, e))?;
+        let path = self.staging_root.join(format!("{}.zip", operation_id));
+        let file = File::create(&path).map_err(|e| format!("Failed to create {:?}: {}", path, e))?;
+        info!(
+            "Starting folder drop transfer id={}, operation={}, total_bytes={}, zip at {:?}",
+            transfer_id, operation_id, total_bytes, path
+        );
+        self.transfers.insert(
+            transfer_id,
+            ActiveTransfer { file, path, received_bytes: 0, total_bytes, operation_id, archive: true },
+        );
+        Ok(())
     }
 
     /// Writes a chunk of dropped file data.
@@ -164,31 +192,46 @@ impl DndManager {
         Ok(())
     }
 
-    /// Finalizes one file; after the last one, every staged file is moved to the drop location.
-    pub fn finish_file(
-        &mut self,
-        transfer_id: u32,
-        success: bool,
-    ) -> Result<Option<String>, String> {
+    /// Finalizes one file. After the last one every staged file is moved to the drop location; a
+    /// folder drop (an archive) is handed back as an [`UnpackJob`] for a worker thread instead.
+    pub fn finish_file(&mut self, transfer_id: u32, success: bool) -> Result<Finished, String> {
         let transfer = self
             .transfers
             .remove(&transfer_id)
             .ok_or_else(|| format!("Unknown transfer_id {}", transfer_id))?;
         let operation_id = transfer.operation_id;
         let (received_bytes, total_bytes, path) = (transfer.received_bytes, transfer.total_bytes, transfer.path.clone());
+        let is_archive = transfer.archive;
         // The staged file must be closed before it is deleted or moved (sharing locks).
         drop(transfer);
 
-        if !success {
+        if !success || received_bytes != total_bytes {
+            if is_archive {
+                let _ = fs::remove_file(&path);
+            }
             self.abandon_operation(operation_id);
-            return Err("Transfer cancelled by host; partial files removed".into());
+            return Err(if success {
+                format!(
+                    "Transfer {} incomplete: received {} of {} bytes; partial files removed",
+                    transfer_id, received_bytes, total_bytes
+                )
+            } else {
+                "Transfer cancelled by host; partial files removed".into()
+            });
         }
-        if received_bytes != total_bytes {
-            self.abandon_operation(operation_id);
-            return Err(format!(
-                "Transfer {} incomplete: received {} of {} bytes; partial files removed",
-                transfer_id, received_bytes, total_bytes
-            ));
+
+        if is_archive {
+            let operation = self
+                .operations
+                .remove(&operation_id)
+                .ok_or_else(|| format!("Unknown drop operation {}", operation_id))?;
+            info!("Folder drop {} received: {} bytes of zip at {:?}", operation_id, received_bytes, path);
+            return Ok(Finished::Unpack(UnpackJob {
+                operation_id,
+                zip: path,
+                staging_dir: operation.staging_dir,
+                target_dir: operation.target_dir,
+            }));
         }
 
         let operation = self
@@ -202,7 +245,7 @@ impl DndManager {
             transfer_id, received_bytes, path
         );
         if operation.completed_files < operation.file_count {
-            return Ok(None);
+            return Ok(Finished::Waiting);
         }
 
         let operation = self.operations.remove(&operation_id).expect("operation was just looked up");
@@ -215,7 +258,7 @@ impl DndManager {
             .collect::<Vec<_>>()
             .join(", ");
         info!("Drop operation {} moved to {:?}", operation_id, operation.target_dir);
-        Ok(Some(format!("Saved to {}", names)))
+        Ok(Finished::Saved(format!("Saved to {}", names)))
     }
 
     /// Forgets an operation and deletes whatever it staged.
@@ -245,12 +288,68 @@ impl DndManager {
     }
 }
 
-/// Moves staged files into `dir` without overwriting anything: the destination name is claimed
-/// first, then the staged file replaces the placeholder (copy and delete across volumes).
+/// What finishing a dropped file leads to.
+pub enum Finished {
+    /// More files of the operation are still to come.
+    Waiting,
+    /// The operation is complete; the message says where the files went.
+    Saved(String),
+    /// A folder drop: the zip is complete and waits to be unpacked on a worker thread.
+    Unpack(UnpackJob),
+}
+
+/// A received folder drop (a zip) waiting to be unpacked.
+pub struct UnpackJob {
+    operation_id: u32,
+    zip: PathBuf,
+    staging_dir: PathBuf,
+    target_dir: PathBuf,
+}
+
+impl UnpackJob {
+    /// The drop operation the zip belongs to.
+    pub fn operation_id(&self) -> u32 {
+        self.operation_id
+    }
+}
+
+/// Largest folder drop (content bytes) the guest unpacks.
+const DROP_CAP_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Unpacks the zip into the operation's staging directory, deletes it and moves the top-level
+/// items to the drop location. `report(phase, done, total)` tells the host's bar about the unpack
+/// and delete steps. The zip and the staging directory are gone afterwards, success or not.
+pub fn run_unpack(job: UnpackJob, report: &mut dyn FnMut(u8, u64, u64)) -> Result<String, String> {
+    let UnpackJob { zip, staging_dir, target_dir, .. } = job;
+    let outcome = (|| {
+        let tops = archive::unpack(&zip, &staging_dir, archive::Dest::Windows, DROP_CAP_BYTES, &mut |done, total| {
+            report(archive::PHASE_UNPACK, done, total);
+            true
+        })?;
+        report(archive::PHASE_DELETE, 0, 1);
+        fs::remove_file(&zip).map_err(|e| format!("{}: {}", zip.display(), e))?;
+        report(archive::PHASE_DELETE, 1, 1);
+        move_into(&tops, &target_dir)
+    })();
+    let _ = fs::remove_file(&zip);
+    let _ = fs::remove_dir_all(&staging_dir);
+    let moved = outcome?;
+    let names = moved.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
+    info!("Folder drop moved to {:?}", target_dir);
+    Ok(format!("Saved to {}", names))
+}
+
+/// Moves staged files and folders into `dir` without overwriting anything: a file's destination
+/// name is claimed first, then the staged file replaces the placeholder (copy and delete across
+/// volumes); a folder takes the first free name (see [`move_dir`]).
 fn move_into(paths: &[PathBuf], dir: &Path) -> Result<Vec<PathBuf>, String> {
     fs::create_dir_all(dir).map_err(|e| format!("Failed to create {:?}: {}", dir, e))?;
     let mut moved = Vec::with_capacity(paths.len());
     for path in paths {
+        if path.is_dir() {
+            moved.push(move_dir(path, dir)?);
+            continue;
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -272,6 +371,64 @@ fn move_into(paths: &[PathBuf], dir: &Path) -> Result<Vec<PathBuf>, String> {
         moved.push(dest);
     }
     Ok(moved)
+}
+
+/// Moves the staged directory `src` into `dir` under a name not taken there (`name`, `name (1)`,
+/// ...): a rename, else a copy of the tree and a delete (another volume). The user becomes the
+/// owner of everything in it.
+fn move_dir(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("dropped_folder");
+    for index in 0..10_000u32 {
+        let candidate = if index == 0 { dir.join(name) } else { dir.join(format!("{} ({})", name, index)) };
+        if candidate.exists() {
+            continue;
+        }
+        match fs::rename(src, &candidate) {
+            Ok(()) => {}
+            Err(_) if candidate.exists() => continue,
+            Err(_) => {
+                copy_tree(src, &candidate).map_err(|e| {
+                    let _ = fs::remove_dir_all(&candidate);
+                    format!("Failed to move {:?} to {:?}: {}", src, candidate, e)
+                })?;
+                let _ = fs::remove_dir_all(src);
+            }
+        }
+        claim_tree(&candidate);
+        return Ok(candidate);
+    }
+    Err(format!("No free name for {:?} in {:?}", name, dir))
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies the destination's inheritable permissions and the user as owner to `path` and
+/// everything below it (a rename keeps what the staged items had).
+fn claim_tree(path: &Path) {
+    if let Err(e) = owner::claim(path) {
+        warn!("Could not apply the folder's permissions to {:?}: {}", path, e);
+    }
+    if let Ok(read) = fs::read_dir(path) {
+        for entry in read.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                claim_tree(&entry.path());
+            } else if let Err(e) = owner::claim(&entry.path()) {
+                warn!("Could not apply the folder's permissions to {:?}: {}", entry.path(), e);
+            }
+        }
+    }
 }
 
 /// Private receive area, outside every user-visible folder.
