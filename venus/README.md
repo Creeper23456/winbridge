@@ -21,7 +21,7 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 | `guest/vn_renderer_winbridge.c`, `guest/wbvn_proto.h`, `guest/wbvn_ring.h` | The `vn_renderer` backend, the WBVN wire protocol with the slot layout, and the guest's ring code (the same layout as `crates/winbridge-shm`). Copy them into `src/virtio/vulkan/` of the Mesa tree. |
 | `guest/venus-probe.c` | Loads the driver directly and runs instance, device, submit and a buffer copy through the GPU. |
 | `tests/ring_peer.c` | The guest end of the ring interoperability test of `crates/winbridge-venus`. |
-| `tests/d3d/` | The D3D programs (`tri11`, `teapot11` for D3D11 and `tri9` for D3D9) the driver is accepted with, run through DXVK. |
+| `tests/d3d/` | The D3D programs (`tri11`, `teapot11` for D3D11, `tri10` for D3D10 and `tri9` for D3D9) the driver is accepted with, run through DXVK. |
 | `patches/0001`-`0011` | Patches to Mesa 26.3.0 (`0a6fa60abb73`). Apply in order (`build/build.sh` does). |
 | `patches/virglrenderer/` | Patches to virglrenderer for the host: `0001` and `0002` are needed on NVIDIA 550, `0003` is the command trace. |
 | `tools/compare-command-traces.py` | Compares command traces of the Windows and the Linux driver. |
