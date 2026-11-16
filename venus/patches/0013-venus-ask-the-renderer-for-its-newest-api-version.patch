@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 22:40:00 +0800
+Subject: [PATCH 13/13] venus: ask the renderer for its newest API version
+ whatever the app asked for
+
+The renderer instance was created with the app's API version (at least 1.1). With a 1.1 app the physical device is then queried as a 1.1 device and the Vulkan 1.2 feature booleans that stand for an extension (descriptorIndexing, drawIndirectCount, samplerFilterMinmax, ...) come back false: VkPhysicalDeviceVulkan12Features has no extension structure to fill them from. FurMark 2 creates a 1.1 instance, chains VkPhysicalDeviceVulkan12Features with descriptorIndexing set (as it may on a native driver) and got VK_ERROR_FEATURE_NOT_PRESENT. The renderer instance now uses the newest version the renderer reports, capped by what this driver advertises, and never less than the app's.
+---
+ src/virtio/vulkan/vn_instance.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -100,9 +100,15 @@
+              VK_VERSION_PATCH(instance_version));
+    }
+ 
+-   /* request at least VN_MIN_RENDERER_VERSION internally */
++   /* Request the newest version the renderer offers (and this driver advertises), not only what
++    * the app asked for. The Vulkan 1.2 feature booleans that stand for an extension
++    * (descriptorIndexing, drawIndirectCount, ...) are only reported by a renderer at 1.2 or
++    * newer, and applications that create a 1.1 instance (FurMark) still chain
++    * VkPhysicalDeviceVulkan12Features and enable them, as they may on a native driver. */
+    instance->renderer_api_version =
+-      MAX2(instance->base.vk.app_info.api_version, VN_MIN_RENDERER_VERSION);
++      MAX3(instance->base.vk.app_info.api_version, VN_MIN_RENDERER_VERSION,
++           MIN3(instance_version, VN_MAX_API_VERSION,
++                instance->renderer->info.vk_xml_version));
+ 
+    /* instance version for internal use is capped */
+    instance_version = MIN3(instance_version, instance->renderer_api_version,
