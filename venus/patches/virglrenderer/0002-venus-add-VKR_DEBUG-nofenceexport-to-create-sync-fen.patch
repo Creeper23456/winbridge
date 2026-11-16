@@ -1,0 +1,52 @@
+From 81c591a48cab0e30a474887baca35b43e776b285 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 13:23:29 +0800
+Subject: [PATCH] venus: add VKR_DEBUG=nofenceexport to create sync fences
+ without sync fd export
+
+---
+ src/venus/vkr_common.c | 1 +
+ src/venus/vkr_common.h | 1 +
+ src/venus/vkr_queue.c  | 2 +-
+ 3 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index 953ab3a..5540a7d 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -215,6 +215,7 @@ static const struct debug_named_value vkr_debug_options[] = {
+    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
+    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
+    { "opaque", VKR_DEBUG_OPAQUE, "Export host visible memory as opaque fd even if dma-buf export is supported" },
++   { "nofenceexport", VKR_DEBUG_NO_FENCE_EXPORT, "Create sync fences without sync fd export (NVIDIA 550 crashes in vkWaitForFences on exportable fences)" },
+    DEBUG_NAMED_VALUE_END
+ };
+ 
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index 8353c9a..5e696bb 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -117,6 +117,7 @@ enum vkr_debug_flags {
+    VKR_DEBUG_VALIDATE = 1 << 0,
+    VKR_DEBUG_UDMABUF = 1 << 1,
+    VKR_DEBUG_OPAQUE = 1 << 2,
++   VKR_DEBUG_NO_FENCE_EXPORT = 1 << 3,
+ };
+ 
+ /* base class for all objects */
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index 61b94be..c90db96 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -34,7 +34,7 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+       };
+       const struct VkFenceCreateInfo create_info = {
+          .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+-         .pNext = dev->physical_device->KHR_external_fence_fd ? &export_info : NULL,
++         .pNext = (VKR_DEBUG(NO_FENCE_EXPORT) || !dev->physical_device->KHR_external_fence_fd) ? NULL : &export_info,
+       };
+       VkResult result =
+          vk->CreateFence(dev->base.handle.device, &create_info, NULL, &sync->fence);
+-- 
+2.47.3
+

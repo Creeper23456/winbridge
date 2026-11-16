@@ -1,0 +1,58 @@
+From a37d57f789cd2e39b2aae1436ee4469ed9ffb995 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 12:35:34 +0800
+Subject: [PATCH] venus: add VKR_DEBUG=opaque to prefer opaque fd export for
+ host visible memory
+
+The NVIDIA proprietary driver reports dma-buf export for buffers but cannot mmap the dma-bufs
+it exports, so a host that maps device memory itself needs the opaque fd that vkr_allocator
+imports and maps.
+---
+ src/venus/vkr_common.c          | 1 +
+ src/venus/vkr_common.h          | 1 +
+ src/venus/vkr_physical_device.c | 5 +++++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index 34f8ced..953ab3a 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -214,6 +214,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
+ static const struct debug_named_value vkr_debug_options[] = {
+    { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
+    { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
++   { "opaque", VKR_DEBUG_OPAQUE, "Export host visible memory as opaque fd even if dma-buf export is supported" },
+    DEBUG_NAMED_VALUE_END
+ };
+ 
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index e24a16f..8353c9a 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -116,6 +116,7 @@ typedef uint64_t vkr_object_id;
+ enum vkr_debug_flags {
+    VKR_DEBUG_VALIDATE = 1 << 0,
+    VKR_DEBUG_UDMABUF = 1 << 1,
++   VKR_DEBUG_OPAQUE = 1 << 2,
+ };
+ 
+ /* base class for all objects */
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index e2c3baa..6b7adb7 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -227,6 +227,11 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+    }
+ 
++   /* Some drivers export dma-bufs they cannot mmap (NVIDIA's proprietary driver). A host that
++    * maps the memory itself needs the opaque fd, which vkr_allocator can import and map. */
++   if (VKR_DEBUG(OPAQUE) && physical_dev->is_opaque_fd_export_supported)
++      physical_dev->is_dma_buf_fd_export_supported = false;
++
+    /* fallback to gbm allocation with dma-buf import */
+    if (!physical_dev->is_dma_buf_fd_export_supported &&
+        !physical_dev->is_opaque_fd_export_supported &&
+-- 
+2.47.3
+
