@@ -399,25 +399,32 @@ fn set_dacl(h: &Handle, sddl: &str) -> Result<(), u32> {
     Ok(())
 }
 
-/// Restricts the device object of every ivshmem interface to SYSTEM and Administrators and
-/// reads the DACL back. Returns the number of devices hardened (0 when there is none).
+/// Restricts the device object of every ivshmem interface whose region is `len` bytes (the control
+/// region) to SYSTEM and Administrators and reads the DACL back. Returns the number of devices
+/// hardened (0 when there is none). Devices of another size are not the agent's: the Venus slots
+/// (`docs/IVSHMEM-TRANSPORT.md` section 8b) are mapped by the Vulkan processes of the interactive
+/// user, who runs without the Administrators SID enabled, so they keep the driver's default DACL.
 ///
 /// The driver's default DACL is open to Everyone and the change is not persistent (it applies to
 /// the live device object), so the elevated agent calls this on every start, before mapping.
 /// Any failure is an error: shared memory must then be treated as unavailable.
-pub fn harden_devices() -> Result<usize, IvshmemError> {
-    let ifaces = interfaces()?;
-    for (i, f) in ifaces.iter().enumerate() {
+pub fn harden_devices(len: u64) -> Result<usize, IvshmemError> {
+    let mut hardened = 0;
+    for (i, f) in interfaces()?.iter().enumerate() {
         let what = format!("device {i} ({})", f.instance);
         let h = open_path(&f.path, GENERIC_READ | GENERIC_WRITE | WRITE_DAC)
             .map_err(|e| IvshmemError::Hardening(format!("{what}: open with WRITE_DAC failed, Win32 error {e} (is the agent elevated?)")))?;
+        if device_size(&h) != Ok(len) {
+            continue;
+        }
         set_dacl(&h, HARDENED_SDDL).map_err(|e| IvshmemError::Hardening(format!("{what}: SetKernelObjectSecurity failed, Win32 error {e}")))?;
         let now = read_dacl(&h).map_err(|e| IvshmemError::Hardening(format!("{what}: reading the DACL back failed, Win32 error {e}")))?;
         if now != HARDENED_READBACK {
             return Err(IvshmemError::Hardening(format!("{what}: DACL reads back as {now}, expected {HARDENED_READBACK}")));
         }
+        hardened += 1;
     }
-    Ok(ifaces.len())
+    Ok(hardened)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -497,7 +504,7 @@ fn request_mmap(dev: Handle, expected_len: u64) -> Result<Bar, IvshmemError> {
 /// one whose region header magic is already valid wins; otherwise the first device that is not
 /// mapped yet. The mapping is held until the [`Bar`] is dropped.
 pub fn map_device(expected_len: u64) -> Result<Bar, IvshmemError> {
-    if harden_devices()? == 0 {
+    if harden_devices(expected_len)? == 0 {
         return Err(IvshmemError::NoDevice);
     }
     let mut sizes = Vec::new();
@@ -1196,9 +1203,11 @@ fn pattern_roundtrip(bar: &Bar, offset: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `--ivshmem-selftest user`: as an unprivileged user every device must refuse to open.
-/// Plain `--ivshmem-selftest` (SYSTEM / elevated): harden, map both devices, pattern, header,
-/// single-mapping rule and release-on-drop. Exit code 0 only if every step passed.
+/// `--ivshmem-selftest user`: as an unprivileged user a device of the control size must refuse to
+/// open; other devices (the Venus slots) keep the driver's default DACL and may open, which the
+/// report shows. Plain `--ivshmem-selftest` (SYSTEM / elevated): harden, map the devices of the
+/// control size, pattern, header, single-mapping rule and release-on-drop. Exit code 0 only if
+/// every step passed.
 fn selftest(as_user: bool) -> i32 {
     let mut failed = 0;
     let mut step = |name: &str, r: Result<String, String>| match r {
@@ -1213,17 +1222,21 @@ fn selftest(as_user: bool) -> i32 {
         step("enumerate", ifaces.as_ref().map(|v| format!("{} interface(s)", v.len())).map_err(|e| e.to_string()));
         for f in ifaces.unwrap_or_default() {
             let r = match open_path(&f.path, GENERIC_READ | GENERIC_WRITE) {
-                Ok(_) => Err("device OPENED by an unprivileged user".to_string()),
+                Ok(h) => match device_size(&h) {
+                    Ok(SELFTEST_LEN) => Err("a device of the control size was OPENED by an unprivileged user".to_string()),
+                    Ok(len) => Ok(format!("opened, {len} bytes (not a control device)")),
+                    Err(st) => Err(format!("opened, but its size cannot be read: {}", nt_name(st))),
+                },
                 Err(5) => Ok("ACCESS_DENIED (Win32 error 5)".to_string()),
                 Err(e) => Err(format!("unexpected Win32 error {e}")),
             };
-            step(&format!("denied {}", f.instance), r);
+            step(&format!("device {}", f.instance), r);
         }
         println!("{}", if failed == 0 { "SELFTEST USER OK" } else { "SELFTEST USER FAILED" });
         return failed.min(1);
     }
 
-    let devices = match harden_devices() {
+    let devices = match harden_devices(SELFTEST_LEN) {
         Ok(n) => {
             step("harden", Ok(format!("{n} device(s) restricted")));
             n
