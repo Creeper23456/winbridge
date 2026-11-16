@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! What the display path costs, once a second (`--stats`): the updates QEMU sends over D-Bus
-//! (how many, how large, how long the handler takes) and the canvas redraws.
+//! What the display and input paths cost, once a second (`--stats`): the updates QEMU sends over
+//! D-Bus (how many, how large, how long the handler takes), the canvas redraws, and the input
+//! calls to QEMU (how many, how long QEMU takes to answer, how many events waited in the queue).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -18,6 +19,10 @@ static SCANOUTS: AtomicU64 = AtomicU64::new(0);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static DRAW_NS: AtomicU64 = AtomicU64::new(0);
 static COPY_NS: AtomicU64 = AtomicU64::new(0);
+static INPUTS: AtomicU64 = AtomicU64::new(0);
+static INPUT_NS: AtomicU64 = AtomicU64::new(0);
+static INPUT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static INPUT_BACKLOG_MAX: AtomicU64 = AtomicU64::new(0);
 static LAST_UPDATE: Mutex<Option<Instant>> = Mutex::new(None);
 /// How far apart updates arrive: < 8 ms, < 15 ms, < 20 ms, < 28 ms, < 40 ms, more.
 const GAP_LIMITS: [Duration; 5] = [
@@ -73,6 +78,17 @@ pub fn draw(t: Option<Instant>, copy_ns: u64) {
     }
 }
 
+/// One input call to QEMU that took since `t`, with `backlog` more events waiting behind it.
+pub fn input(t: Option<Instant>, backlog: usize) {
+    if let Some(t) = t {
+        let ns = nanos(t);
+        INPUTS.fetch_add(1, Relaxed);
+        INPUT_NS.fetch_add(ns, Relaxed);
+        INPUT_MAX_NS.fetch_max(ns, Relaxed);
+        INPUT_BACKLOG_MAX.fetch_max(backlog as u64, Relaxed);
+    }
+}
+
 /// Logs the counters every second while they are on. Needs a Tokio runtime.
 pub fn start() {
     if !ENABLED.load(Relaxed) {
@@ -90,6 +106,19 @@ pub fn start() {
             let draws = DRAWS.swap(0, Relaxed);
             let draw_ns = DRAW_NS.swap(0, Relaxed);
             let copy_ns = COPY_NS.swap(0, Relaxed);
+            let inputs = INPUTS.swap(0, Relaxed);
+            let input_ns = INPUT_NS.swap(0, Relaxed);
+            let input_max = INPUT_MAX_NS.swap(0, Relaxed);
+            let backlog = INPUT_BACKLOG_MAX.swap(0, Relaxed);
+            if inputs > 0 {
+                info!(
+                    "input: {} calls to QEMU, answered in {:.2} ms on average and {:.2} ms at most; at most {} events waiting",
+                    inputs,
+                    input_ns as f64 / 1e6 / inputs as f64,
+                    input_max as f64 / 1e6,
+                    backlog,
+                );
+            }
             if updates + scanouts + draws == 0 {
                 continue;
             }

@@ -10,6 +10,7 @@
 //! been a moment earlier.
 
 use crate::dbus_display::{KeyboardProxy, MouseProxy};
+use crate::stats;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,7 +78,6 @@ impl InputQueue {
         self.ops.pop_front()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -134,9 +134,12 @@ impl InputPipeline {
             loop {
                 task_shared.wake.notified().await;
                 loop {
-                    let op = task_shared.queue.lock().unwrap().pop();
+                    let (op, backlog) = {
+                        let mut queue = task_shared.queue.lock().unwrap();
+                        (queue.pop(), queue.len())
+                    };
                     let Some(op) = op else { break };
-                    send(&task_shared, &mouse, &keyboard, op).await;
+                    send(&task_shared, &mouse, &keyboard, op, backlog).await;
                 }
             }
         });
@@ -163,7 +166,8 @@ impl InputPipeline {
     }
 }
 
-async fn send(shared: &Shared, mouse: &MouseProxy<'static>, keyboard: &KeyboardProxy<'static>, op: InputOp) {
+async fn send(shared: &Shared, mouse: &MouseProxy<'static>, keyboard: &KeyboardProxy<'static>, op: InputOp, backlog: usize) {
+    let started = stats::begin();
     let (kind, what, result) = match op {
         InputOp::Abs(x, y) | InputOp::AbsExact(x, y) => {
             (0, "SetAbsPosition", tokio::time::timeout(CALL_TIMEOUT, mouse.set_abs_position(x, y)).await)
@@ -182,6 +186,7 @@ async fn send(shared: &Shared, mouse: &MouseProxy<'static>, keyboard: &KeyboardP
             (3, "Keyboard.Release", tokio::time::timeout(CALL_TIMEOUT, keyboard.release(code)).await)
         }
     };
+    stats::input(started, backlog);
     let error = match result {
         Ok(Ok(())) => return,
         Ok(Err(e)) => e.to_string(),

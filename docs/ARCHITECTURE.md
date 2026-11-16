@@ -86,7 +86,7 @@ To drive guest desktop resolution, DPI scaling, clipboard exchange, and drag-and
 3. **P2P D-Bus Listener Service:**
    - Serves `org.qemu.Display1.Listener` (`Scanout`, `Update`) and `org.qemu.Display1.Listener.Unix.Map` (`ScanoutMap`, `UpdateMap`), and announces the second one in the `Interfaces` property. With virtio-gpu 2D QEMU then shares the memory of the guest's scanout once (a memfd) and only names the changed rectangle; the viewer maps it read-only and Cairo draws from it, so no pixel is sent or copied. `Scanout` and `Update` remain for a surface QEMU cannot share; their byte arrays are read as `&[u8]` (a `Vec<u8>` is decoded byte by byte, about 10 ms per MiB).
    - A mapped frame can show half of an update, because QEMU writes the memory while it is drawn.
-   - Calls `drawing_area.queue_draw()` on every update. With `--stats` it logs once a second what the display path costs, including how far apart the updates arrive.
+   - Calls `drawing_area.queue_draw()` on every update. With `--stats` it logs once a second what the display path costs, including how far apart the updates arrive, and, while input flows, how many input calls went to QEMU, how long QEMU took to answer them and how many events waited behind one.
 
 ### Guest Agent Architecture (`winbridge-agent`)
 1. **VirtIO-Serial Worker Thread:**
