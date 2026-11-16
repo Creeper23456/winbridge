@@ -6,7 +6,7 @@
 
 **面向 QEMU/KVM 上 Windows 11 的 Linux GTK4 查看器与客户机代理。**
 
-WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持同步:客户机分辨率跟随窗口大小(没有黑边),客户机 DPI 缩放跟随 Linux 的缩放因子,剪贴板(文本、HTML、RTF、图片、文件)双向共享,文件和文本可以在两端之间拖放。鼠标位于画布上时,显示的是客户机光标,而不是 Linux 指针。
+WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持同步:客户机分辨率跟随窗口大小(没有黑边),客户机 DPI 缩放跟随 Linux 的缩放因子,剪贴板(文本、HTML、RTF、图片、文件)双向共享,文件、文件夹和文本可以在两端之间拖放。鼠标位于画布上时,显示的是客户机光标,而不是 Linux 指针。客户机里的程序可以使用主机 GPU 运行 Vulkan、Direct3D 9/10/11 和 OpenGL([3D 加速](#3d-加速)),控制和大数据流量也可以改走共享内存,不再经过 virtio-serial。
 
 做这个项目的原因:QEMU 自带的 GTK 窗口无法调整使用 virtio-gpu(`viogpudo`)驱动的 Windows 客户机的分辨率,驱动知道了新尺寸,却没有任何东西去应用它。WinBridge 向 QEMU 请求新尺寸,再由客户机内部的代理自己应用。
 
@@ -27,6 +27,20 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持
 - **分辨率**:查看器用画布的物理像素尺寸(逻辑尺寸 × 缩放因子)调用 `SetUIInfo`,然后让代理通过 `SetDisplayConfig` 应用(与 virtio-win 辅助程序使用的调用相同)。`ChangeDisplaySettings` 只作为后备,因为 Windows 只会给它一组固定的模式列表。
 - **DPI**:在分辨率之后发送(Windows 会按分辨率限制缩放比例)。代理会回读实际生效的 DPI,并报告真实结果。
 - **通道**:专用 virtio-serial 端口 `org.winbridge.0` 上带版本号、带长度前缀的帧([协议](docs/PROTOCOL.md)、[架构](docs/ARCHITECTURE.md),目前为英文)。它不会占用 `org.qemu.guest_agent.0`。
+- **共享内存(可选,`shm = true`)**:一个 `ivshmem` 设备承载控制通道和大数据通道(剪贴板、拖放、文件流),两条通道有优先级,所以大文件粘贴不会让控制消息排在它后面。virtio-serial 仍用于握手和回退([设计与实测](docs/IVSHMEM-TRANSPORT.md),目前为英文)。
+- **显示路径**:QEMU 提供 `Listener.Unix.Map` 时,查看器以只读方式映射客户机扫描输出的内存并直接从中绘制,不发送、也不复制任何像素;GTK 的重绘由更新驱动,而不是由合成器节拍驱动(见[速度与诊断](#速度与诊断))。
+
+## 3D 加速
+
+客户机里的程序可以使用主机 GPU。WinBridge 把 Mesa 的 **Venus**(一个 Vulkan 序列化层)移植到了 Windows:客户机驱动 `vulkan_virtio.dll` 把每个 Vulkan 调用编码成命令流,命令流经共享内存送到主机,`winbridge-venus` 再用 virglrenderer 的 Venus 渲染器在主机 GPU 上执行。设计、被否决的备选方案和全部实测数据见 [ADR 0001](docs/adr/0001-venus-as-serialization-layer.md);构建、安装和运行见 [`venus/README.md`](venus/README.md)(均为英文)。
+
+- **能运行什么**:Vulkan 程序;通过 DXVK 运行的 Direct3D 9、10、11;通过 Zink 运行的 OpenGL 4.6(把 Mesa 的 `opengl32.dll` 和 `libgallium_wgl.dll` 放在程序旁边);用同一批 DLL 的 x86 版本运行的 32 位程序;FurMark 2 的 Vulkan 模式。
+- **实测**(Windows 11 LTSC 客户机,4 vCPU,RTX 3060 Ti 主机,普通用户令牌):D3D11 三角形每帧 1.9 ms,茶壶场景在 1280x720 下每帧 2.0 ms(约每秒 500 帧);运行 16 分钟没有泄漏,主机端也没有警告;FurMark 的 Vulkan 模式约 100 FPS。Direct3D 10(2.35 ms)、Direct3D 9 以及 32 位版本(三角形和茶壶 2.5 到 3.2 ms)也都跑通了。
+- **没有中转进程**:每个 Vulkan 进程独占一个*槽位*,即一个 64 MiB 的 `ivshmem-plain` 设备加一个 virtio-serial 唤醒端口,由一个 `winbridge-venus` 进程为它服务。示例启动脚本用 `WINBRIDGE_VENUS=N` 启动这些槽位。
+- **主机需要**:带有 `venus/patches/virglrenderer` 补丁的 virglrenderer(NVIDIA 550 上其中两个是必需的)及其 render server。
+- **在 Linux 上构建**:`WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh` 用 `clang-cl` 交叉编译驱动、OpenGL DLL 和 x86 版本;客户机内不编译任何东西。`scripts/install-venus-icd.ps1` 负责注册驱动(需要先装好 ivshmem 驱动)。
+- **开销**:主机上的 `winbridge-venus` 会有意地忙等占满一个核心。茶壶场景在 720p 下做 15 秒采样:查看器占一个核心的 45%,QEMU 占 202%,Venus 线程占 100%。
+- **限制**:每个槽位同时只服务一个 Vulkan 实例。OpenGL 交换间隔保持为 1 的程序会被限制在每帧约 14.7 ms。测试程序和 FurMark 之外的应用没有运行过。没有 `winbridge-venus` 时,Vulkan 程序最多会等主机 30 秒。
 
 ## 状态
 
@@ -42,8 +56,10 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持
 | 把文本拖放到窗口 | 正常(已验证 UTF-8) |
 | 剪贴板的 HTML、RTF、图片、文件;从 Windows 拖到 Linux | 已实现,**还没有端到端验证** |
 | 用客户机光标代替 Linux 指针 | 画布上隐藏 Linux 指针;如果客户机发送了硬件光标图像,则显示该图像 |
-
-> 说明:以上验证结果对应拖放功能改动之前的版本。下面"已知限制"中关于拖放去向的描述属于新行为,以及"设备"菜单(光盘镜像、USB 直通),都还没有在客户机上做端到端验证。
+| 3D:Vulkan、Direct3D 9/10/11(DXVK)、OpenGL(Zink)、x64 和 x86、FurMark 2 Vulkan | 在 LTSC 虚拟机中用测试程序和 FurMark 验证正常;其他应用没有运行过 |
+| 控制和大数据流量的共享内存传输(`shm = true`) | 正常;在构建虚拟机里,主机→客户机 2.0 到 3.4 GiB/s,virtio-serial 为 239 MiB/s;大数据流占满时控制消息往返仍为 p50 135 到 150 us(serial 为 p50 4.2 ms) |
+| 来自共享内存扫描输出的显示,查看器里没有拷贝 | 正常(帧缓冲拷贝 12.5 ms → 0.0 ms;GDI 程序和 Vulkan 程序下每秒约 60 次显示更新) |
+| 文件夹拖放(打包成一个 zip),双向 | 已实现并有单元测试;虚拟机里的端到端运行正在检查,请视为未验证 |
 
 已知限制:
 
@@ -51,8 +67,9 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持
 - **只支持整数缩放因子。** X11 上的 GTK 报告的是整数 `scale_factor`,看不到 Linux 的分数缩放。
 - **Windows 的缩放档位是离散的**(100、125、150、175、200 ……),请求值会被取整到最近的档位。
 - **剪贴板:文本、HTML、RTF、图片和文件,双向。** 文本、HTML、RTF 和图片(单项不超过 48 MiB)在复制时同步。复制的文件**不会**在复制时传输:直到你粘贴(Ctrl+V)那一刻才开始,画布顶部出现进度条,传输期间虚拟机输入被锁定(客户机继续运行),文件到达粘贴目标(每次粘贴上限 8 GiB)。虚拟文件来源(如压缩包管理器、邮件附件)两侧都不支持。*共享逻辑做了单元测试,客户机的延迟渲染在构建虚拟机里测过;还没有端到端测试。*
-- **拖放支持双向。** 主机→客户机:由鼠标位置决定目标。松开左键那一刻开始接收,先存到客户机里的私有暂存目录,再**移动**到鼠标下的 Explorer 文件夹或桌面(其他位置落到 `Downloads\WinBridge`);拖入的文本会保存为 `.txt` 文件。客户机→主机:从 Windows 应用里开始拖动,按住左键把鼠标移出画布,鼠标下的 Linux 应用就会收到文件,最终放在哪里由它决定(只有在放下时才从客户机取文件;上限 8 GiB)。每次传输都会显示进度条并锁定输入。只有磁盘上存在的文件和文本可以拖出;虚拟文件(压缩包、邮件附件、浏览器下载)不行。已有文件不会被覆盖。"文件还在传输时就把路径交给应用"没有实现。*还没有端到端验证;客户机→主机依赖客户机的 OLE 拖动在 700 ms 内询问探测窗口,这一点还没有观察到。*
+- **拖放支持双向。** 主机→客户机:由鼠标位置决定目标。松开左键那一刻开始接收,先存到客户机里的私有暂存目录,再**移动**到鼠标下的 Explorer 文件夹或桌面(其他位置落到 `Downloads\WinBridge`);拖入的文本会保存为 `.txt` 文件。客户机→主机:从 Windows 应用里开始拖动,按住左键把鼠标移出画布,鼠标下的 Linux 应用就会收到文件,最终放在哪里由它决定(只有在放下时才从客户机取文件;上限 8 GiB)。文件夹打包成一个 zip 传输(打包、发送、解包、删除四步合起来填满进度条);另一侧无法创建的条目会被省略,并在提示里列出。每次传输都会显示进度条并锁定输入。只有磁盘上存在的文件、文件夹和文本可以拖出;虚拟文件(压缩包、邮件附件、浏览器下载)不行。已有的文件和文件夹不会被覆盖。"文件还在传输时就把路径交给应用"没有实现。*还没有端到端验证;客户机→主机依赖客户机的 OLE 拖动在 700 ms 内询问探测窗口,这一点还没有观察到。文件夹传输有单元测试(`proto::archive`),但还没有在虚拟机里运行过。*
 - **很大或非常规的分辨率**需要足够的 virtio-gpu 显存。
+- **客户机显示以 64 Hz 运行,而不是主机显示器的刷新率。** 查看器会请求主机所有显示器中最低的刷新率(最高 60 Hz);virtio-gpu 的 display-only 驱动保持 64 Hz 并拒绝(查看器日志里是 `Guest did not take the refresh rate 60000 mHz ... it runs at 64000 mHz`)。GDI 程序每秒约有 60 次显示更新,通过 Venus 驱动呈现的程序也是如此(这是在驱动使用 1 ms 定时器分辨率时测得的;更早的构建请求 0.5 ms,会让整个桌面降到每秒约 33 次更新,见 `docs/adr/0001-venus-as-serialization-layer.md` 里的 LTSC 记录)。
 
 ## 构建
 
@@ -94,6 +111,14 @@ cargo build --release -p winbridge-agent
 
 客户机需要 virtio-win 驱动(`viogpudo`、`vioser`)。用 `RUST_LOG=info` 运行代理可以看到它的行为。
 
+### 速度与诊断
+
+- `--shm`(或 `shm = true`)开启共享内存传输。它需要 ivshmem 设备(示例脚本 `scripts/launch-qemu-winbridge.sh` 里设 `WINBRIDGE_SHM=1`)、客户机里的 ivshmem 驱动,以及连同它一起安装的代理;缺少任何一项都不会改变现有行为。
+- 查看器在 GTK 启动前设置 `GDK_DEBUG=no-vsync`。在实测的 X11 GNOME 会话(显示器 75 Hz 和 60 Hz)上,GTK 的帧时钟中位间隔为 33 ms,客户机每秒送来 60 次更新却只显示 30 次。`--vsync` 恢复 GTK 自己的节拍。
+- `--stats` 每秒记录一次显示路径的开销(更新次数、处理耗时、重绘次数、帧缓冲拷贝耗时、更新之间的间隔),并在你操作鼠标或键盘时记录发给 QEMU 的输入调用次数以及 QEMU 的应答耗时。
+- `winbridge-venus --stats` 记录它的循环,以及它比较了多少字节的客户机内存,按环、其他共享内存和设备内存分开统计。
+- 不带 GTK、用真实代理扮演查看器的示例:`shme2e`(传输吞吐和延迟)和 `folderdnd`(一次文件夹拖放),在 `crates/winbridge-host/examples/` 里。运行它们时查看器不能处于连接状态。
+
 ### 启动脚本与生命周期
 
 虚拟机怎么启动由你自己管理。把查看器指向一个脚本,它会原样执行一次,并把脚本作为自己的子进程:
@@ -102,7 +127,7 @@ cargo build --release -p winbridge-agent
 winbridge-host --launch-script ~/vm/start-windows.sh
 ```
 
-或写在 `~/.config/winbridge/config.toml` 中(键:`launch_script`、`launch_args`、`socket`、`dbus_addr`、`qmp_socket`、`usb_bus`、`grab_keyboard`;命令行优先;未知键会报错):
+或写在 `~/.config/winbridge/config.toml` 中(键:`launch_script`、`launch_args`、`socket`、`dbus_addr`、`qmp_socket`、`usb_bus`、`grab_keyboard`、`shm`;命令行优先;未知键会报错):
 
 ```toml
 launch_script = "/home/me/vm/start-windows.sh"

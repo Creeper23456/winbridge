@@ -2,6 +2,8 @@
 
 # WinBridge
 
+**English** | [简体中文](README.zh-CN.md)
+
 **A Linux GTK4 viewer and guest agent for Windows 11 on QEMU/KVM.**
 
 WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync: the guest resolution follows the window size (no letterboxing), the guest DPI scale follows the Linux scale factor, the clipboard (text, HTML, RTF, images, files) is shared both ways, and files, folders and text can be dragged between the two sides. The guest cursor replaces the Linux pointer while it is over the canvas. Programs in the guest can use the host GPU for Vulkan, Direct3D 9/10/11 and OpenGL ([3D acceleration](#3d-acceleration)), and the control and bulk traffic can move to shared memory instead of virtio-serial.
@@ -125,7 +127,7 @@ You manage how the VM starts. Point the viewer at a script and it runs it once, 
 winbridge-host --launch-script ~/vm/start-windows.sh
 ```
 
-or in `~/.config/winbridge/config.toml` (keys: `launch_script`, `launch_args`, `socket`, `dbus_addr`, `qmp_socket`, `usb_bus`; command-line options win; unknown keys are an error):
+or in `~/.config/winbridge/config.toml` (keys: `launch_script`, `launch_args`, `socket`, `dbus_addr`, `qmp_socket`, `usb_bus`, `grab_keyboard`, `shm`; command-line options win; unknown keys are an error):
 
 ```toml
 launch_script = "/home/me/vm/start-windows.sh"
