@@ -1,0 +1,123 @@
+From 5a11edcdaaa5677be8fc004e9623a95ba82532f5 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 14:33:53 +0800
+Subject: [PATCH] venus: add VKR_CMD_TRACE to log every decoded command
+
+---
+ src/venus/vkr_common.c    | 32 ++++++++++++++++++++++++++++++++
+ src/venus/vkr_common.h    |  3 +++
+ src/venus/vkr_context.c   |  2 ++
+ src/venus/vkr_ring.c      |  2 ++
+ src/venus/vkr_transport.c |  2 ++
+ 5 files changed, 41 insertions(+)
+
+diff --git a/src/venus/vkr_common.c b/src/venus/vkr_common.c
+index 5540a7d..0a8b816 100644
+--- a/src/venus/vkr_common.c
++++ b/src/venus/vkr_common.c
+@@ -6,7 +6,10 @@
+ #include "vkr_common.h"
+ 
+ #include <stdarg.h>
++#include <pthread.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "util/u_debug.h"
+ #include "venus-protocol/vn_protocol_renderer_info.h"
+@@ -229,6 +232,35 @@ vkr_debug_init(void)
+    vkr_debug_flags = debug_get_option_vkr_debug_flags();
+ }
+ 
++/* VKR_CMD_TRACE=path appends one line per decoded command: its source (C context, R ring,
++ * N nested stream), command type, length in bytes and an FNV-1a hash of the bytes. */
++void
++vkr_trace_command(char source, const uint8_t *start, const uint8_t *end)
++{
++   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++   static FILE *file;
++   static bool opened;
++
++   pthread_mutex_lock(&lock);
++   if (!opened) {
++      opened = true;
++      const char *path = getenv("VKR_CMD_TRACE");
++      if (path)
++         file = fopen(path, "a");
++   }
++   if (file && end > start + 4) {
++      uint32_t type;
++      memcpy(&type, start, sizeof(type));
++      uint64_t hash = 0xcbf29ce484222325ull;
++      for (const uint8_t *p = start; p < end; p++)
++         hash = (hash ^ *p) * 0x100000001b3ull;
++      fprintf(file, "%c %u %zu %016llx\n", source, type, (size_t)(end - start),
++              (unsigned long long)hash);
++      fflush(file);
++   }
++   pthread_mutex_unlock(&lock);
++}
++
+ void
+ vkr_log(const char *fmt, ...)
+ {
+diff --git a/src/venus/vkr_common.h b/src/venus/vkr_common.h
+index 5e696bb..254ebdb 100644
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -184,6 +184,9 @@ extern uint32_t vkr_debug_flags;
+ void
+ vkr_debug_init(void);
+ 
++void
++vkr_trace_command(char source, const uint8_t *start, const uint8_t *end);
++
+ void
+ vkr_log(const char *fmt, ...);
+ 
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index 4bf526a..3509a9d 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -170,7 +170,9 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
+    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
+ 
+    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
++      const uint8_t *cmd_start = ctx->decoder.cur;
+       vn_dispatch_command(&ctx->dispatch);
++      vkr_trace_command('C', cmd_start, ctx->decoder.cur);
+       if (vkr_context_get_fatal(ctx)) {
+          vkr_log("submit_cmd: vn_dispatch_command failed");
+ 
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 0e46df8..9419c07 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -222,7 +222,9 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
+    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+ 
+    while (vkr_cs_decoder_has_command(dec)) {
++      const uint8_t *cmd_start = dec->cur;
+       vn_dispatch_command(&ring->dispatch);
++      vkr_trace_command('R', cmd_start, dec->cur);
+       if (vkr_cs_decoder_get_fatal(dec)) {
+          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
+ 
+diff --git a/src/venus/vkr_transport.c b/src/venus/vkr_transport.c
+index 85c0294..ab573e4 100644
+--- a/src/venus/vkr_transport.c
++++ b/src/venus/vkr_transport.c
+@@ -80,7 +80,9 @@ vkr_dispatch_vkExecuteCommandStreamsMESA(
+       }
+ 
+       while (vkr_cs_decoder_has_command(dec)) {
++         const uint8_t *cmd_start = dec->cur;
+          vn_dispatch_command(dispatch);
++         vkr_trace_command('N', cmd_start, dec->cur);
+          if (vkr_context_get_fatal(ctx))
+             break;
+       }
+-- 
+2.47.3
+
