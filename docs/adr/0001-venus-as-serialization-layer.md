@@ -85,6 +85,17 @@ The three differing commands carry the ring id, which Mesa sets to the address o
 
 Limit: this covers the basic call sequence only. A draw, memory and presentation have no Linux counterpart in this run (Mesa's vtest client cannot map host-visible memory on NVIDIA 550). For those, the evidence is that virglrenderer's strict decoder accepted every command in the DXVK runs and the frame matched the hand-written ICD bit for bit (3.4).
 
+### 3.6 Teapot-class scene on both paths (measured 2026-11-16)
+
+`crates/winbridge-gfx-probe/d3d11/teapot11.cpp` draws a procedural pot (lathe body, lid, knob, spout, handle) and a ground plane with a depth buffer, two indexed draws, a sampled 64x64 checker texture with a wrap sampler and a constant buffer updated between the draws (640x360, frame 59 of a fixed rotation), through DXVK 3.1.1 d3d11:
+
+| Path | Result |
+|---|---|
+| Venus | Pass, exit 0; avg 47.9 ms per frame, first frame 399 ms. The frame was inspected: the handle, spout and lid occlude correctly, the texture is sampled and the surfaces are lit (107620 non-background pixels, 1454 distinct colours). |
+| Hand-written ICD | Fail: `sc->Present` returns `E_FAIL`; the dispatcher logs `unknown VkSampler handle id 36` and closes the session, DXVK reports `VK_ERROR_DEVICE_LOST` from `vkCreateDescriptorPool`. The cause was not investigated. |
+
+There is no second frame to compare against, so the pixel check for this scene is the visual one; a bit-for-bit comparison is only available where both paths render, as for the triangle (3.4). The frame was not compared against any third renderer.
+
 ## 4. Options considered
 
 | Option | Effect | Cost / risk |
@@ -98,7 +109,7 @@ Limit: this covers the basic call sequence only. A draw, memory and presentation
 
 1. Command-stream consistency with Mesa's own driver: the same Vulkan call sequence must produce the same Venus byte stream, and the same stream through virglrenderer must render the same image. **Done for the basic call sequence** (section 3.5); draw and presentation streams are covered by the decoder acceptance and the pixel result in 3.4, not by a Linux comparison.
 2. The DXVK d3d11 triangle runs through the new path in the build VM and matches the current ICD's result. **Done** (section 3.4).
-3. A teapot-class test (depth, textures, constant buffers) renders on both paths.
+3. A teapot-class test (depth, textures, constant buffers) renders on both paths. **Venus passes; the hand-written ICD fails on a sampler handle** (section 3.6), the kind of coverage gap this ADR is meant to close.
 4. Mesa and venus-protocol copyright and licence headers are preserved; nothing in the repository carries private paths or host names.
 
 ## 6. Open design items
