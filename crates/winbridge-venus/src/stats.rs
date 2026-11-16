@@ -34,6 +34,8 @@ struct Window {
     scans: u64,
     scan_msgs: u64,
     scan_bytes: u64,
+    compare_calls: u64,
+    compare_bytes: u64,
     out_msgs: u64,
     out_bytes: u64,
     send_time: Duration,
@@ -105,6 +107,12 @@ impl Stats {
         self.w.scan_bytes += bytes;
     }
 
+    /// A scan pass compared `bytes` of mirrored memory with its copy.
+    pub fn compared(&mut self, bytes: u64) {
+        self.w.compare_calls += 1;
+        self.w.compare_bytes += bytes;
+    }
+
     pub fn sent(&mut self, bytes: usize, took: Duration) {
         self.w.out_msgs += 1;
         self.w.out_bytes += bytes as u64;
@@ -144,8 +152,8 @@ impl Stats {
         );
         info!(
             target: "stats",
-            "  out: {} msgs {:.0} KiB, write {:.1} ms total max {:.2} ms; {} scans made {} msgs {:.0} KiB",
-            w.out_msgs, kib(w.out_bytes), ms(w.send_time), ms(w.send_max), w.scans, w.scan_msgs, kib(w.scan_bytes)
+            "  out: {} msgs {:.0} KiB, write {:.1} ms total max {:.2} ms; {} scans made {} msgs {:.0} KiB; compared {} x {:.0} KiB",
+            w.out_msgs, kib(w.out_bytes), ms(w.send_time), ms(w.send_max), w.scans, w.scan_msgs, kib(w.scan_bytes), w.compare_calls, kib(w.compare_bytes)
         );
     }
 }

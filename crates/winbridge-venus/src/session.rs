@@ -120,9 +120,10 @@ impl Shm {
         unsafe { &*self.map.add(off).cast::<AtomicU32>() }
     }
 
-    /// Appends the words the renderer changed since the last scan.
-    fn scan(&mut self, res_id: u32, out: &mut PushBuilder) {
-        let Some(mut snap) = self.snap.take() else { return };
+    /// Appends the words the renderer changed since the last scan. Returns how many bytes it
+    /// compared.
+    fn scan(&mut self, res_id: u32, out: &mut PushBuilder) -> usize {
+        let Some(mut snap) = self.snap.take() else { return 0 };
         let words = snap.len();
         let mut i = 0;
         let mut cur = vec![0u64; 0];
@@ -168,6 +169,7 @@ impl Shm {
             i = end;
         }
         self.snap = Some(snap);
+        words * 8
     }
 
     /// Writes words pushed by the guest, and records them as seen so they are not echoed.
@@ -633,21 +635,23 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         self.last_scan = Instant::now();
         let mut ring = PushBuilder::default();
         let mut others = PushBuilder::default();
+        let mut compared = 0usize;
         // The ring is read first: its head must never be newer than the data behind it.
         let mut ids: Vec<u32> = self.shms.keys().copied().collect();
         ids.sort_unstable();
         for &id in &ids {
             let s = self.shms.get_mut(&id).unwrap();
             if s.ring {
-                s.scan(id, &mut ring);
+                compared += s.scan(id, &mut ring);
             }
         }
         for &id in &ids {
             let s = self.shms.get_mut(&id).unwrap();
             if !s.ring && (include_bos || !s.bo) {
-                s.scan(id, &mut others);
+                compared += s.scan(id, &mut others);
             }
         }
+        self.stats.compared(compared as u64);
         if !ring.is_empty() || !others.is_empty() {
             debug!("push: {} other range(s), then {} ring range(s)", others.len(), ring.len());
         }
