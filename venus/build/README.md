@@ -2,17 +2,17 @@
 
 # Building the Venus guest ICD
 
-`build.sh` cross-builds `vulkan_virtio.dll` on Linux with clang-cl and lld-link, against the MSVC CRT and the Windows SDK that it fetches from Microsoft's public channel. Nothing from a Windows machine is needed, and nothing from Microsoft is stored in this repository.
+`build.sh` cross-builds `vulkan_virtio.dll` and Mesa's OpenGL for Windows (`opengl32.dll`, `libgallium_wgl.dll` with the Zink driver, and `z-1.dll`) on Linux with clang-cl and lld-link, against the MSVC CRT and the Windows SDK that it fetches from Microsoft's public channel. Nothing from a Windows machine is needed, and nothing from Microsoft is stored in this repository.
 
 ```sh
-WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh      # all stages; the DLL ends up in $WBVN_BUILD_DIR/out
+WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh      # all stages; the DLLs end up in $WBVN_BUILD_DIR/out
 ```
 
 The work directory is `~/.cache/winbridge-venus-build` unless `WBVN_BUILD_DIR` says otherwise. Stages can be run alone (`build.sh mesa build`), and a finished stage is cheap to run again.
 
 ## What it needs
 
-- Debian packages `clang-19`, `lld-19`, `llvm-19`, `ninja-build`, `git`, `curl`, `python3`; `cargo` (to install xwin) and, for the Python environment, `uv` or `python3-venv`.
+- Debian packages `clang-19`, `lld-19`, `llvm-19`, `ninja-build`, `git`, `curl`, `python3`, `flex`, `bison` (Mesa's GLSL and ARB program parsers); `cargo` (to install xwin) and, for the Python environment, `uv` or `python3-venv`.
 - Network access to gitlab.freedesktop.org (Mesa), github.com and wrapdb.mesonbuild.com (meson's wrapped subprojects), crates.io and download.visualstudio.microsoft.com (xwin and what it downloads), pypi.org.
 - Acceptance of the Microsoft Software License Terms for the CRT and the SDK: `WBVN_ACCEPT_MS_LICENSE=1`. The script refuses to download without it.
 

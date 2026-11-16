@@ -47,7 +47,7 @@ stage_tools() {
     for t in clang clang-cl lld llvm-lib llvm-rc; do
         [ -x "$llvm/$t" ] || die "$llvm/$t is missing (install clang-$LLVM_MAJOR, lld-$LLVM_MAJOR, llvm-$LLVM_MAJOR)"
     done
-    for t in git curl ninja python3; do
+    for t in git curl ninja python3 flex bison; do
         command -v "$t" >/dev/null || die "$t is not installed"
     done
 }
@@ -197,15 +197,19 @@ stage_build() {
     local setup=(setup)
     [ -f "$build/build.ninja" ] && setup=(setup --reconfigure)
     "$work/venv/bin/meson" "${setup[@]}" "$build" "$src" --cross-file "$work/cross.ini" \
-        --buildtype debugoptimized -Dvulkan-drivers=virtio -Dgallium-drivers= -Dplatforms=windows \
-        -Dopengl=false -Degl=disabled -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
+        --buildtype debugoptimized -Dvulkan-drivers=virtio -Dgallium-drivers=zink -Dplatforms=windows \
+        -Dopengl=true -Degl=disabled -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
         -Dvalgrind=disabled -Dlibunwind=disabled -Dbuild-tests=false -Dmicrosoft-clc=disabled \
         -Dtools= -Dxmlconfig=disabled
     say "build"
-    ninja -C "$build" src/virtio/vulkan/vulkan_virtio.dll
+    ninja -C "$build" src/virtio/vulkan/vulkan_virtio.dll src/gallium/targets/libgl-gdi/opengl32.dll \
+        src/gallium/targets/wgl/libgallium_wgl.dll
     mkdir -p "$work/out"
-    cp "$build/src/virtio/vulkan/vulkan_virtio.dll" "$build/src/virtio/vulkan/vulkan_virtio.pdb" "$work/out/"
-    say "done: $work/out/vulkan_virtio.dll"
+    cp "$build/src/virtio/vulkan/vulkan_virtio.dll" "$build/src/virtio/vulkan/vulkan_virtio.pdb" \
+        "$build/src/gallium/targets/libgl-gdi/opengl32.dll" "$build/src/gallium/targets/libgl-gdi/opengl32.pdb" \
+        "$build/src/gallium/targets/wgl/libgallium_wgl.dll" "$build/src/gallium/targets/wgl/libgallium_wgl.pdb" \
+        "$build/subprojects/zlib-1.3.1/z-1.dll" "$work/out/"
+    say "done: $work/out"
 }
 
 mkdir -p "$work"

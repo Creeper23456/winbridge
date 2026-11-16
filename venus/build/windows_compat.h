@@ -6,6 +6,10 @@
 #define WINBRIDGE_WINDOWS_COMPAT_H
 
 #include <intrin.h>
+#include <io.h>
+
+/* the lexers flex generates for Mesa's GLSL and ARB program parsers call the POSIX name */
+#define isatty _isatty
 
 static __forceinline long
 _interlockedadd(long volatile *addend, long value)
