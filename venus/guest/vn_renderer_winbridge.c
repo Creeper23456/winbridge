@@ -153,8 +153,6 @@ struct wbvn {
    volatile LONG contenders;
    /* frames a flush has built and not written yet; guarded by push_lock */
    struct wbvn_buf out;
-   /* counts the flushes that sent something (under push_lock); the pump stays awake while it moves */
-   volatile LONG flush_gen;
    uint32_t max_timeline_count;
    struct virgl_renderer_capset_venus capset;
 };
@@ -1010,8 +1008,6 @@ wbvn_flush_build(struct wbvn *w)
    if (ring_count)
       sent |= frame_put_push(out, &ring, ring_count);
    free(ring.data);
-   if (sent)
-      w->flush_gen++;
    if (flush_start) {
       stat_add(S_flush_n, 1);
       stat_add(S_flush_ns, stat_now() - flush_start);
@@ -1110,6 +1106,19 @@ wbvn_push_gen(void)
    const uint64_t gen = w->push_gen;
    ReleaseSRWLockShared(&w->mu);
    return gen;
+}
+
+/* For Mesa's `vn_ring_submit_internal` (patch 0011): the ring's tail has just been published, so
+ * the host gets the ring and what it covers now instead of when the pump next looks. */
+void
+wbvn_ring_published(void)
+{
+   struct wbvn *w = g_renderer;
+   if (!w || w->lost)
+      return;
+   lock_excl(w, &w->push_lock);
+   wbvn_flush_push(w);
+   ReleaseSRWLockExclusive(&w->push_lock);
 }
 
 uint64_t
@@ -1294,41 +1303,28 @@ done:
    return 0;
 }
 
-/* Scans the guest side continuously: the ring may be running and take new commands without a
- * submit to announce them. Spins briefly after activity, then backs off to the timer tick. */
+/* Sweeps up what nothing announced. The ring's tail is pushed by wbvn_ring_published, and a
+ * submit, a wait and a bo flush push what they need, so this runs at the timer's rate and finds
+ * little. A pump that polled for 4000 rounds after every push kept a virtual CPU busy: the teapot
+ * took 5.3 and 6.3 ms a frame with it and 2.2 and 2.3 ms without (600 frames, build VM, 4 vCPUs). */
 static DWORD WINAPI
 wbvn_pump(LPVOID arg)
 {
    struct wbvn *w = arg;
-   uint32_t idle = 0;
-   LONG seen = 0;
    while (!w->quit && !w->lost) {
       if (w->contenders) {
          SwitchToThread();
          continue;
       }
       AcquireSRWLockExclusive(&w->push_lock);
-      bool sent = wbvn_flush_push(w);
+      wbvn_flush_push(w);
       ReleaseSRWLockExclusive(&w->push_lock);
       stat_add(S_pump_loops, 1);
-      /* a flush by another thread is activity too: the application is running */
-      const LONG gen = w->flush_gen;
-      if (sent || gen != seen) {
-         seen = gen;
-         idle = 0;
-      } else if (idle < 4000) {
-         idle++;
-         if (idle % 16 == 0)
-            SwitchToThread();
-         else
-            YieldProcessor();
-      } else {
-         const int64_t t0 = stat_now();
-         Sleep(1);
-         if (t0) {
-            stat_add(S_pump_sleeps, 1);
-            stat_add(S_pump_sleep_ns, stat_now() - t0);
-         }
+      const int64_t t0 = stat_now();
+      Sleep(1);
+      if (t0) {
+         stat_add(S_pump_sleeps, 1);
+         stat_add(S_pump_sleep_ns, stat_now() - t0);
       }
       stats_tick(false);
    }

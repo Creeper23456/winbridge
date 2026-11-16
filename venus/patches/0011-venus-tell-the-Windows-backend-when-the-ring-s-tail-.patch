@@ -1,0 +1,43 @@
+From bf1547aa75e376ee3d087d1d038fa39dc4eae2f4 Mon Sep 17 00:00:00 2001
+From: Creeper23456 <Creeper23456@outlook.com>
+Date: Mon, 16 Nov 2026 16:44:12 +0800
+Subject: [PATCH 11/11] venus: tell the Windows backend when the ring's tail is
+ published
+
+The WinBridge backend mirrors the ring into the host's memory. Without a notification it can only notice a new tail by scanning the ring over and over from a thread of its own, which keeps a virtual CPU busy for as long as the application renders. vn_ring_submit_internal now calls the backend right after it stores the tail, so the host gets the ring when it changes.
+---
+ src/virtio/vulkan/vn_ring.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 62f3b8d..167c55c 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -15,6 +15,14 @@
+ #include "vn_instance.h"
+ #include "vn_renderer.h"
+ 
++#ifdef _WIN32
++/* implemented by the WinBridge renderer backend: sends the ring, with what its tail covers, to the
++ * host now. The backend mirrors the ring; without this it would only notice the new tail when it
++ * next scanned, and keep a thread scanning all the time. */
++void
++wbvn_ring_published(void);
++#endif
++
+ #define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
+ 
+ /* for better recycle of the vn_ring_submit batch */
+@@ -463,6 +471,9 @@ vn_ring_submit_internal(struct vn_ring *ring,
+    }
+ 
+    vn_ring_store_tail(ring);
++#ifdef _WIN32
++   wbvn_ring_published();
++#endif
+    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
+    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+       vn_log(NULL, "vn_ring_submit abort on fatal");
+-- 
+2.47.3
+
