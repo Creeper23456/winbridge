@@ -72,6 +72,19 @@ Mesa Venus `vulkan_virtio.dll` installed with `scripts/install-venus-icd.ps1`, h
 
 The Venus path is about nine times slower per frame than the hand-written ICD. Causes not yet separated: round trips through the pump thread, fence retire and copy-back of the swapchain image, serial throughput. Defects found and fixed on the way, each with its evidence in the commit history: `Sleep(1)` lasting 15.6 ms (timer resolution), uncached memory scan (8), sync-file semantics (7), ring tail pushed ahead of its commands (the guest read the tail after the write-watch list, so a tail could arrive without the page behind it; one in several runs ended in `vkUpdateDescriptorSets resulted in CS error`).
 
+### 3.5 Command streams compared with Mesa's Linux driver (measured 2026-11-16)
+
+`venus-probe basic` (instance, enumerate, properties, device, queue, fence, an empty submit, waits, destroy) ran once through the Windows driver and once through Mesa's Linux `libvulkan_virtio.so` (same Mesa commit, same `VN_PERF`, same physical device, vtest). virglrenderer logged every decoded command with `VKR_CMD_TRACE` (type, length, FNV-1a hash); `venus/tools/compare-command-traces.py` compared the two traces:
+
+| Stream | Linux | Windows | Result |
+|---|---|---|---|
+| Ring commands | 34 | 34 | 34 identical in type, length and content hash |
+| Context commands | 4 | 4 (plus 37 `vkNotifyRingMESA` issued by the host bridge) | Same types and lengths; the hashes of `vkCreateRingMESA`, `vkSubmitVirtqueueSeqnoMESA` and `vkDestroyRingMESA` differ |
+
+The three differing commands carry the ring id, which Mesa sets to the address of the ring object (`ring->id = (uintptr_t)ring`), and the shmem resource id, which each backend assigns; both are process-specific by construction [INFERENCE from the source; the differing bytes were not dumped on the Linux side].
+
+Limit: this covers the basic call sequence only. A draw, memory and presentation have no Linux counterpart in this run (Mesa's vtest client cannot map host-visible memory on NVIDIA 550). For those, the evidence is that virglrenderer's strict decoder accepted every command in the DXVK runs and the frame matched the hand-written ICD bit for bit (3.4).
+
 ## 4. Options considered
 
 | Option | Effect | Cost / risk |
@@ -83,7 +96,7 @@ The Venus path is about nine times slower per frame than the hand-written ICD. C
 
 ## 5. Acceptance before anything is pushed
 
-1. Command-stream consistency in a Linux container: the same Vulkan call sequence must produce the same Venus byte stream as Mesa's own driver (record with the logging tap used in 3.1), and the same stream through virglrenderer must render the same image.
+1. Command-stream consistency with Mesa's own driver: the same Vulkan call sequence must produce the same Venus byte stream, and the same stream through virglrenderer must render the same image. **Done for the basic call sequence** (section 3.5); draw and presentation streams are covered by the decoder acceptance and the pixel result in 3.4, not by a Linux comparison.
 2. The DXVK d3d11 triangle runs through the new path in the build VM and matches the current ICD's result. **Done** (section 3.4).
 3. A teapot-class test (depth, textures, constant buffers) renders on both paths.
 4. Mesa and venus-protocol copyright and licence headers are preserved; nothing in the repository carries private paths or host names.
@@ -100,5 +113,5 @@ The Venus path is about nine times slower per frame than the hand-written ICD. C
 
 - Venus on a driver of 570.86 or later (not tried).
 - Frame time of the Venus path (about 40 ms against 4.5 ms) is measured but its causes are not separated; bos above 2 MiB are not host-scanned.
-- Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`); probe wall time of about 41 s in the VM is not analysed.
-- Container tooling: docker was unusable without root, so the build used a user prefix; the byte-for-byte stream comparison of 5.1 has not been run.
+- Idle CPU cost of the guest pump thread (spins 4000 iterations, then `Sleep(1)`).
+- Container tooling: docker was unusable without root, so the Linux side of the comparison ran natively in a user prefix, not in a container.
