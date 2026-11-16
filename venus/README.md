@@ -60,6 +60,10 @@ Guest: the ivshmem driver must be installed (`docs/IVSHMEM-TRANSPORT.md` section
 PowerShell. Applications then find the driver through the Vulkan loader. `WBVN_SPIN_US` (default
 150) is how long the driver's reader polls for the host before it sleeps.
 
+The slots' serial ports are created for administrators only. The elevated `winbridge-agent` opens them
+to the interactive users when it starts (`org.winbridge.venus.N`, live, not persistent), so a
+Vulkan process with a normal token can use them; without the agent only an elevated process can.
+
 The driver needs the Visual C++ runtime in the guest (`VCRUNTIME140.dll`; the test programs also
 `MSVCP140.dll` and, through it, `VCRUNTIME140_1.dll`). A Windows 11 install does not have it until some
 application brings it: without it the loader reports no driver and a program that links it

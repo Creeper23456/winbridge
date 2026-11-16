@@ -2,7 +2,7 @@
 
 # ADR 0001: Venus as the Vulkan serialization layer on Windows guests
 
-- Status: **Accepted** (2026-11-16, by the user, after the DXVK triangle and teapot-class scenes ran through it in the build VM; the hand-written ICD was removed the same day). Not verified in the user's LTSC VM; the guest driver has not been installed there.
+- Status: **Accepted** (2026-11-16, by the user, after the DXVK triangle and teapot-class scenes ran through it in the build VM; the hand-written ICD was removed the same day). Section 3.8: it also runs in the user's LTSC VM, started through the viewer.
 - Context owner: 3D acceleration (`docs/GFX-DESIGN.md`)
 - Related: `docs/IVSHMEM-TRANSPORT.md` (shared-memory transport), `docs/GFX-DESIGN.md` (measurements and history of the removed hand-written ICD)
 
@@ -117,6 +117,23 @@ The frames stayed bit-identical (tri11 against the hand-written ICD's frame; tea
 4. **The channel.** With nothing else running, a 16-byte ping takes 0.11 to 0.12 ms at the least (0.18 on average), 64 KiB 0.5 ms, and 1 MiB out and back 4.9 to 5.9 ms. `Sleep(1)` lasts 4.4 to 6.3 ms in this guest even with a 0.5 ms timer resolution requested, and a high-resolution waitable timer lasted as long (5.4 to 6.4 ms), so nothing on the hot path may depend on a timed sleep. The timer was tried and removed again.
 
 Not done: fewer renderer waits per frame (what in DXVK and the software presentation path causes them, and which of them Mesa could skip), an in-process virglrenderer without the render-server hops, and the cause of the difference in 3. The run-to-run spread (3.24 to 4.55 ms for the same binary) was not explained either.
+
+### 3.8 The user's LTSC VM (measured 2026-11-16)
+
+Installed in the LTSC guest (4 vCPU, virtio-gpu for the desktop, 2 Venus slots) and started through the viewer (`winbridge-host --launch-script`, which runs the VM's launch script with the D-Bus display, the WinBridge port and the slots). A normal, non-elevated user session; DXVK 3.1.1 d3d11 and d3d9 next to the programs:
+
+| Program | Result |
+|---|---|
+| `tri11.exe`, 120 frames, dumped | Pass; 2.32 ms per frame on average, 13.98 ms worst; 41,472 of 230,400 pixels differ from the background colour |
+| `teapot11.exe` (`--frames 0`), then `tri9.exe` started beside it, one slot each | Both run and hold a slot at the same time (two claims in the host logs). From two screenshots: the teapot's title and DXVK's HUD read 339.8 frames a second, 2.94 ms average and 8.46 ms worst over the last half second while it ran alone; tri9 read 340.7 frames a second, 2.93 ms and 6.92 ms with the teapot running. Not a controlled measurement. |
+
+Three things stood in the way, all in the guest or the host, none in the encoder:
+
+1. **The guest had no Visual C++ runtime.** `VCRUNTIME140.dll` and `MSVCP140.dll` are not part of Windows 11; the programs stopped with 0xC0000135 and the loader found no driver. The DLLs of Microsoft's VC 14.52 redistributable package (the version the driver was built with) now sit next to the programs and next to `vulkan_virtio.dll` (`venus/README.md`).
+2. **The slot's serial port is administrators only.** The virtio-serial driver creates `org.winbridge.venus.N` with the DACL `SY, BA`. A Vulkan process of the user runs with the filtered token, got access denied, and the driver enumerated no device. The elevated agent now opens the ports to the interactive users when it starts (live, like the ivshmem hardening; the port carries wake-up bytes only). Read back as `D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x12019f;;;IU)`; the same probe as the user returned success on both ports.
+3. **The host missed a quick claim and leave.** It polled for the state CLAIMED; the failures of item 2 claimed the slot and closed it again within a poll, which left it CLOSED, and every later claim then waited for a slot that never became free. The host now treats CLOSED as the end of the wait and resets the slot (a regression test covers it).
+
+Not verified here: the hand-written pieces of the viewer on this VM (drag and drop, clipboard) with the slots present, a run longer than a few minutes, applications other than the three test programs, and how the driver behaves when the VM runs without `winbridge-venus` (the driver waits up to 30 s for the host's answer).
 
 ## 4. Options considered
 
