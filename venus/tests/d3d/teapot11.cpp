@@ -3,7 +3,7 @@
 // ground plane, drawn with a depth buffer, an indexed draw, a sampled texture and a constant buffer
 // that is updated between two draws. The geometry is procedural; frame i uses a fixed angle, so
 // the frame written by --dump is the same on every path. Run with DXVK's d3d11.dll and dxgi.dll
-// next to the exe. Usage: teapot11 [--frames N] [--hold-ms N] [--dump PATH.ppm]
+// next to the exe. Usage: teapot11 [--frames N] [--hold-ms N] [--dump PATH.ppm] [--size WxH]
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
@@ -96,13 +96,13 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("RESULT: FAIL: %s = 0x%08lx\n", #x, (unsigned long)hr_); return 1; } } while (0)
 
 int main(int argc, char **argv) {
-    int frames = 120, hold = 0; const char *dump = 0;
+    int frames = 120, hold = 0, W = 640, H = 360; const char *dump = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hold-ms") && i + 1 < argc) hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc && sscanf(argv[++i], "%dx%d", &W, &H) != 2) { fprintf(stderr, "bad --size\n"); return 2; }
     }
-    const int W = 640, H = 360;
     WNDCLASSW wc = {0}; wc.lpfnWndProc = proc; wc.hInstance = GetModuleHandleW(0);
     wc.lpszClassName = L"teapot11"; wc.hCursor = LoadCursorW(0, (LPCWSTR)IDC_ARROW);
     RegisterClassW(&wc);
