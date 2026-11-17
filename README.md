@@ -6,9 +6,51 @@
 
 **A Linux GTK4 viewer and guest agent for Windows 11 on QEMU/KVM.**
 
-WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync: the guest resolution follows the window size (no letterboxing), the guest DPI scale follows the Linux scale factor, the clipboard (text, HTML, RTF, images, files) is shared both ways, and files, folders and text can be dragged between the two sides. The guest cursor replaces the Linux pointer while it is over the canvas. Programs in the guest can use the host GPU for Vulkan, Direct3D 9/10/11 and OpenGL ([3D acceleration](#3d-acceleration)), and the control and bulk traffic can move to shared memory instead of virtio-serial.
+## Origin
 
-It exists because QEMU's own GTK window cannot drive the resolution of a Windows guest using the virtio-gpu (`viogpudo`) driver: the driver learns the new size but nothing applies it. WinBridge asks QEMU for the new size and applies it itself from inside the guest.
+I am working on the Axolotl engine and the JBP project, and money is very tight right now...
+
+I sold two 16 GB memory sticks to pay for development. As a result, continuing on Windows was hardly an option, so I carried on in Debian, whose memory management is more flexible.
+
+But the first problem of moving into the Linux ecosystem showed up right away: how do I check that the Bevy backend of the VN engine works in a Windows VM, and how do I check the Minecraft instances that some mods need to launch?
+
+I had no choice but to use a Windows virtual machine. A Windows VM has no 3D graphics acceleration, so it is painfully slow. That is why this project was built.
+
+## Introduction
+
+WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync. It offers a Windows virtualization experience similar to VMware Workstation or Parallels Desktop, with these features:
+
+- Two-way clipboard copy
+- Quick USB device passthrough
+- Vulkan 3D acceleration
+- File transfer by drag and drop
+- Absolute and relative mouse coordinates
+
+This project does not modify QEMU on the host, and it does not need special drivers installed in Windows. On the host, you only need the QEMU package from your distribution. For the guest, I recommend:
+
+- A modern Windows version. I have only tested Windows 11 LTSC 24H2, Chinese edition.
+- All the VirtIO drivers installed, including the VirtIO display driver that has no 3D acceleration.
+- QemuGA, the QEMU Guest Agent, installed.
+- The ivshmem device and the serial device configured with the VM parameters from this repository.
+
+Install the Agent built from this project in the guest, and user-mode Vulkan forwarding and rendering are enabled.
+
+I would really like someone to make this project work on a Hackintosh through Metal2Vulkan. Pull requests from anyone are very welcome.
+
+For this project, I hope everyone will actively submit pull requests to improve its features. You can also share your views and feature suggestions in the issue discussions. But this is not my main project: I may only join the discussions and will not add more new features unless someone submits a pull request. Still, I am glad to exchange ideas about the project with you in more depth.
+
+I will review pull requests and give my suggestions for changes if a request is not good enough. Please also keep to a friendly and respectful community consensus. For issues, please be polite and provide detailed logs wherever possible.
+
+Almost all the code of this project was written by AI; I took part only in the architecture design. So, unlike some open-source organizations that resist AI, I warmly welcome pull requests with AI-generated code, as long as the quality is good.
+
+The quality requirement is strict. It covers these dimensions:
+
+- Maintainability
+- Robustness
+- Is it the better engineering solution, or was it added as a temporary stopgap?
+- Does it affect existing stable features, and if so, how large is the effect?
+
+What follows is Claude taking over, to introduce the project itself:
 
 ## How it works
 
