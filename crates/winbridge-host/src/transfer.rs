@@ -226,12 +226,14 @@ pub fn set_ui_hook(hook: Rc<dyn Fn()>) {
 }
 
 impl Hub {
-    /// Schedules one refresh on the GTK main loop (changes in between share it).
+    /// Schedules one refresh on the GTK main loop (changes in between share it). It runs at
+    /// the default priority, not the idle one: a pulsing bar keeps the frame clock (priority
+    /// 120) busy, and an idle-priority refresh would never run to hide that bar.
     fn notify(&self) {
         if self.refresh_pending.swap(true, Ordering::SeqCst) {
             return;
         }
-        glib::idle_add_once(|| {
+        glib::timeout_add_once(Duration::ZERO, || {
             HUB.refresh_pending.store(false, Ordering::SeqCst);
             let hook = UI_HOOK.with(|h| h.borrow().clone());
             if let Some(hook) = hook {
@@ -507,5 +509,27 @@ mod tests {
         assert_eq!(view.direction, Direction::FromGuest);
         core.finish(b);
         assert_eq!(core.view().unwrap().label, "Sending 2 files to Windows");
+    }
+
+    /// GDK repaints at priority 120 (`GDK_PRIORITY_REDRAW`) and, with `no-vsync`, a pulsing bar
+    /// keeps asking for the next frame, so a source of that priority is ready on every pass of
+    /// the main loop. A refresh at the default idle priority (200) then never runs: the bar and
+    /// the input lock stay for good (seen: a 22 MB paste whose bar never went away).
+    #[test]
+    fn a_refresh_runs_while_the_frame_clock_never_stops() {
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().expect("the test thread owns the default main context");
+        let frames = glib::source::idle_add_local_full(glib::Priority::from(120), || glib::ControlFlow::Continue);
+
+        let refreshed = Rc::new(std::cell::Cell::new(false));
+        let seen = refreshed.clone();
+        set_ui_hook(Rc::new(move || seen.set(true)));
+        HUB.notify();
+        for _ in 0..50 {
+            context.iteration(false);
+        }
+        frames.remove();
+        assert!(refreshed.get(), "the refresh was starved by work at the redraw priority");
+        assert!(!HUB.refresh_pending.load(Ordering::SeqCst));
     }
 }
