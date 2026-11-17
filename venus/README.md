@@ -21,6 +21,7 @@ Windows app (DXVK, ...) -> vulkan-1.dll -> vulkan_virtio.dll (Venus + vn_rendere
 | `guest/vn_renderer_winbridge.c`, `guest/wbvn_proto.h`, `guest/wbvn_ring.h` | The `vn_renderer` backend, the WBVN wire protocol with the slot layout, and the guest's ring code (the same layout as `crates/winbridge-shm`). Copy them into `src/virtio/vulkan/` of the Mesa tree. |
 | `guest/venus-probe.c` | Loads the driver directly and runs instance, device, submit and a buffer copy through the GPU. |
 | `tests/vk/featprobe.c` | Creates a device with every feature the driver reports as supported (what an application that enables all it can query does) and, if that fails, names the features that do not. |
+| `tests/vk/multiinst.c` | Opens several Vulkan instances in one process (more than there are slots), fills a host-visible buffer on the GPU in each and reads it back, destroys some while the others keep working, and opens one more. |
 | `tests/ivshmem-probe.c` | Asks the ivshmem driver for a slot's mapping the way the driver does, with several output-buffer sizes; built for x64 and x86 it shows what the driver wants from each (24 bytes from a 32-bit caller, 32 from a 64-bit one). |
 | `tests/ring_peer.c` | The guest end of the ring interoperability test of `crates/winbridge-venus`. |
 | `tests/d3d/` | The D3D programs (`tri11`, `teapot11` for D3D11, `tri10` for D3D10 and `tri9` for D3D9) the driver is accepted with, run through DXVK. |
@@ -60,14 +61,16 @@ backing file once (`/dev/shm/winbridge-venus0`, mode 0600, exactly 64 MiB) and s
 ```
 
 then `winbridge-venus --shm /dev/shm/winbridge-venus0 --socket SOCK --virgl-lib LIBVIRGLRENDERER
---render-server VIRGL_RENDER_SERVER`. The process serves the slot for ever: each guest that claims
-it gets a fresh Venus context, and the slot is reset when the guest closes it, exits or stops
+--render-server VIRGL_RENDER_SERVER`. The process serves the slot for ever: the guest process that claims
+it gets a Venus context on virglrenderer for each Vulkan instance it creates, and the slot is reset when the guest closes it, exits or stops
 showing signs of life for 10 s. The bridge sets `VKR_DEBUG=opaque,nofenceexport` when `VKR_DEBUG` is
 unset; both flags come from the virglrenderer patches and are needed on NVIDIA 550.
 
 The slot's number (`--slot N`, default 0) is written into it and names the serial port, so slot N
-needs the port `org.winbridge.venus.N`. A guest Vulkan process maps one device for itself, so one
-slot serves one Vulkan instance at a time; a second one fails to initialise cleanly (within
+needs the port `org.winbridge.venus.N`. A guest Vulkan process maps one device for itself and keeps it
+for as long as any of its Vulkan instances lives; its instances share it, each one a venus context
+(the high half of the `kind` word of a message names it). So one slot serves one process, however many
+instances it creates, and a process that finds no free slot fails to initialise cleanly (within
 `WBVN_CONNECT_MS`, 5 s by default).
 
 Guest: the ivshmem driver must be installed (`docs/IVSHMEM-TRANSPORT.md` section 8), then run

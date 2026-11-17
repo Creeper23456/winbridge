@@ -131,7 +131,7 @@ The Venus channel (`venus/README.md`, `docs/adr/0001-venus-as-serialization-laye
 
 - The one-mapping rule that forces a broker also gives a natural claim: the process whose `REQUEST_MMAP` succeeds owns the device until its handle closes (process exit and kill included, measured in `experiments/shmprobe/RESULTS.md`). No arbitration code is needed.
 - A broker adds a hop, a copy and a wake-up between the Vulkan process and the host on a 4-vCPU guest, for traffic whose latency is the product. With slots the driver writes records straight into the lane the host reads.
-- The cost is that N concurrent Vulkan processes need N devices and N serial ports. A Vulkan *instance* in the same process as another also needs its own slot, because a process cannot map one device twice.
+- The cost is that N concurrent Vulkan processes need N devices and N serial ports. The Vulkan *instances* of one process share its slot (a process maps a device only once): each is a venus context, named in the high half of the `kind` word of a message (WBVN 2, `venus/guest/wbvn_proto.h`; ADR 3.12). Until 2026-11-17 an instance needed a slot of its own.
 
 **Layout.** A slot is a 64 MiB device (not the control size, so the agent tells them apart by `IOCTL_SIZE`) with a `winbridge-shm` region of two lanes of 16 MiB each, guest to host (id 1) and host to guest (id 2), `Role::GuestClient`, capability bit 0 (`venus`). The header page carries a slot block at offset 0x800 (`crates/winbridge-venus/src/slot.rs`, mirrored in `venus/guest/wbvn_proto.h`): magic, version, the slot id, a state (free, claimed, closed), the claimant's nonce and a heartbeat. The records of a lane are pieces of one byte stream of WBVN messages.
 

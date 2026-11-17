@@ -86,7 +86,7 @@ fi
 # acceleration. A slot is a 64 MiB ivshmem-plain device backed by /dev/shm/winbridge-venus<I>
 # (recreated empty at every start, mode 0600) plus the virtio-serial port org.winbridge.venus.<I>
 # that carries wake-up bytes, and gets one winbridge-venus process, stopped when this script ends.
-# A guest Vulkan process takes one slot at a time. Needs WINBRIDGE_VIRGL_LIB (libvirglrenderer.so.1
+# A guest Vulkan process takes one slot for as long as any of its Vulkan instances lives. Needs WINBRIDGE_VIRGL_LIB (libvirglrenderer.so.1
 # with the patches of venus/patches/virglrenderer) and WINBRIDGE_RENDER_SERVER (virgl_render_server);
 # WINBRIDGE_VENUS_BIN names the winbridge-venus binary (default: from PATH).
 VENUS_DEVICES=()

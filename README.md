@@ -40,7 +40,7 @@ Programs in the guest can use the host GPU. WinBridge ports Mesa's **Venus**, a 
 - **Host needs**: a virglrenderer with the patches in `venus/patches/virglrenderer` (two of them are needed on NVIDIA 550) and its render server.
 - **Build from Linux**: `WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh` cross-compiles the driver, the OpenGL DLLs and the x86 builds with `clang-cl`; nothing is built inside the guest. `scripts/install-venus-icd.ps1` registers the driver (it needs the ivshmem driver).
 - **Cost**: the host's `winbridge-venus` busy-polls one core on purpose. During the teapot scene at 720p a 15 s sample showed the viewer at 45% of a core, QEMU at 202% and the Venus thread at 100%.
-- **Limits**: one Vulkan instance per slot. A program that leaves the OpenGL swap interval at 1 is paced to about 14.7 ms a frame. Applications other than the test programs and FurMark were not run. Without `winbridge-venus` a Vulkan program waits up to 30 s for the host.
+- **Limits**: one Vulkan process per slot; its Vulkan instances share it (DXVK and FurMark's Vulkan mode create two). A program that leaves the OpenGL swap interval at 1 is paced to about 14.7 ms a frame. Applications other than the test programs and FurMark were not run. Without `winbridge-venus` a Vulkan program waits up to 30 s for the host.
 
 ## Status
 
