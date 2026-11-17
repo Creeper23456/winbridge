@@ -479,6 +479,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // The fixture names cannot be created on Windows, which is the point: only a Linux sender
+    // meets them.
+    #[cfg(unix)]
     #[test]
     fn names_windows_cannot_hold_are_left_out_and_reported() {
         let dir = scratch("illegal");
