@@ -608,6 +608,30 @@ fail:
    return why;
 }
 
+/* Tells the guest agent that this process uses the accelerated driver, for the viewer's game
+ * mode: connects to the agent's pipe and keeps the handle for the life of the process. The agent
+ * reads the end of the connection as the end of the use, however the process dies, and learns
+ * which program it is from the process id of the connection. No agent, or a pipe that cannot
+ * be opened, changes nothing: this is a notice, not part of the driver's work. */
+static void
+wbvn_agent_note(void)
+{
+   static volatile LONG noted;
+   if (InterlockedCompareExchange(&noted, 1, 0))
+      return;
+   static const WCHAR name[] = L"\\\\.\\pipe\\winbridge-gfx";
+   for (int tries = 0; tries < 3; tries++) {
+      /* The handle is kept on purpose; the process ending closes it. */
+      if (CreateFileW(name, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                      FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+                      NULL) != INVALID_HANDLE_VALUE)
+         return;
+      if (GetLastError() != ERROR_PIPE_BUSY)
+         return;
+      WaitNamedPipeW(name, 100);
+   }
+}
+
 /* Finds a free slot among the ivshmem devices and claims it. */
 static bool
 wbvn_attach(struct wbvn *w)
@@ -649,6 +673,8 @@ wbvn_attach(struct wbvn *w)
    SetupDiDestroyDeviceInfoList(set);
    if (!done)
       vn_log(w->instance, "cannot claim a Venus slot: %s", why);
+   else
+      wbvn_agent_note();
    return done;
 }
 
