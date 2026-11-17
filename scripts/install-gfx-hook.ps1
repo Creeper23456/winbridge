@@ -48,6 +48,21 @@ $Windows64 = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"
 $Windows32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows"
 $Dlls = @("opengl32.dll", "libgallium_wgl.dll", "dxgi.dll", "d3d11.dll", "d3d10core.dll", "d3d9.dll")
 
+# A running program that loaded one of our DLLs holds it open: Windows lets such a file be renamed
+# but not overwritten. The old copy is renamed aside (it goes with the next install or when the
+# program ends) and the new one written, so an update does not need every program closed.
+function Copy-Replace([string]$From, [string]$To) {
+    $dir = Split-Path -Parent $To
+    Get-ChildItem -Path $dir -Filter ((Split-Path -Leaf $To) + ".old-*") -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    try {
+        Copy-Item -Path $From -Destination $To -Force
+    } catch {
+        Rename-Item -Path $To -NewName ((Split-Path -Leaf $To) + ".old-" + [guid]::NewGuid().ToString("N").Substring(0, 8)) -Force
+        Copy-Item -Path $From -Destination $To -Force
+    }
+}
+
 function Get-List([string]$Key) {
     $value = (Get-ItemProperty -Path $Key -Name AppInit_DLLs -ErrorAction SilentlyContinue).AppInit_DLLs
     if ($null -eq $value) { return @() }
@@ -162,11 +177,11 @@ if ($LASTEXITCODE -ne 0) {
 foreach ($arch in @("x64", "x86")) {
     New-Item -ItemType Directory -Path (Join-Path $InstallDir $arch) -Force | Out-Null
     foreach ($dll in $Dlls) {
-        Copy-Item -Path (Join-Path $Source "$arch\$dll") -Destination (Join-Path $InstallDir "$arch\$dll") -Force
+        Copy-Replace (Join-Path $Source "$arch\$dll") (Join-Path $InstallDir "$arch\$dll")
     }
 }
-Copy-Item -Path (Join-Path $Source "wbhook64.dll") -Destination $Hook64 -Force
-Copy-Item -Path (Join-Path $Source "wbhook32.dll") -Destination $Hook32 -Force
+Copy-Replace (Join-Path $Source "wbhook64.dll") $Hook64
+Copy-Replace (Join-Path $Source "wbhook32.dll") $Hook32
 
 New-Item -Path $Settings -Force | Out-Null
 $mask = switch ($Components) { "OpenGL" { 1 } "Direct3D" { 2 } default { 3 } }
