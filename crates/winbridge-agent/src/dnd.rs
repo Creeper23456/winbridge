@@ -38,6 +38,9 @@ pub struct DndManager {
     /// Fallback destination (Downloads\WinBridge) when the drop point is not a folder window or the desktop.
     target_dir: PathBuf,
     staging_root: PathBuf,
+    /// Finds the Explorer folder or desktop under a screen point; a field so tests do not depend
+    /// on what the machine shows at that point.
+    resolve_drop_dir: fn(i32, i32) -> Option<PathBuf>,
 }
 
 impl DndManager {
@@ -59,6 +62,7 @@ impl DndManager {
             operations: HashMap::new(),
             target_dir,
             staging_root,
+            resolve_drop_dir: resolve_shell_drop_dir,
         }
     }
 
@@ -78,7 +82,7 @@ impl DndManager {
         }
 
         let point = (x.min(i32::MAX as u32) as i32, y.min(i32::MAX as u32) as i32);
-        let target_dir = resolve_shell_drop_dir(point.0, point.1).unwrap_or_else(|| self.target_dir.clone());
+        let target_dir = (self.resolve_drop_dir)(point.0, point.1).unwrap_or_else(|| self.target_dir.clone());
         let staging_dir = self.staging_root.join(operation_id.to_string());
         fs::create_dir_all(&staging_dir)
             .map_err(|e| format!("Failed to create staging directory {:?}: {}", staging_dir, e))?;
@@ -667,6 +671,7 @@ mod tests {
             operations: HashMap::new(),
             target_dir,
             staging_root: root.join("stage"),
+            resolve_drop_dir: |_, _| None,
         }
     }
 
