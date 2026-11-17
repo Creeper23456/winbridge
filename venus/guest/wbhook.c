@@ -60,6 +60,21 @@ static const struct {
 /* Programs that must never get the hook, whatever the registry says. */
 static const WCHAR *const wbh_never[] = { L"winbridge-agent.exe", NULL };
 
+/* Calls into Windows that Windows forwards to *its own* opengl32.dll by name. gdi32's SwapBuffers
+ * loads "OPENGL32" and calls its wglSwapBuffers; when the program imported the System32
+ * opengl32.dll before the hook ran, that is the copy the loader hands out for the name, and it
+ * knows nothing of the context made in ours (SwapBuffers then returns FALSE). The program's own
+ * import of the gdi32 function is pointed at ours instead (`file` indexes wbh_files). */
+static const struct {
+   const char *dll;
+   const char *function;
+   size_t file;
+   const char *to;
+} wbh_redirects[] = {
+   { "gdi32.dll", "SwapBuffers", 1, "wglSwapBuffers" },
+};
+#define WBH_NREDIRECTS (sizeof(wbh_redirects) / sizeof(wbh_redirects[0]))
+
 static HMODULE wbh_loaded[WBH_NFILES];
 static HMODULE wbh_self;
 
@@ -267,6 +282,27 @@ wbh_replacement(const char *import)
    return NULL;
 }
 
+static int
+wbh_has_redirects(const char *dll)
+{
+   for (size_t i = 0; i < WBH_NREDIRECTS; i++) {
+      if (wbh_ieq_ascii(dll, wbh_redirects[i].dll))
+         return 1;
+   }
+   return 0;
+}
+
+static FARPROC
+wbh_redirect_target(const char *dll, const char *function)
+{
+   for (size_t i = 0; i < WBH_NREDIRECTS; i++) {
+      if (wbh_ieq_ascii(dll, wbh_redirects[i].dll) && wbh_ieq_ascii(function, wbh_redirects[i].function) &&
+          wbh_loaded[wbh_redirects[i].file])
+         return GetProcAddress(wbh_loaded[wbh_redirects[i].file], wbh_redirects[i].to);
+   }
+   return NULL;
+}
+
 static void
 wbh_patch(FARPROC *slot, FARPROC target)
 {
@@ -297,18 +333,22 @@ wbh_rebind(HMODULE m, const WCHAR *path, size_t len, void *arg)
       return;
    for (const IMAGE_IMPORT_DESCRIPTOR *d = (const IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
         d->Name; d++) {
-      HMODULE repl = wbh_replacement((const char *)(base + d->Name));
+      const char *dll = (const char *)(base + d->Name);
+      HMODULE repl = wbh_replacement(dll);
       /* Without the name table the names are gone once the table is bound. */
-      if (!repl || repl == m || !d->OriginalFirstThunk)
+      if ((!repl && !wbh_has_redirects(dll)) || repl == m || !d->OriginalFirstThunk)
          continue;
       const IMAGE_THUNK_DATA *names = (const IMAGE_THUNK_DATA *)(base + d->OriginalFirstThunk);
       FARPROC *iat = (FARPROC *)(base + d->FirstThunk);
       for (; names->u1.AddressOfData; names++, iat++) {
-         FARPROC target;
-         if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
-            target = GetProcAddress(repl, (LPCSTR)IMAGE_ORDINAL(names->u1.Ordinal));
-         else
-            target = GetProcAddress(repl, (LPCSTR)((const IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name);
+         const char *function = NULL;
+         if (!IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+            function = ((const IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name;
+         FARPROC target = NULL;
+         if (repl)
+            target = GetProcAddress(repl, function ? function : (LPCSTR)IMAGE_ORDINAL(names->u1.Ordinal));
+         else if (function)
+            target = wbh_redirect_target(dll, function);
          if (target && *iat != target)
             wbh_patch(iat, target);
       }
