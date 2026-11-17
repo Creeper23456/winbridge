@@ -85,7 +85,7 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面，提供了比virt
 - **主机需要**:带有 `venus/patches/virglrenderer` 补丁的 virglrenderer(NVIDIA 550 上其中两个是必需的)及其 render server。
 - **在 Linux 上构建**:`WBVN_ACCEPT_MS_LICENSE=1 venus/build/build.sh` 用 `clang-cl` 交叉编译驱动、OpenGL DLL 和 x86 版本;客户机内不编译任何东西。`scripts/install-venus-icd.ps1` 负责注册驱动(需要先装好 ivshmem 驱动)。
 - **开销**:主机上的 `winbridge-venus` 会有意地忙等占满一个核心。茶壶场景在 720p 下做 15 秒采样:查看器占一个核心的 45%,QEMU 占 202%,Venus 线程占 100%。
-- **限制**:每个槽位同时只服务一个 Vulkan 进程,该进程的多个 Vulkan 实例共用这个槽位(DXVK 和 FurMark 的 Vulkan 模式都会创建两个)。OpenGL 交换间隔保持为 1 的程序会被限制在每帧约 14.7 ms。测试程序和 FurMark 之外的应用没有运行过。没有 `winbridge-venus` 时,Vulkan 程序最多会等主机 30 秒。
+- **限制**:每个槽位同时只服务一个 Vulkan 进程,该进程的多个 Vulkan 实例共用这个槽位(DXVK 和 FurMark 的 Vulkan 模式都会创建两个)。OpenGL 交换间隔保持为 1 的程序会被限制在每帧约 14.7 ms。测试程序和 FurMark 之外的应用没有运行过。没有 `winbridge-venus` 时,Vulkan 程序最多会等主机 30 秒。Venus 报告自己的 `driverID`(`VK_DRIVER_ID_MESA_VENUS`,22),与上游 Mesa 一致。GeeXLab 2021 的光线追踪 Demo(`Vulkan_Raytracing_Demo`,Geeks3D)用这个值去索引一张只有 10 项的表,崩溃在 `plugin_gxc_vulkan2_x64.dll`;在临时构建里把 ID 强制成 NVIDIA 的之后,该 Demo 在宿主 GPU 上以 30 FPS 跑起了硬件光追。ID 保持与上游一致,没有改。
 
 ## 状态
 
