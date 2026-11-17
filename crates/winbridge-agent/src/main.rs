@@ -16,12 +16,14 @@ mod dragipc;
 mod dragout;
 mod dragprobe;
 mod gfxwatch;
+mod identity;
 #[cfg(windows)]
 mod ivshmem;
 mod hostfiles;
 mod logging;
 mod medium;
 mod owner;
+mod service;
 
 use channel::{Outgoing, VirtioSerialStream};
 use clipboard::{write_bundle, ClipboardWatcher, GuestOffer};
@@ -45,6 +47,12 @@ fn main() {
         let pipe = raw.get(i + 1).cloned().unwrap_or_default();
         let agent_pid = raw.get(i + 2).and_then(|p| p.parse().ok()).unwrap_or(0);
         std::process::exit(dragprobe::run(&pipe, agent_pid));
+    }
+    // The service started by the service control manager: it only keeps the agent running.
+    #[cfg(windows)]
+    if raw.iter().any(|a| a == "--service") {
+        logging::init_service("service.log");
+        std::process::exit(service::run());
     }
     logging::init(has_console);
     let args: Vec<String> = std::env::args().collect();
@@ -102,7 +110,8 @@ fn main() {
     if let Some(code) = ivshmem::run_cli(&args) {
         std::process::exit(code);
     }
-    // Before the first file or folder is created: the user, not Administrators, owns them.
+    // Who the files belong to must be known before the first file or folder is created.
+    identity::init();
     owner::adopt_user_ownership();
     display::init_dpi_awareness();
 
@@ -225,6 +234,9 @@ fn main() {
             Pop::Timeout => continue,
             Pop::Closed => break,
         };
+        // Files the host sends belong in the user's profile and to the user; display settings
+        // and the rest stay with SYSTEM.
+        let _user = if touches_user_files(&msg) { identity::impersonate() } else { None };
 
         match msg {
             Message::Ping { seq, timestamp_ms } => {
@@ -413,13 +425,33 @@ fn main() {
     }
 }
 
+/// Whether handling `msg` creates or moves the user's files: those run as the user.
+fn touches_user_files(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::ClipboardOffer { .. }
+            | Message::ClipboardItem { .. }
+            | Message::ClipFilesManifest { .. }
+            | Message::FilesBegin { .. }
+            | Message::FileEntry { .. }
+            | Message::FileChunk { .. }
+            | Message::FilesEnd { .. }
+            | Message::DropBegin { .. }
+            | Message::DropFileStart { .. }
+            | Message::DropArchiveStart { .. }
+            | Message::DropFileChunk { .. }
+            | Message::DropFileFinish { .. }
+            | Message::DropText { .. }
+    )
+}
+
 /// Unpacks a received folder drop on a worker thread (the message loop must not wait for it),
 /// reports the unpack and delete steps to the host's progress bar (at most ten times a second)
 /// and answers the drop.
 fn spawn_unpacker(out: Outgoing, job: dnd::UnpackJob) {
     let id = job.operation_id();
     let answer = out.clone();
-    let spawned = std::thread::Builder::new().name("winbridge-drop-unpack".into()).spawn(move || {
+    let spawned = identity::spawn("winbridge-drop-unpack", move || {
         let mut last: Option<(u8, std::time::Instant)> = None;
         let mut report = |phase: u8, done: u64, total: u64| {
             let due = match last {
@@ -456,7 +488,7 @@ fn spawn_files_sender(out: Outgoing, offer: Arc<GuestOffer>, clip_id: u32) {
             return;
         }
     };
-    let spawned = std::thread::Builder::new().name("winbridge-clip-files".into()).spawn({
+    let spawned = identity::spawn("winbridge-clip-files", {
         let offer = offer.clone();
         move || {
             info!("Host pastes: streaming {} copied path(s) of clip {}", paths.len(), clip_id);

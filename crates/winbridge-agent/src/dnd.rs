@@ -509,7 +509,9 @@ fn known_folder(folder: &windows::core::GUID) -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
 
     unsafe {
-        let value = SHGetKnownFolderPath(folder, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        // As SYSTEM the profile in question is the logged-on user's, not SYSTEM's.
+        let token = crate::identity::user_token().map(windows::Win32::Foundation::HANDLE);
+        let value = SHGetKnownFolderPath(folder, KNOWN_FOLDER_FLAG(0), token).ok()?;
         if value.is_null() {
             return None;
         }
@@ -572,12 +574,16 @@ mod windows_drop {
             let root_handle = root.0 as usize;
             let pair = Arc::new((Mutex::new(None), Condvar::new()));
             let worker_pair = pair.clone();
-            std::thread::spawn(move || {
+            let spawned = crate::identity::spawn("winbridge-shell-lookup", move || {
                 let result = resolve_explorer_folder(HWND(root_handle as *mut c_void));
                 let (lock, ready) = &*worker_pair;
                 *lock.lock().unwrap() = Some(result);
                 ready.notify_one();
             });
+            if let Err(e) = spawned {
+                warn!("Could not start the Explorer lookup thread: {}", e);
+                return None;
+            }
             let (lock, ready) = &*pair;
             let mut result = lock.lock().unwrap();
             while result.is_none() {

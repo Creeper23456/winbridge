@@ -125,10 +125,11 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Creates one end of the private pipes: only the user's own SID may open it.
+    /// Creates one end of the private pipes: only the user's own SID and SYSTEM (the agent) may
+    /// open it.
     unsafe fn create_pipe(name: &str, inbound: bool) -> Result<HANDLE, String> {
         let sid = medium::user_sid_string().ok_or("cannot read the user SID")?;
-        let sddl = wide(&format!("D:(A;;GA;;;{})", sid));
+        let sddl = wide(&format!("D:(A;;GA;;;{})(A;;GA;;;SY)", sid));
         let mut descriptor = ptr::null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut descriptor, ptr::null_mut()) == 0 {
             return Err(format!("security descriptor: {}", std::io::Error::last_os_error()));

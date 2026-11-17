@@ -61,7 +61,21 @@ pub fn init_as(has_console: bool, file_name: &str) {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("WinBridge");
-    let _ = std::fs::create_dir_all(&dir);
+    init_file(&dir, file_name);
+}
+
+/// Logs to `file_name` below `%ProgramData%\WinBridge`: for the service, which is nobody's
+/// program and has no profile worth writing to.
+pub fn init_service(file_name: &str) {
+    let dir = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("WinBridge");
+    init_file(&dir, file_name);
+}
+
+fn init_file(dir: &std::path::Path, file_name: &str) {
+    let _ = std::fs::create_dir_all(dir);
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -214,6 +214,29 @@ mod imp {
 
     /// The medium-integrity token candidates, best first, each with its description.
     fn medium_tokens() -> Vec<(&'static str, Token)> {
+        // The agent is SYSTEM: the helper is the logged-on user's, at the user's own integrity
+        // level (medium; the linked token when Windows hands out the elevated one).
+        if let Some(user) = crate::identity::user_token() {
+            let mut copy: HANDLE = ptr::null_mut();
+            let ok = unsafe {
+                DuplicateTokenEx(user, MAXIMUM_ALLOWED, ptr::null(), SECURITY_IMPERSONATION, TOKEN_PRIMARY, &mut copy)
+            };
+            if ok == 0 {
+                warn!("Drag helper: cannot copy the user's token: {}", std::io::Error::last_os_error());
+                return Vec::new();
+            }
+            let copy = Token(copy);
+            if token_integrity(copy.0) == Some(MEDIUM_RID) {
+                return vec![("the logged-on user's token", copy)];
+            }
+            return match linked_token(&copy) {
+                Some(t) if token_integrity(t.0) == Some(MEDIUM_RID) => vec![("the user's linked token", t)],
+                _ => {
+                    warn!("Drag helper: the user's token is not medium integrity and has no medium linked token");
+                    Vec::new()
+                }
+            };
+        }
         let Some(own) = open_own_token(TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT) else {
             warn!("Drag helper: cannot open the agent token: {}", std::io::Error::last_os_error());
             return Vec::new();

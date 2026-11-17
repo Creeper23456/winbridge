@@ -51,7 +51,21 @@ mod imp {
     }
 
     /// Makes the token's `TokenUser` the default owner of everything this process creates.
+    ///
+    /// As SYSTEM the process cannot take another user as its default owner. The threads that
+    /// create the user's files impersonate the user instead ([`crate::identity`]), and [`claim`]
+    /// and [`fix_owner`] correct what is moved in; this only records whose files they are.
     pub fn adopt_user_ownership() {
+        if crate::identity::is_system() {
+            match crate::identity::user_sid() {
+                Some(sid) => {
+                    let _ = USER_SID.set(sid.to_vec());
+                    info!("New files and folders are created as the logged-on user");
+                }
+                None => info!("Nobody is logged on: there is no user to own files yet"),
+            }
+            return;
+        }
         unsafe {
             let mut token: HANDLE = ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &mut token) == 0 {
