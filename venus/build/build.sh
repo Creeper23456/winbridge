@@ -243,12 +243,29 @@ stage_build() {
     done
 }
 
+# The hook of the global injection (venus/guest/wbhook.c): kernel32 only, no C runtime, wbhook.dll
+# next to the other DLLs of each architecture. It runs after `build`, which recreates out and out32.
+stage_hook() {
+    local a bin out entry
+    for a in ${WBVN_ARCHS:-x64 x86}; do
+        case $a in
+            x64) bin=$work/bin out=$work/out entry=DllMain ;;
+            x86) bin=$work/bin32 out=$work/out32 entry=DllMain@12 ;;
+            *) die "unknown architecture $a (x64 or x86)" ;;
+        esac
+        mkdir -p "$out"
+        say "hook $a"
+        "$bin/clang-cl" -GS- /clang:-fno-builtin -O2 -W3 -MT "$repo/venus/guest/wbhook.c" -LD "-Fe$out/wbhook.dll" \
+            -link /NODEFAULTLIB "/ENTRY:$entry" kernel32.lib
+    done
+}
+
 mkdir -p "$work"
 stages=("$@")
-[ ${#stages[@]} -gt 0 ] || stages=(tools venv sysroot overlay toolchain mesa build)
+[ ${#stages[@]} -gt 0 ] || stages=(tools venv sysroot overlay toolchain mesa build hook)
 for s in "${stages[@]}"; do
     case $s in
-        tools | venv | sysroot | overlay | toolchain | mesa | build) "stage_$s" ;;
+        tools | venv | sysroot | overlay | toolchain | mesa | build | hook) "stage_$s" ;;
         *) die "unknown stage $s" ;;
     esac
 done
