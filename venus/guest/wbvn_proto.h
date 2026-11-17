@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 /*
- * WinBridge Venus channel (WBVN), version 1.
+ * WinBridge Venus channel (WBVN), version 2.
  * A byte stream, little endian, carried by the records of two lanes in an ivshmem region (the
  * guest to host lane and the host to guest lane, see `wbvn_ring.h`); a message may span several
  * records and a record may hold several messages. A virtio-serial port `org.winbridge.venus.N`
@@ -20,7 +20,9 @@
 
 /* ---- the ivshmem slot (`crates/winbridge-venus/src/slot.rs`) ----
  *
- * A guest Vulkan process maps one 64 MiB ivshmem device. The region is a `winbridge-shm` region
+ * A guest Vulkan process maps one 64 MiB ivshmem device, however many Vulkan instances it creates;
+ * they share the region, its lanes and the serial port, and each one is a venus context on the
+ * host (see WBVN_TAG). The region is a `winbridge-shm` region
  * (header page, lane directory at 0x40, rings after the header page): lane 1 carries guest to
  * host, lane 2 host to guest, 16 MiB of data each. The host lays the region out and publishes
  * the slot block last. */
@@ -53,14 +55,25 @@
 
 #include <stdint.h>
 
-#define WBVN_VERSION 1u
+#define WBVN_VERSION 2u
+
+/* The `kind` word of a guest message carries a context id in its high half. Every Vulkan instance
+ * of a process is a venus context on the host, and the messages that act on one (HELLO,
+ * SHM_CREATE, BO_CREATE, SUBMIT, CTX_DESTROY) name it. Shmem, bo and sync ids are unique across
+ * the slot, so the other messages need no context. Replies and host messages carry none. */
+#define WBVN_KIND_MASK 0xFFFFu
+#define WBVN_CTX_SHIFT 16
+#define WBVN_CTX_MAX 0xFFFFu
+#define WBVN_TAG(kind, ctx) ((uint32_t)(kind) | ((uint32_t)(ctx) << WBVN_CTX_SHIFT))
 
 /* Message kinds. Guest -> host unless noted. A reply has the request kind | WBVN_REPLY. */
 enum wbvn_kind {
-   /* payload: u32 version. reply payload: u32 version, u32 max_timeline_count,
+   /* The context id is in the kind word (nonzero, chosen by the guest); the host creates the
+    * context. payload: u32 version. reply payload: u32 version, u32 max_timeline_count,
     * then the venus capset bytes (struct virgl_renderer_capset_venus). reply arg: 0 = ok */
    WBVN_HELLO = 1,
-   /* arg: res_id chosen by the guest (nonzero). payload: u64 size. reply arg: 0 = ok.
+   /* arg: res_id chosen by the guest (nonzero, unique across the slot). The kind word names the
+    * context. payload: u64 size. reply arg: 0 = ok.
     * The host creates a memfd of that size, imports it as a venus shmem and attaches it. */
    WBVN_SHM_CREATE = 2,
    /* arg: res_id. reply arg: 0 = ok. */
@@ -74,21 +87,23 @@ enum wbvn_kind {
     * with vkNotifyRingMESA when a pushed tail finds the ring idle, because mirrored memory
     * lets the ring go idle after the guest has already looked at the status word. */
    WBVN_SHM_ROLE = 5,
-   /* payload: u32 ring_idx, u32 sync_count, u32 cs_size, u32 reserved,
-    * then sync_count * { u32 sync_id, u32 reserved, u64 value }, then cs_size bytes.
-    * The cs runs on the venus context; when sync_count > 0 the host creates a fence on
+   /* The kind word names the context. payload: u32 ring_idx, u32 sync_count, u32 cs_size,
+    * u32 reserved, then sync_count * { u32 sync_id, u32 reserved, u64 value }, then cs_size
+    * bytes. The cs runs on that venus context; when sync_count > 0 the host creates a fence on
     * ring_idx and answers with WBVN_SYNC_SIGNAL once it retires. No reply. */
    WBVN_SUBMIT = 6,
    /* host -> guest. payload: u32 count, u32 reserved, count * { u32 sync_id, u32 reserved,
     * u64 value }. No reply. */
    WBVN_SYNC_SIGNAL = 7,
-   /* host -> guest. The host stopped serving the context (device lost). No payload. */
+   /* host -> guest. arg: the context the host stopped serving (the instance is lost); the
+    * session goes on for the others. No payload. */
    WBVN_LOST = 8,
    /* arg: res_id. payload: u32 offset, u32 mask. The guest cleared `mask` in the 32-bit word
     * at `offset` of a ring shmem (the status word, whose other bits the host owns). The
     * host does `word &= ~mask` on its memory and on its snapshot. No reply. */
    WBVN_STATUS_CLEAR = 9,
-   /* arg: res_id chosen by the guest. payload: struct wbvn_bo_create, then batch_len bytes
+   /* arg: res_id chosen by the guest (unique across the slot); the kind word names the context.
+    * payload: struct wbvn_bo_create, then batch_len bytes
     * laid out like a WBVN_SUBMIT payload (the vkWaitRingSeqnoMESA that orders the resource
     * after its vkAllocateMemory; may be empty). The host runs the batch, creates a mappable
     * host3d blob for the device memory with id blob_id, maps it, and mirrors it like a shmem.
@@ -98,6 +113,9 @@ enum wbvn_kind {
    /* guest -> host. Payload of any size; the reply echoes payload and arg unchanged. Measures the
     * channel alone, the renderer is not involved. */
    WBVN_PING = 11,
+   /* The kind word names the context; the guest destroyed its Vulkan instance. The host releases
+    * the context and what it still holds. reply arg: 0 = ok. */
+   WBVN_CTX_DESTROY = 12,
 
    WBVN_REPLY = 0x8000,
 };

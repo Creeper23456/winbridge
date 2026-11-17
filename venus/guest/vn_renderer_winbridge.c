@@ -4,9 +4,10 @@
  * WinBridge `vn_renderer` backend for the Mesa Venus guest ICD on Windows.
  *
  * Replaces the POSIX-only virtgpu and vtest backends. The renderer is a host process that
- * owns virglrenderer's Venus context; this file talks to it over the WBVN channel
- * (`wbvn_proto.h`). The channel is the two lanes of an ivshmem region that this process maps
- * for itself (a "slot", `wbvn_ring.h`); a virtio-serial port carries a wake-up byte when the
+ * owns virglrenderer's Venus contexts, one per Vulkan instance; this file talks to it over the
+ * WBVN channel (`wbvn_proto.h`). The channel is the two lanes of an ivshmem region that this
+ * process maps for itself and that all its Vulkan instances share (a "slot", `wbvn_ring.h`);
+ * a virtio-serial port carries a wake-up byte when the
  * peer sleeps. The guest cannot map the memory the renderer uses, so every venus shmem is a
  * local allocation that is mirrored in both directions (see the protocol header for the
  * ordering rules). Timeline syncs live in the guest; the host only reports the points that
@@ -98,8 +99,11 @@ struct wbvn_buf {
    size_t cap;
 };
 
+/* The slot this process claimed. Every Vulkan instance of the process shares it: the lanes, the
+ * serial port, the reader and pump threads, the mirror tables and the request channel. Each
+ * instance is a venus context on the host (`struct wbvn_ctx`). */
 struct wbvn {
-   struct vn_renderer base;
+   /* the instance whose creation is being logged; set only while the slot is set up */
    struct vn_instance *instance;
 
    /* the serial port of the slot; it carries wake-up bytes only */
@@ -153,9 +157,30 @@ struct wbvn {
    volatile LONG contenders;
    /* frames a flush has built and not written yet; guarded by push_lock */
    struct wbvn_buf out;
+   /* the instances using the slot, by context id (guarded by mu), and how many there are
+    * (guarded by g_slot_lock) */
+   struct wbvn_tab ctxs;
+   uint32_t refs;
+};
+
+/* One Vulkan instance: a venus context on the host, with the vn_renderer Mesa drives. */
+struct wbvn_ctx {
+   struct vn_renderer base;
+   struct vn_instance *instance;
+   struct wbvn *w;
+   uint32_t id;        /* on the wire, nonzero */
+   bool open;          /* the host has created the context */
+   volatile LONG lost; /* the host stopped serving this context */
    uint32_t max_timeline_count;
    struct virgl_renderer_capset_venus capset;
 };
+
+/* True when this instance can no longer use the host: its context was lost, or the channel. */
+static inline bool
+ctx_lost(const struct wbvn_ctx *c)
+{
+   return c->w->lost || c->lost;
+}
 
 /* ---------- small helpers ------------------------------------------------------------ */
 
@@ -272,10 +297,12 @@ static const char *const stat_names[S_COUNT] = {
 #undef X
 };
 
-/* The renderer of this process, for DllMain: when the process ends without destroying its
- * instance, the slot is closed at once instead of when the host notices a stopped heartbeat. */
+/* The slot of this process, for DllMain and for the hooks Mesa calls without an instance: when the
+ * process ends without destroying its instances, the slot is closed at once instead of when the
+ * host notices a stopped heartbeat. g_slot_lock serialises creating and ending the slot. */
 struct wbvn;
-static struct wbvn *volatile g_renderer;
+static struct wbvn *volatile g_slot;
+static SRWLOCK g_slot_lock = SRWLOCK_INIT;
 
 static bool g_stats_on;
 static FILE *g_stats_file;
@@ -1134,7 +1161,7 @@ wbvn_apply_signals(struct wbvn *w, const uint8_t *p, uint32_t len)
 uint64_t
 wbvn_push_gen(void)
 {
-   struct wbvn *w = g_renderer;
+   struct wbvn *w = g_slot;
    if (!w)
       return 0;
    lock_shared(w, &w->mu);
@@ -1148,7 +1175,7 @@ wbvn_push_gen(void)
 void
 wbvn_ring_published(void)
 {
-   struct wbvn *w = g_renderer;
+   struct wbvn *w = g_slot;
    if (!w || w->lost)
       return;
    lock_excl(w, &w->push_lock);
@@ -1159,7 +1186,7 @@ wbvn_ring_published(void)
 uint64_t
 wbvn_relax_wait(uint64_t seen, uint32_t us)
 {
-   struct wbvn *w = g_renderer;
+   struct wbvn *w = g_slot;
    if (!w) {
       Sleep((us + 999) / 1000);
       return seen;
@@ -1208,7 +1235,15 @@ wbvn_handle_message(struct wbvn *w, const struct wbvn_hdr *h, const uint8_t *pay
       stat_add(S_rdsignal_n, 1);
       wbvn_apply_signals(w, payload, h->len);
    } else if (h->kind == WBVN_LOST) {
-      return false;
+      if (!h->arg)
+         return false;
+      /* one instance is lost; the others go on */
+      lock_excl(w, &w->mu);
+      struct wbvn_ctx *c = tab_get(&w->ctxs, h->arg);
+      if (c)
+         c->lost = 1;
+      WakeAllConditionVariable(&w->cv);
+      ReleaseSRWLockExclusive(&w->mu);
    }
    return true;
 }
@@ -1387,13 +1422,13 @@ wbvn_timer_resolution(bool fine)
 
 /* ---------- vn_renderer ops ---------------------------------------------------------- */
 
+/* Ends the slot: the threads stop and the host gets the slot back. The caller holds g_slot_lock
+ * and has seen the last Vulkan instance go (or the slot never came up). */
 static void
-wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
+wbvn_slot_close(struct wbvn *w)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
-
-   if (g_renderer == w)
-      g_renderer = NULL;
+   if (g_slot == w)
+      g_slot = NULL;
    InterlockedExchange(&w->quit, 1);
    if (w->pump) {
       WaitForSingleObject(w->pump, INFINITE);
@@ -1423,10 +1458,33 @@ wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       CloseHandle(w->write_event);
    free(w->regions.v);
    free(w->syncs.v);
+   free(w->ctxs.v);
    free(w->scratch.data);
    free(w->out.data);
    free(w->reply.payload);
-   vk_free(alloc, w);
+   free(w);
+}
+
+static void
+wbvn_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
+{
+   struct wbvn_ctx *c = (struct wbvn_ctx *)renderer;
+   struct wbvn *w = c->w;
+
+   if (c->open && !ctx_lost(c)) {
+      /* The host releases the context and what it still holds; the answer does not matter. */
+      wbvn_request(w, WBVN_TAG(WBVN_CTX_DESTROY, c->id), 0, NULL, 0, NULL, NULL);
+   }
+   if (c->id) {
+      lock_excl(w, &w->mu);
+      tab_del(&w->ctxs, c->id);
+      ReleaseSRWLockExclusive(&w->mu);
+   }
+   AcquireSRWLockExclusive(&g_slot_lock);
+   if (--w->refs == 0)
+      wbvn_slot_close(w);
+   ReleaseSRWLockExclusive(&g_slot_lock);
+   vk_free(alloc, c);
 }
 
 /* Appends a batch in the layout of a WBVN_SUBMIT payload. */
@@ -1457,9 +1515,10 @@ static VkResult
 wbvn_submit(struct vn_renderer *renderer,
             const struct vn_renderer_submit_batch *batch)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn_ctx *c = (struct wbvn_ctx *)renderer;
+   struct wbvn *w = c->w;
    const int64_t submit_start = stat_now();
-   if (w->lost)
+   if (ctx_lost(c))
       return VK_ERROR_DEVICE_LOST;
 
    struct wbvn_buf msg = { 0 };
@@ -1471,7 +1530,7 @@ wbvn_submit(struct vn_renderer *renderer,
 
    lock_excl(w, &w->push_lock);
    wbvn_flush_build(w);
-   ok = frame_put(&w->out, WBVN_SUBMIT, 0, 0, msg.data, msg.len) && wbvn_out_write(w);
+   ok = frame_put(&w->out, WBVN_TAG(WBVN_SUBMIT, c->id), 0, 0, msg.data, msg.len) && wbvn_out_write(w);
    ReleaseSRWLockExclusive(&w->push_lock);
    if (submit_start) {
       stat_add(S_submit_n, 1);
@@ -1485,7 +1544,8 @@ wbvn_submit(struct vn_renderer *renderer,
 static VkResult
 wbvn_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn_ctx *c = (struct wbvn_ctx *)renderer;
+   struct wbvn *w = c->w;
    const DWORD64 start = GetTickCount64();
    const int64_t wait_start = stat_now();
    VkResult result = VK_SUCCESS;
@@ -1505,7 +1565,7 @@ wbvn_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
       }
       if (wait->wait_any ? reached > 0 : reached == wait->sync_count)
          break;
-      if (w->lost) {
+      if (ctx_lost(c)) {
          result = VK_ERROR_DEVICE_LOST;
          break;
       }
@@ -1595,8 +1655,9 @@ region_detach(struct wbvn *w, struct wbvn_region *r)
 static struct vn_renderer_shmem *
 wbvn_shmem_create(struct vn_renderer *renderer, size_t size)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
-   if (w->lost)
+   struct wbvn_ctx *c = (struct wbvn_ctx *)renderer;
+   struct wbvn *w = c->w;
+   if (ctx_lost(c))
       return NULL;
 
    struct wbvn_shmem *s = calloc(1, sizeof(*s));
@@ -1607,7 +1668,7 @@ wbvn_shmem_create(struct vn_renderer *renderer, size_t size)
    s->r.ring_src = &s->base.mirror_ring_id;
 
    const uint64_t size64 = s->r.size;
-   if (!region_attach(w, &s->r, WBVN_SHM_CREATE, &size64, sizeof(size64))) {
+   if (!region_attach(w, &s->r, WBVN_TAG(WBVN_SHM_CREATE, c->id), &size64, sizeof(size64))) {
       region_fini(&s->r);
       goto fail;
    }
@@ -1626,7 +1687,7 @@ fail:
 static void
 wbvn_shmem_destroy(struct vn_renderer *renderer, struct vn_renderer_shmem *_shmem)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_shmem *s = (struct wbvn_shmem *)_shmem;
    region_detach(w, &s->r);
    region_fini(&s->r);
@@ -1642,8 +1703,9 @@ wbvn_bo_create_from_device_memory(struct vn_renderer *renderer,
                                   VkExternalMemoryHandleTypeFlags external_handles,
                                   struct vn_renderer_bo **out_bo)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
-   if (w->lost)
+   struct wbvn_ctx *c = (struct wbvn_ctx *)renderer;
+   struct wbvn *w = c->w;
+   if (ctx_lost(c))
       return VK_ERROR_DEVICE_LOST;
 
    struct wbvn_bo *bo = calloc(1, sizeof(*bo));
@@ -1670,13 +1732,13 @@ wbvn_bo_create_from_device_memory(struct vn_renderer *renderer,
 
    lock_excl(w, &w->push_lock);
    wbvn_flush_push(w);
-   ok = ok && region_attach(w, &bo->r, WBVN_BO_CREATE, msg.data, msg.len);
+   ok = ok && region_attach(w, &bo->r, WBVN_TAG(WBVN_BO_CREATE, c->id), msg.data, msg.len);
    ReleaseSRWLockExclusive(&w->push_lock);
    free(msg.data);
    if (!ok) {
       region_fini(&bo->r);
       free(bo);
-      return w->lost ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      return ctx_lost(c) ? VK_ERROR_DEVICE_LOST : VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
 
    bo->base.refcount = VN_REFCOUNT_INIT(1);
@@ -1690,7 +1752,7 @@ wbvn_bo_create_from_device_memory(struct vn_renderer *renderer,
 static bool
 wbvn_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_bo *bo = (struct wbvn_bo *)_bo;
    region_detach(w, &bo->r);
    region_fini(&bo->r);
@@ -1712,7 +1774,7 @@ static void
 wbvn_bo_flush(struct vn_renderer *renderer, struct vn_renderer_bo *bo,
               VkDeviceSize offset, VkDeviceSize size)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    lock_excl(w, &w->push_lock);
    wbvn_flush_push(w);
    ReleaseSRWLockExclusive(&w->push_lock);
@@ -1728,7 +1790,7 @@ static VkResult
 wbvn_sync_create(struct vn_renderer *renderer, uint64_t initial_val,
                  struct vn_renderer_sync **out_sync)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_sync *s = calloc(1, sizeof(*s));
    if (!s)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1747,7 +1809,7 @@ wbvn_sync_create(struct vn_renderer *renderer, uint64_t initial_val,
 static void
 wbvn_sync_destroy(struct vn_renderer *renderer, struct vn_renderer_sync *_sync)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
    lock_excl(w, &w->mu);
    tab_del(&w->syncs, s->base.sync_id);
@@ -1759,7 +1821,7 @@ static VkResult
 wbvn_sync_write(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
                 uint64_t val)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
    lock_excl(w, &w->mu);
    s->value = val;
@@ -1778,7 +1840,7 @@ static VkResult
 wbvn_sync_read(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
                uint64_t *val)
 {
-   struct wbvn *w = (struct wbvn *)renderer;
+   struct wbvn *w = ((struct wbvn_ctx *)renderer)->w;
    struct wbvn_sync *s = (struct wbvn_sync *)_sync;
    lock_shared(w, &w->mu);
    *val = s->value;
@@ -1788,8 +1850,10 @@ wbvn_sync_read(struct vn_renderer *renderer, struct vn_renderer_sync *_sync,
 
 /* ---------- start-up ----------------------------------------------------------------- */
 
+/* Claims a slot and starts the threads that serve every instance of the process. The caller
+ * holds g_slot_lock. */
 static VkResult
-wbvn_init(struct wbvn *w)
+wbvn_slot_init(struct wbvn *w)
 {
    stats_init();
    InitializeSRWLock(&w->write_lock);
@@ -1822,30 +1886,45 @@ wbvn_init(struct wbvn *w)
    w->reader = CreateThread(NULL, 0, wbvn_reader, w, 0, NULL);
    if (!w->reader)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   wbvn_timer_resolution(true);
+   wbvn_stats_ping(w);
+   w->pump = CreateThread(NULL, 0, wbvn_pump, w, 0, NULL);
+   if (!w->pump)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   return VK_SUCCESS;
+}
 
+/* Has the host create the venus context of a Vulkan instance, and fills in what Mesa asks its
+ * renderer about. */
+static VkResult
+wbvn_ctx_open(struct wbvn_ctx *c)
+{
+   struct wbvn *w = c->w;
    const uint32_t version = WBVN_VERSION;
    uint8_t *hello = NULL;
    uint32_t hello_len = 0;
-   int64_t r = wbvn_request(w, WBVN_HELLO, 0, &version, sizeof(version), &hello,
+   int64_t r = wbvn_request(w, WBVN_TAG(WBVN_HELLO, c->id), 0, &version, sizeof(version), &hello,
                             &hello_len);
-   if (r != 0 || hello_len < 8 + sizeof(w->capset)) {
-      vn_log(w->instance, "the venus host refused the session (%lld)", (long long)r);
+   if (r == 0)
+      c->open = true;
+   if (r != 0 || hello_len < 8 + sizeof(c->capset)) {
+      vn_log(c->instance, "the venus host refused the session (%lld)", (long long)r);
       free(hello);
       return VK_ERROR_INITIALIZATION_FAILED;
    }
    uint32_t host_version;
    memcpy(&host_version, hello, 4);
-   memcpy(&w->max_timeline_count, hello + 4, 4);
-   memcpy(&w->capset, hello + 8, sizeof(w->capset));
+   memcpy(&c->max_timeline_count, hello + 4, 4);
+   memcpy(&c->capset, hello + 8, sizeof(c->capset));
    free(hello);
-   if (host_version != WBVN_VERSION || !w->max_timeline_count ||
-       !w->capset.supports_blob_id_0 || !w->capset.allow_vk_wait_syncs ||
-       !w->capset.supports_multiple_timelines) {
-      vn_log(w->instance, "the venus host does not offer what the guest needs");
+   if (host_version != WBVN_VERSION || !c->max_timeline_count ||
+       !c->capset.supports_blob_id_0 || !c->capset.allow_vk_wait_syncs ||
+       !c->capset.supports_multiple_timelines) {
+      vn_log(c->instance, "the venus host does not offer what the guest needs");
       return VK_ERROR_INITIALIZATION_FAILED;
    }
 
-   struct vn_renderer_info *info = &w->base.info;
+   struct vn_renderer_info *info = &c->base.info;
    info->pci.vendor_id = 0x1af4;
    info->pci.device_id = 0x1050;
    info->has_dma_buf_import = false;
@@ -1855,47 +1934,41 @@ wbvn_init(struct wbvn *w)
     * an image, and a bo is brought up to date when that fence retires. */
    info->has_implicit_fencing = true;
    info->has_guest_vram = false;
-   info->wire_format_version = w->capset.wire_format_version;
-   info->vk_xml_version = w->capset.vk_xml_version;
+   info->wire_format_version = c->capset.wire_format_version;
+   info->vk_xml_version = c->capset.vk_xml_version;
    info->vk_ext_command_serialization_spec_version =
-      w->capset.vk_ext_command_serialization_spec_version;
+      c->capset.vk_ext_command_serialization_spec_version;
    info->vk_mesa_venus_protocol_spec_version =
-      w->capset.vk_mesa_venus_protocol_spec_version;
+      c->capset.vk_mesa_venus_protocol_spec_version;
    STATIC_ASSERT(sizeof(info->vk_extension_mask) >=
-                 sizeof(w->capset.vk_extension_mask1));
-   memcpy(info->vk_extension_mask, w->capset.vk_extension_mask1,
-          sizeof(w->capset.vk_extension_mask1));
-   info->max_timeline_count = w->max_timeline_count;
+                 sizeof(c->capset.vk_extension_mask1));
+   memcpy(info->vk_extension_mask, c->capset.vk_extension_mask1,
+          sizeof(c->capset.vk_extension_mask1));
+   info->max_timeline_count = c->max_timeline_count;
 
-   w->base.ops.destroy = wbvn_destroy;
-   w->base.ops.submit = wbvn_submit;
-   w->base.ops.wait = wbvn_wait;
+   c->base.ops.destroy = wbvn_destroy;
+   c->base.ops.submit = wbvn_submit;
+   c->base.ops.wait = wbvn_wait;
 
-   w->base.shmem_ops.create = wbvn_shmem_create;
-   w->base.shmem_ops.destroy = wbvn_shmem_destroy;
+   c->base.shmem_ops.create = wbvn_shmem_create;
+   c->base.shmem_ops.destroy = wbvn_shmem_destroy;
 
-   w->base.bo_ops.create_from_device_memory = wbvn_bo_create_from_device_memory;
-   w->base.bo_ops.create_from_dma_buf = NULL;
-   w->base.bo_ops.destroy = wbvn_bo_destroy;
-   w->base.bo_ops.export_dma_buf = NULL;
-   w->base.bo_ops.export_sync_file = NULL;
-   w->base.bo_ops.map = wbvn_bo_map;
-   w->base.bo_ops.flush = wbvn_bo_flush;
-   w->base.bo_ops.invalidate = wbvn_bo_invalidate;
+   c->base.bo_ops.create_from_device_memory = wbvn_bo_create_from_device_memory;
+   c->base.bo_ops.create_from_dma_buf = NULL;
+   c->base.bo_ops.destroy = wbvn_bo_destroy;
+   c->base.bo_ops.export_dma_buf = NULL;
+   c->base.bo_ops.export_sync_file = NULL;
+   c->base.bo_ops.map = wbvn_bo_map;
+   c->base.bo_ops.flush = wbvn_bo_flush;
+   c->base.bo_ops.invalidate = wbvn_bo_invalidate;
 
-   w->base.sync_ops.create = wbvn_sync_create;
-   w->base.sync_ops.create_from_syncobj = NULL;
-   w->base.sync_ops.destroy = wbvn_sync_destroy;
-   w->base.sync_ops.export_syncobj = NULL;
-   w->base.sync_ops.reset = wbvn_sync_reset;
-   w->base.sync_ops.read = wbvn_sync_read;
-   w->base.sync_ops.write = wbvn_sync_write;
-
-   wbvn_timer_resolution(true);
-   wbvn_stats_ping(w);
-   w->pump = CreateThread(NULL, 0, wbvn_pump, w, 0, NULL);
-   if (!w->pump)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   c->base.sync_ops.create = wbvn_sync_create;
+   c->base.sync_ops.create_from_syncobj = NULL;
+   c->base.sync_ops.destroy = wbvn_sync_destroy;
+   c->base.sync_ops.export_syncobj = NULL;
+   c->base.sync_ops.reset = wbvn_sync_reset;
+   c->base.sync_ops.read = wbvn_sync_read;
+   c->base.sync_ops.write = wbvn_sync_write;
    return VK_SUCCESS;
 }
 
@@ -1907,7 +1980,7 @@ DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
    if (reason == DLL_PROCESS_DETACH && reserved) {
       /* the process is ending: the other threads are gone, and the host must free the slot */
-      struct wbvn *w = g_renderer;
+      struct wbvn *w = g_slot;
       if (w && w->bar && SLOT_LD64(w->bar, WBVN_SLOT_OFF_NONCE) == w->nonce)
          SLOT_ST32(w->bar, WBVN_SLOT_OFF_STATE, WBVN_SLOT_CLOSED);
    }
@@ -1926,23 +1999,60 @@ vn_renderer_create_winbridge(struct vn_instance *instance,
                              const VkAllocationCallbacks *alloc,
                              struct vn_renderer **renderer)
 {
-   struct wbvn *w = vk_zalloc(alloc, sizeof(*w), VN_DEFAULT_ALIGN,
-                              VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
-   if (!w)
+   struct wbvn_ctx *c = vk_zalloc(alloc, sizeof(*c), VN_DEFAULT_ALIGN,
+                                  VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   if (!c)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   c->instance = instance;
 
-   w->instance = instance;
-   w->port = INVALID_HANDLE_VALUE;
+   /* The first instance of the process claims the slot; the others share it. */
+   VkResult result = VK_SUCCESS;
+   AcquireSRWLockExclusive(&g_slot_lock);
+   struct wbvn *w = g_slot;
+   if (!w) {
+      w = calloc(1, sizeof(*w));
+      if (!w) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      } else {
+         w->port = INVALID_HANDLE_VALUE;
+         w->instance = instance;
+         result = wbvn_slot_init(w);
+         w->instance = NULL;
+         if (result == VK_SUCCESS) {
+            g_slot = w;
+         } else {
+            wbvn_slot_close(w);
+            w = NULL;
+         }
+      }
+   }
+   if (result == VK_SUCCESS) {
+      w->refs++;
+      c->w = w;
+      lock_excl(w, &w->mu);
+      c->id = tab_add(&w->ctxs, c);
+      ReleaseSRWLockExclusive(&w->mu);
+      if (c->id > WBVN_CTX_MAX)
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   ReleaseSRWLockExclusive(&g_slot_lock);
 
-   VkResult result = wbvn_init(w);
+   if (result == VK_SUCCESS) {
+      if (!c->id)
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      else
+         result = wbvn_ctx_open(c);
+   }
    if (result != VK_SUCCESS) {
-      wbvn_destroy(&w->base, alloc);
+      if (c->w)
+         wbvn_destroy(&c->base, alloc);
+      else
+         vk_free(alloc, c);
       return result;
    }
 
-   g_renderer = w;
-   *renderer = &w->base;
+   *renderer = &c->base;
    if (VN_DEBUG(INIT))
-      vn_log(instance, "winbridge backend initialized");
+      vn_log(instance, "winbridge backend initialized (context %u)", c->id);
    return VK_SUCCESS;
 }
