@@ -94,6 +94,7 @@ cargo build --release -p winbridge-agent
 1. 用 D-Bus 显示和 WinBridge 端口启动 QEMU。[`scripts/launch-qemu-winbridge.sh`](scripts/launch-qemu-winbridge.sh) 会启动私有总线,并展示所需参数:
 
    ```
+   -smp 8,sockets=1,cores=8,threads=1
    -display dbus,addr=unix:path=/tmp/qemu-dbus.sock
    -qmp unix:/tmp/winbridge-qmp.sock,server=on,wait=off
    -device qemu-xhci,id=xhci
@@ -105,8 +106,10 @@ cargo build --release -p winbridge-agent
    -device virtserialport,chardev=wb0,name=org.winbridge.0
    ```
 
+   默认是 **8 个 vCPU**,单插槽(`WINBRIDGE_VCPUS=N` 可改)。Windows 在 CPU 上合成桌面(WARP,见下文"限制"):窗口移动时在 4 vCPU 的客户机上约占满 2 个核,4 个 vCPU 留给程序的很少。启动脚本和示例 VM 用 8;8 相对 4 对帧时间的影响还没有测过。客户机只看到一个插槽,因为 Windows 客户端版本最多支持两个插槽。
+
 2. 启动查看器:`winbridge-host --socket /tmp/winbridge.sock --dbus-addr unix:path=/tmp/qemu-dbus.sock --qmp-socket /tmp/winbridge-qmp.sock`(或者见下面的"启动脚本与生命周期")。标题栏右上角的 **设备(Devices)** 菜单可以插入/弹出 CD/DVD 镜像,并把主机的 USB 设备直通给 Windows。USB 两个方向都支持热插拔,已勾选的设备在重新连接后会自动重新挂载。直通期间,设备会从 Linux 主机驱动上分离。**键盘和鼠标永远不会被列出,也没有覆盖选项**(任何带键盘或鼠标 HID 接口的设备都会被过滤,包括复合设备),避免把你锁在主机之外。运行查看器的用户需要访问 `/dev/bus/usb/*`:运行 `scripts/install-host-udev.sh`(`--dry-run` 可预览)来授权。
-3. 在客户机里用管理员权限的 PowerShell 安装代理:`scripts\install-agent.ps1 -SourceBinary .\winbridge-agent.exe`。
+3. 在客户机里用管理员权限的 PowerShell 安装代理:`scripts\install-agent.ps1 -SourceBinary .\winbridge-agent.exe`。脚本先检查文件(64 位 Windows 程序、是 WinBridge 代理、能运行),客户机没有可用的 virtio 串口设备时给出警告,把安装目录限制为只有 SYSTEM 和管理员可写(服务会运行里面的程序),旧版本保留为 `winbridge-agent.previous.exe`;服务起不来或代理没有在控制台会话里启动时,**会恢复原状并以 1 退出**。再次运行即更新。`-Status` 显示状态(服务、程序哈希、进程、日志、共享内存设备),不改任何东西;`-Uninstall` 移除服务(文件保留,加 `-Purge` 还会删除程序和 `%ProgramData%\WinBridge`);`-InstallDir` 和 `-StartTimeoutSeconds` 改目录和等待时间。
 
 代理**以 SYSTEM 身份运行**。安装脚本注册服务 `WinBridgeAgent`(开机自启,LocalSystem),由它在控制台会话里、用已登录用户的环境变量启动代理,登录界面就已经启动;代理结束或换了用户登录时服务会再次启动它。打开 `\\.\Global\org.winbridge.0` 需要管理员权限;受限令牌的进程会无提示地一直重试。处理用户文件的代码以用户身份运行(相应线程会模拟已登录用户),所以拖入和粘贴的文件属于用户,落在用户自己的目录里。服务日志在 `%ProgramData%\WinBridge\service.log`,代理日志在已登录用户的 `%LOCALAPPDATA%\WinBridge\agent.log`。查看器和代理可以各自独立重启。
 

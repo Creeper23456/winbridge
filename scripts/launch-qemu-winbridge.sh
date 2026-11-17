@@ -15,6 +15,9 @@
 # transport (see below); WINBRIDGE_SHM_FILE changes its backing file (default /dev/shm/winbridge-ctl).
 # Optional: WINBRIDGE_VENUS=N adds N Venus slots for 3D acceleration and starts one winbridge-venus
 # per slot (see below and venus/README.md).
+# Optional: WINBRIDGE_VCPUS=N sets the number of vCPUs (default 8, one socket). Windows composes the
+# desktop on the CPU (WARP): measured about 2 cores busy while a window moves, so 4 vCPUs leave
+# the programs little.
 # Runs in the foreground so the EXIT trap can stop the private bus daemon.
 
 set -euo pipefail
@@ -120,7 +123,7 @@ fi
 qemu-system-x86_64 \
     -enable-kvm \
     -cpu host \
-    -smp 4 \
+    -smp "${WINBRIDGE_VCPUS:-8},sockets=1,cores=${WINBRIDGE_VCPUS:-8},threads=1" \
     -m 8G \
     -drive file="$IMAGE",format=qcow2,if=virtio \
     -vga none \

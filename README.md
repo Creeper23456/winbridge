@@ -94,6 +94,7 @@ The agent is linked with the static CRT (`.cargo/config.toml`), so it runs on a 
 1. Start QEMU with the D-Bus display and the WinBridge port. [`scripts/launch-qemu-winbridge.sh`](scripts/launch-qemu-winbridge.sh) starts a private bus and shows the arguments:
 
    ```
+   -smp 8,sockets=1,cores=8,threads=1
    -display dbus,addr=unix:path=/tmp/qemu-dbus.sock
    -qmp unix:/tmp/winbridge-qmp.sock,server=on,wait=off
    -device qemu-xhci,id=xhci
@@ -105,8 +106,10 @@ The agent is linked with the static CRT (`.cargo/config.toml`), so it runs on a 
    -device virtserialport,chardev=wb0,name=org.winbridge.0
    ```
 
+   The default is **8 vCPUs** in one socket (`WINBRIDGE_VCPUS=N` changes it). Windows composes its desktop on the CPU (WARP, see "Limits" below): while a window moves that took about 2 busy cores of a 4-vCPU guest, so 4 leave the programs little. 8 is the setting the launch script and the example VM use; the effect of 8 against 4 on frame times has not been measured. The guest sees one socket because Windows client editions use at most two.
+
 2. Start the viewer: `winbridge-host --socket /tmp/winbridge.sock --dbus-addr unix:path=/tmp/qemu-dbus.sock --qmp-socket /tmp/winbridge-qmp.sock`. The header-bar **Devices** menu inserts/ejects CD/DVD images and passes host USB devices to Windows. USB hotplug works in both directions and reattaches checked devices after reconnection. Passthrough detaches a device from its Linux host driver while attached. Keyboards and mice are never offered for passthrough, with no override: any device with a keyboard or mouse HID interface is filtered out, including composite devices. The host user needs access to `/dev/bus/usb/*`; run `scripts/install-host-udev.sh` (use `--dry-run` to preview) to grant it.
-3. Install the agent in the guest with an elevated PowerShell: `scripts\install-agent.ps1 -SourceBinary .\winbridge-agent.exe`.
+3. Install the agent in the guest with an elevated PowerShell: `scripts\install-agent.ps1 -SourceBinary .\winbridge-agent.exe`. The script checks the file first (a 64-bit Windows program, the WinBridge agent, runs), warns when the VM has no working virtio serial device, restricts the install folder to SYSTEM and Administrators (the service runs what is in it), keeps the previous binary as `winbridge-agent.previous.exe`, and **restores the previous state and exits with 1** if the service does not start or the agent does not come up in the console session. Running it again updates. `-Status` shows the state (service, binary hash, processes, logs, shared-memory devices) and changes nothing; `-Uninstall` removes the service (files stay; `-Purge` also deletes the binaries and `%ProgramData%\WinBridge`); `-InstallDir` and `-StartTimeoutSeconds` change the folder and the wait.
 
 The agent **runs as SYSTEM**. The installer registers the service `WinBridgeAgent` (starts at boot, LocalSystem), which starts the agent in the console session with the logged-on user's environment, already at the logon screen, and starts it again when it ends or when another user logs on. Opening `\\.\Global\org.winbridge.0` needs administrator rights; a limited-token process retries silently forever. Code that touches the user's files runs as the user (the threads impersonate the logged-on user), so dropped and pasted files belong to the user and land in the user's profile. The service logs to `%ProgramData%\WinBridge\service.log`, the agent to `%LOCALAPPDATA%\WinBridge\agent.log` of the logged-on user. The viewer and the agent can be restarted independently of each other.
 
