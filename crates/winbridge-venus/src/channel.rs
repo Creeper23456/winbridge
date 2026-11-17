@@ -20,10 +20,10 @@ pub trait Channel {
     /// Sends all of `data`, waiting for room if necessary.
     fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
 
-    /// Returns when the guest may have sent something, when `extra_fd` is readable, or after
-    /// `timeout`, whichever comes first. A short timeout asks for the lowest latency, a long one
-    /// for the lowest CPU use.
-    fn wait(&mut self, extra_fd: RawFd, timeout: Duration) -> io::Result<()>;
+    /// Returns when the guest may have sent something, when one of `extra_fds` is readable
+    /// (negative ones are ignored), or after `timeout`, whichever comes first. A short timeout asks
+    /// for the lowest latency, a long one for the lowest CPU use.
+    fn wait(&mut self, extra_fds: &[RawFd], timeout: Duration) -> io::Result<()>;
 }
 
 /// `ppoll`s `fds` (a negative descriptor is ignored). Returns whether any is ready.
@@ -74,11 +74,9 @@ impl Channel for StreamChannel {
         (&self.stream).write_all(data)
     }
 
-    fn wait(&mut self, extra_fd: RawFd, timeout: Duration) -> io::Result<()> {
-        let mut fds = [
-            libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: extra_fd, events: libc::POLLIN, revents: 0 },
-        ];
+    fn wait(&mut self, extra_fds: &[RawFd], timeout: Duration) -> io::Result<()> {
+        let mut fds = vec![libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        fds.extend(extra_fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
         poll_fds(&mut fds, timeout).map(|_| ())
     }
 }

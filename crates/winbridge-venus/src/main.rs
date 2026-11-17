@@ -7,8 +7,9 @@
 //! device (64 MiB); the guest's Vulkan process maps that device and talks to this process
 //! through the two lanes in it (`slot.rs`). `PATH` is the QEMU chardev socket of the slot's
 //! `org.winbridge.venus.N` virtio-serial port (QEMU is the listener, `server=on`); it carries
-//! only wake-up bytes. Each guest that claims the slot gets a fresh Venus context on
-//! virglrenderer; when it closes or dies the slot is reset and the next one is served.
+//! only wake-up bytes. The guest process that claims the slot gets a Venus context on virglrenderer
+//! for each of its Vulkan instances; when it closes the slot or dies the slot is reset and the next
+//! one is served.
 //!
 //! `--record` keeps what the guest sent; `--replay` feeds such a recording to a session without
 //! a guest, with the original timing, so host-side problems can be reproduced in seconds.

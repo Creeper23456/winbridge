@@ -2,10 +2,22 @@
 
 //! WBVN wire format. Must stay identical to `venus/guest/wbvn_proto.h`.
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HDR_LEN: usize = 16;
 pub const MAX_PAYLOAD: u32 = 64 << 20;
 pub const REPLY: u32 = 0x8000;
+/// The low half of a guest message's `kind` word is the message kind (with `REPLY` for an answer);
+/// the high half names the venus context the message is for, 0 where none applies.
+pub const KIND_MASK: u32 = 0xFFFF;
+pub const CTX_SHIFT: u32 = 16;
+/// The largest context id the kind word can carry.
+pub const CTX_MAX: u32 = 0xFFFF;
+
+/// `kind` for context `ctx`.
+pub fn tag(kind: u32, ctx: u32) -> u32 {
+    kind | ctx << CTX_SHIFT
+}
+
 /// Offset of the status word in a ring shmem.
 pub const RING_STATUS: u32 = 128;
 /// Offset of the head word in a ring shmem.
@@ -26,6 +38,7 @@ pub const LOST: u32 = 8;
 pub const STATUS_CLEAR: u32 = 9;
 pub const BO_CREATE: u32 = 10;
 pub const PING: u32 = 11;
+pub const CTX_DESTROY: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hdr {
@@ -43,6 +56,16 @@ impl Hdr {
         b[8..12].copy_from_slice(&self.req.to_le_bytes());
         b[12..16].copy_from_slice(&self.arg.to_le_bytes());
         b
+    }
+
+    /// The context the message is for (0 for none).
+    pub fn ctx(&self) -> u32 {
+        self.kind >> CTX_SHIFT
+    }
+
+    /// The message kind without the context tag.
+    pub fn id(&self) -> u32 {
+        self.kind & KIND_MASK
     }
 
     pub fn decode(b: &[u8]) -> Hdr {

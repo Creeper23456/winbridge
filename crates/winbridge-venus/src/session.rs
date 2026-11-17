@@ -7,6 +7,11 @@
 //! that the renderer changed. Words the guest changed arrive in `PUSH` messages and are applied
 //! last range first. The ring is scanned before the other shmems and sent after them, so a ring
 //! head never becomes visible ahead of the reply it covers.
+//!
+//! A session serves one guest process, which may run several Vulkan instances. Each instance is a
+//! venus context (named in the high half of a message's `kind`, see `proto.rs`) with its own
+//! renderer state; shmem, device memory and sync ids are unique across the session, so a push or a
+//! signal needs no context.
 
 use crate::channel::Channel;
 use crate::proto::{self, Hdr, PushBuilder, HDR_LEN};
@@ -25,8 +30,6 @@ use tracing::{debug, error, info, warn};
 pub const SCAN_MAX: usize = 4 << 20;
 /// Runs closer than this many words are sent as one.
 const RUN_GAP_WORDS: usize = 8;
-/// The one context id of a session.
-const CTX: u32 = 1;
 /// Timelines the context offers (`PROXY_CONTEXT_TIMELINE_COUNT`).
 const MAX_TIMELINES: u32 = 64;
 /// While anything happened this recently the loop polls at `BUSY_POLL`.
@@ -82,10 +85,12 @@ struct Shm {
     ring_id: u64,
     /// One past the last word that ever changed on the host side.
     hot: usize,
+    /// The context that owns the resource: its commands run there.
+    ctx: u32,
 }
 
 impl Shm {
-    fn create(size: usize) -> io::Result<Shm> {
+    fn create(size: usize, ctx: u32) -> io::Result<Shm> {
         // SAFETY: plain syscalls; the name is NUL-terminated.
         unsafe {
             let fd = libc::memfd_create(c"winbridge-venus".as_ptr(), libc::MFD_CLOEXEC);
@@ -101,15 +106,15 @@ impl Shm {
                 return Err(io::Error::last_os_error());
             }
             let snap = (size <= SCAN_MAX).then(|| vec![0u64; size / 8]);
-            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, hot: 0, bo: false })
+            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, hot: 0, bo: false, ctx })
         }
     }
 
     /// Wraps device memory the renderer mapped for us. `size` is what the guest can see, a
     /// multiple of 8 no larger than the mapping. The guest's copy starts out as it is on the
     /// host, so memory the application has not written is not sent.
-    fn from_blob(map: *mut u8, size: usize) -> Shm {
-        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo: true };
+    fn from_blob(map: *mut u8, size: usize, ctx: u32) -> Shm {
+        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo: true, ctx };
         let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
         shm.snap = Some(words);
         shm
@@ -208,6 +213,7 @@ impl Drop for Shm {
 
 struct Fence {
     id: u64,
+    ctx: u32,
     ring_idx: u32,
     syncs: Vec<(u32, u64)>,
     submitted: Instant,
@@ -220,7 +226,10 @@ pub struct Session<R: Renderer, C: Channel> {
     rpos: usize,
     /// Scratch for a message that goes out as one write.
     wbuf: Vec<u8>,
-    hello: bool,
+    /// The venus contexts the guest has created and not yet destroyed.
+    ctxs: Vec<u32>,
+    /// Reused by the serve loop: the poll descriptors of the contexts.
+    fds: Vec<RawFd>,
     shms: HashMap<u32, Shm>,
     fences: VecDeque<Fence>,
     next_fence: u64,
@@ -239,7 +248,7 @@ const COALESCE_MAX: usize = 64 << 10;
 impl<R: Renderer, C: Channel> Session<R, C> {
     pub fn new(r: R, chan: C) -> Session<R, C> {
         let now = Instant::now();
-        Session { r, chan, rbuf: Vec::new(), rpos: 0, wbuf: Vec::new(), hello: false, shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_full: now, last_state: now, record: None, stats: Stats::new() }
+        Session { r, chan, rbuf: Vec::new(), rpos: 0, wbuf: Vec::new(), ctxs: Vec::new(), fds: Vec::new(), shms: HashMap::new(), fences: VecDeque::new(), next_fence: 1, busy_until: now, last_scan: now, last_full: now, last_state: now, record: None, stats: Stats::new() }
     }
 
     /// Appends everything the guest sends to `file` as `(microseconds, length, bytes)` records,
@@ -268,9 +277,13 @@ impl<R: Renderer, C: Channel> Session<R, C> {
                 *slot = mark.elapsed();
                 mark = Instant::now();
             };
-            let ctx_fd = if self.hello { self.r.poll_fd(CTX) } else { -1 };
+            let mut fds = std::mem::take(&mut self.fds);
+            fds.clear();
+            fds.extend(self.ctxs.iter().map(|&c| self.r.poll_fd(c)));
             let timeout = if Instant::now() < self.busy_until { BUSY_POLL } else { IDLE_POLL };
-            self.chan.wait(ctx_fd, timeout)?;
+            let waited = self.chan.wait(&fds, timeout);
+            self.fds = fds;
+            waited?;
             lap(&mut phases[0]);
             if !self.read_available()? {
                 return Ok(());
@@ -282,11 +295,18 @@ impl<R: Renderer, C: Channel> Session<R, C> {
                 }
             }
             lap(&mut phases[1]);
-            if self.hello {
-                let retired = self.r.poll(CTX);
+            if !self.ctxs.is_empty() {
+                let mut done: Vec<(u32, Vec<(u32, u64)>)> = Vec::new();
+                for i in 0..self.ctxs.len() {
+                    let ctx = self.ctxs[i];
+                    let retired = self.r.poll(ctx);
+                    if !retired.is_empty() {
+                        done.push((ctx, retired));
+                    }
+                }
                 lap(&mut phases[2]);
-                if !retired.is_empty() {
-                    self.retire(&retired)?;
+                for (ctx, retired) in done {
+                    self.retire(ctx, &retired)?;
                 }
                 lap(&mut phases[3]);
                 if self.ring_changed() || self.last_scan.elapsed() >= SCAN_PERIOD {
@@ -384,20 +404,18 @@ impl<R: Renderer, C: Channel> Session<R, C> {
     }
 
     fn dispatch(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
-        debug!("guest message {} (arg {}, {} bytes)", hdr.kind, hdr.arg, p.len());
+        let (ctx, hdr) = (hdr.ctx(), Hdr { kind: hdr.id(), ..hdr });
+        debug!("guest message {} (context {ctx}, arg {}, {} bytes)", hdr.kind, hdr.arg, p.len());
         match hdr.kind {
-            proto::HELLO => self.on_hello(hdr, p)?,
+            proto::HELLO => self.on_hello(ctx, hdr, p)?,
             proto::PING => self.send(hdr.kind | proto::REPLY, hdr.req, hdr.arg, p)?,
-            _ if !self.hello => {
-                warn!("message {} before HELLO", hdr.kind);
-                return Ok(false);
-            }
-            proto::SHM_CREATE => self.on_shm_create(hdr, p)?,
+            proto::CTX_DESTROY => self.on_ctx_destroy(ctx, hdr)?,
+            proto::SHM_CREATE => self.on_shm_create(ctx, hdr, p)?,
             proto::SHM_DESTROY => {
                 self.release(hdr.arg);
                 self.send(hdr.kind | proto::REPLY, hdr.req, 0, &[])?;
             }
-            proto::BO_CREATE => return self.on_bo_create(hdr, p),
+            proto::BO_CREATE => return self.on_bo_create(ctx, hdr, p),
             proto::SHM_ROLE => {
                 if let Some(s) = self.shms.get_mut(&hdr.arg) {
                     s.ring = true;
@@ -406,13 +424,15 @@ impl<R: Renderer, C: Channel> Session<R, C> {
             }
             proto::PUSH => self.on_push(p),
             proto::STATUS_CLEAR => self.on_status_clear(hdr.arg, p),
-            proto::SUBMIT => return self.on_submit(p),
+            proto::SUBMIT => return self.on_submit(ctx, p),
+            // A frame too long to be real: the stream cannot be resynchronised.
+            proto::LOST => return Ok(false),
             other => warn!("unknown message {other}"),
         }
         Ok(true)
     }
 
-    fn on_hello(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<()> {
+    fn on_hello(&mut self, ctx: u32, hdr: Hdr, p: &[u8]) -> io::Result<()> {
         let fail = |this: &mut Self, why: &str| {
             error!("{why}");
             this.send(hdr.kind | proto::REPLY, hdr.req, 1, &[])
@@ -420,31 +440,46 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         if p.len() < 4 || proto::u32_at(p, 0) != proto::VERSION {
             return fail(self, "unsupported WBVN version");
         }
+        if ctx == 0 || self.ctxs.contains(&ctx) {
+            return fail(self, &format!("context id {ctx} is not usable"));
+        }
         let caps = match self.r.capset() {
             Ok(c) => c,
             Err(e) => return fail(self, &e),
         };
-        if let Err(e) = self.r.create_context(CTX) {
+        if let Err(e) = self.r.create_context(ctx) {
             return fail(self, &format!("cannot create the venus context: {e}"));
         }
-        self.hello = true;
+        self.ctxs.push(ctx);
         let mut reply = Vec::with_capacity(8 + caps.len());
         reply.extend_from_slice(&proto::VERSION.to_le_bytes());
         reply.extend_from_slice(&MAX_TIMELINES.to_le_bytes());
         reply.extend_from_slice(&caps);
-        info!("guest connected, venus context created");
+        info!("guest connected, venus context {ctx} created");
         self.send(hdr.kind | proto::REPLY, hdr.req, 0, &reply)
     }
 
-    fn on_shm_create(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<()> {
+    /// The guest destroyed a Vulkan instance: its resources and its context go, the others stay.
+    fn on_ctx_destroy(&mut self, ctx: u32, hdr: Hdr) -> io::Result<()> {
+        let status = if self.ctxs.contains(&ctx) {
+            self.drop_ctx(ctx);
+            info!("venus context {ctx} destroyed");
+            0
+        } else {
+            libc::EINVAL as u32
+        };
+        self.send(hdr.kind | proto::REPLY, hdr.req, status, &[])
+    }
+
+    fn on_shm_create(&mut self, ctx: u32, hdr: Hdr, p: &[u8]) -> io::Result<()> {
         let res_id = hdr.arg;
         let size = if p.len() >= 8 { proto::u64_at(p, 0) } else { 0 };
-        let status = if res_id == 0 || size == 0 || size % 8 != 0 || size > (1 << 30) || self.shms.contains_key(&res_id) {
+        let status = if !self.ctxs.contains(&ctx) || res_id == 0 || size == 0 || size % 8 != 0 || size > (1 << 30) || self.shms.contains_key(&res_id) {
             libc::EINVAL
         } else {
-            match Shm::create(size as usize) {
+            match Shm::create(size as usize, ctx) {
                 Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
-                Ok(shm) => match self.r.attach_shmem(CTX, res_id, shm.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd), size) {
+                Ok(shm) => match self.r.attach_shmem(ctx, res_id, shm.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd), size) {
                     Ok(()) => {
                         self.shms.insert(res_id, shm);
                         0
@@ -495,7 +530,7 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         let cs = proto::notify_ring_cs(s.ring_id, tail);
         debug!("waking ring {res_id}: tail {tail}");
         self.stats.wake();
-        if let Err(e) = self.r.submit(CTX, &cs) {
+        if let Err(e) = self.r.submit(s.ctx, &cs) {
             warn!("cannot wake ring {res_id}: {e}");
         }
     }
@@ -517,41 +552,56 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         }
     }
 
-    fn on_submit(&mut self, p: &[u8]) -> io::Result<bool> {
+    fn on_submit(&mut self, ctx: u32, p: &[u8]) -> io::Result<bool> {
         let Some(sub) = proto::parse_submit(p) else {
             warn!("malformed SUBMIT");
             return Ok(false);
         };
-        self.run_submit(sub)
+        if !self.ctxs.contains(&ctx) {
+            // A context the renderer lost or the guest destroyed; its last messages were in flight.
+            debug!("SUBMIT for context {ctx}, which is gone");
+            return Ok(true);
+        }
+        self.run_submit(ctx, sub)?;
+        Ok(true)
     }
 
-    fn run_submit(&mut self, sub: proto::Submit<'_>) -> io::Result<bool> {
+    /// Runs a command stream on `ctx` and creates the fence its syncs ask for. Returns false when
+    /// the renderer failed: the guest has been told and the context is gone, the session goes on.
+    fn run_submit(&mut self, ctx: u32, sub: proto::Submit<'_>) -> io::Result<bool> {
         let started = Instant::now();
-        let submitted = self.r.submit(CTX, sub.cs);
+        let submitted = self.r.submit(ctx, sub.cs);
         let took = started.elapsed();
         self.stats.submit(sub.cs.len(), took);
         if took >= Duration::from_millis(5) {
             debug!("submit_cmd of {} byte(s) took {:?}", sub.cs.len(), took);
         }
         if let Err(e) = submitted {
-            error!("submit_cmd failed: {e}");
-            self.send(proto::LOST, 0, 0, &[])?;
+            error!("submit_cmd failed on context {ctx}: {e}");
+            self.fail_ctx(ctx)?;
             return Ok(false);
         }
         if !sub.syncs.is_empty() {
             let id = self.next_fence;
             self.next_fence += 1;
-            if let Err(e) = self.r.create_fence(CTX, sub.ring_idx, id) {
-                error!("create_fence failed: {e}");
-                self.send(proto::LOST, 0, 0, &[])?;
+            if let Err(e) = self.r.create_fence(ctx, sub.ring_idx, id) {
+                error!("create_fence failed on context {ctx}: {e}");
+                self.fail_ctx(ctx)?;
                 return Ok(false);
             }
-            self.fences.push_back(Fence { id, ring_idx: sub.ring_idx, syncs: sub.syncs, submitted: Instant::now() });
+            self.fences.push_back(Fence { id, ctx, ring_idx: sub.ring_idx, syncs: sub.syncs, submitted: Instant::now() });
         }
         Ok(true)
     }
 
-    fn on_bo_create(&mut self, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
+    /// The renderer cannot serve `ctx` any more: tell the guest (its instance is lost) and release it.
+    fn fail_ctx(&mut self, ctx: u32) -> io::Result<()> {
+        self.send(proto::LOST, 0, ctx, &[])?;
+        self.drop_ctx(ctx);
+        Ok(())
+    }
+
+    fn on_bo_create(&mut self, ctx: u32, hdr: Hdr, p: &[u8]) -> io::Result<bool> {
         const HEAD: usize = 24;
         if p.len() < HEAD {
             warn!("malformed BO_CREATE");
@@ -559,8 +609,8 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         }
         let (size, blob_id, batch_len) = (proto::u64_at(p, 0), proto::u64_at(p, 8), proto::u32_at(p, 20) as usize);
         let res_id = hdr.arg;
-        if HEAD + batch_len != p.len() || res_id == 0 || size == 0 || self.shms.contains_key(&res_id) {
-            warn!("invalid BO_CREATE for resource {res_id}");
+        if HEAD + batch_len != p.len() || res_id == 0 || size == 0 || !self.ctxs.contains(&ctx) || self.shms.contains_key(&res_id) {
+            warn!("invalid BO_CREATE for resource {res_id} on context {ctx}");
             self.send(hdr.kind | proto::REPLY, hdr.req, libc::EINVAL as u32, &[])?;
             return Ok(true);
         }
@@ -570,18 +620,19 @@ impl<R: Renderer, C: Channel> Session<R, C> {
                 warn!("malformed batch in BO_CREATE");
                 return Ok(false);
             };
-            if !self.run_submit(sub)? {
-                return Ok(false);
+            if !self.run_submit(ctx, sub)? {
+                self.send(hdr.kind | proto::REPLY, hdr.req, libc::EIO as u32, &[])?;
+                return Ok(true);
             }
         }
-        let status = self.create_bo(res_id, blob_id, size);
+        let status = self.create_bo(ctx, res_id, blob_id, size);
         self.send(hdr.kind | proto::REPLY, hdr.req, status, &[])?;
         Ok(true)
     }
 
     /// Creates the blob for a VkDeviceMemory and maps it. Returns the reply status.
-    fn create_bo(&mut self, res_id: u32, blob_id: u64, size: u64) -> u32 {
-        if let Err(e) = self.r.create_blob(CTX, res_id, blob_id, size) {
+    fn create_bo(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> u32 {
+        if let Err(e) = self.r.create_blob(ctx, res_id, blob_id, size) {
             warn!("cannot create the blob for memory {blob_id} ({size} bytes): {e}");
             return e.unsigned_abs().max(1);
         }
@@ -594,7 +645,7 @@ impl<R: Renderer, C: Channel> Session<R, C> {
             Ok((map, host_size)) => {
                 // The guest's copy is rounded up to whole pages.
                 let guest_size = (size + 4095) & !4095;
-                self.shms.insert(res_id, Shm::from_blob(map, (guest_size.min(host_size) & !7) as usize));
+                self.shms.insert(res_id, Shm::from_blob(map, (guest_size.min(host_size) & !7) as usize, ctx));
                 0
             }
         }
@@ -602,12 +653,12 @@ impl<R: Renderer, C: Channel> Session<R, C> {
 
     /// Completes the fences the renderer retired. Mirrored memory goes out first, so a waiter
     /// woken by the signal finds the replies it waits for.
-    fn retire(&mut self, retired: &[(u32, u64)]) -> io::Result<()> {
+    fn retire(&mut self, ctx: u32, retired: &[(u32, u64)]) -> io::Result<()> {
         let mut points = Vec::new();
         for &(ring_idx, id) in retired {
             // Fences on a ring retire in order, and a merged fence retires its predecessors.
             self.fences.retain(|f| {
-                let done = f.ring_idx == ring_idx && f.id <= id;
+                let done = f.ctx == ctx && f.ring_idx == ring_idx && f.id <= id;
                 if done {
                     self.stats.fence(f.submitted.elapsed());
                     debug!("fence {} on ring {} retired {:?} after its submit", f.id, f.ring_idx, f.submitted.elapsed());
@@ -708,16 +759,21 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         }
     }
 
+    /// Releases a context: its resources first, as the guest did, then the context.
+    fn drop_ctx(&mut self, ctx: u32) {
+        let ids: Vec<u32> = self.shms.iter().filter(|(_, s)| s.ctx == ctx).map(|(&id, _)| id).collect();
+        for id in ids {
+            self.release(id);
+        }
+        self.fences.retain(|f| f.ctx != ctx);
+        self.r.destroy_context(ctx);
+        self.ctxs.retain(|&c| c != ctx);
+    }
+
     fn shutdown(&mut self) {
         debug!("ending the session");
-        if self.hello {
-            let ids: Vec<u32> = self.shms.keys().copied().collect();
-            // Resources are released before the context goes, as the guest did.
-            for id in ids {
-                self.release(id);
-            }
-            self.r.destroy_context(CTX);
-            self.hello = false;
+        for ctx in self.ctxs.clone() {
+            self.drop_ctx(ctx);
         }
     }
 }
@@ -777,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_light_scan_stays_near_the_last_change_and_a_full_scan_finds_the_rest() {
-        let mut shm = Shm::create(1 << 20).unwrap();
+        let mut shm = Shm::create(1 << 20, 1).unwrap();
         // Nothing has changed yet: a light scan looks only at the first slack.
         assert_eq!(scanned(&mut shm, false), (HOT_SLACK_WORDS * 8, 0));
 

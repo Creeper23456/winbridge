@@ -3,7 +3,7 @@
 //! virglrenderer (Venus) loaded at run time, so the crate builds without it.
 //!
 //! The library is used the way vtest uses it: `NO_VIRGL | VENUS | RENDER_SERVER | THREAD_SYNC |
-//! USE_EXTERNAL_BLOB`, one context, shared memory imported from memfds we own. The library has
+//! USE_EXTERNAL_BLOB`, one context per guest Vulkan instance, shared memory imported from memfds we own. The library has
 //! no locking, so every call comes from the one session thread, and the fence callback runs
 //! inline inside `context_poll` on that thread.
 
@@ -59,11 +59,11 @@ struct CreateBlobArgs {
     num_iovs: u32,
 }
 
-/// Fences that retired since the last `poll`: (ring_idx, fence_id).
-static RETIRED: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+/// Fences that retired since the last `poll`: (ctx, ring_idx, fence_id).
+static RETIRED: Mutex<Vec<(u32, u32, u64)>> = Mutex::new(Vec::new());
 
-unsafe extern "C" fn write_context_fence(_cookie: *mut c_void, _ctx: u32, ring_idx: u32, fence_id: u64) {
-    RETIRED.lock().unwrap().push((ring_idx, fence_id));
+unsafe extern "C" fn write_context_fence(_cookie: *mut c_void, ctx: u32, ring_idx: u32, fence_id: u64) {
+    RETIRED.lock().unwrap().push((ctx, ring_idx, fence_id));
 }
 
 type InitFn = unsafe extern "C" fn(*mut c_void, c_int, *mut Callbacks) -> c_int;
@@ -198,7 +198,7 @@ impl Renderer for Virgl {
     fn destroy_context(&mut self, ctx: u32) {
         // SAFETY: plain id.
         unsafe { (self.ctx_destroy)(ctx) };
-        RETIRED.lock().unwrap().clear();
+        RETIRED.lock().unwrap().retain(|f| f.0 != ctx);
     }
 
     fn attach_shmem(&mut self, ctx: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32> {
@@ -244,7 +244,10 @@ impl Renderer for Virgl {
     fn poll(&mut self, ctx: u32) -> Vec<(u32, u64)> {
         // SAFETY: plain id; the retire callback runs inside this call on this thread.
         unsafe { (self.poll)(ctx) };
-        std::mem::take(&mut *RETIRED.lock().unwrap())
+        let mut retired = RETIRED.lock().unwrap();
+        let mine = retired.iter().filter(|f| f.0 == ctx).map(|f| (f.1, f.2)).collect();
+        retired.retain(|f| f.0 != ctx);
+        mine
     }
 
     fn poll_fd(&self, ctx: u32) -> RawFd {

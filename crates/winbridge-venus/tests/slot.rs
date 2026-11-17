@@ -98,7 +98,7 @@ fn a_sleeping_host_wakes_on_a_kick_and_kicks_a_sleeping_guest() {
         tx
     });
     let started = Instant::now();
-    r.host.wait(-1, Duration::from_secs(5)).unwrap();
+    r.host.wait(&[], Duration::from_secs(5)).unwrap();
     assert!(started.elapsed() < Duration::from_secs(2), "the wake-up did not end the wait");
     let _tx = t.join().unwrap();
     let mut buf = Vec::new();

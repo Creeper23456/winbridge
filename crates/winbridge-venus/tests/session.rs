@@ -18,12 +18,20 @@ unsafe impl Send for Map {}
 #[derive(Default)]
 struct Inner {
     maps: std::collections::HashMap<u32, Map>,
-    fences: Vec<(u32, u64)>,
+    /// Fences created and not yet retired: (ctx, ring_idx, id).
+    fences: Vec<(u32, u32, u64)>,
     submits: Vec<Vec<u8>>,
+    /// The context of each entry of `submits`.
+    submit_ctx: Vec<u32>,
     /// Runs on every submit: the fake renderer's "work".
     on_submit: Option<Box<dyn FnMut(&mut Inner) + Send>>,
     /// The word new blobs are filled with: device memory starts out with whatever it holds.
     blob_fill: u64,
+    destroyed: Vec<u32>,
+    /// Contexts whose fences do not retire.
+    held: Vec<u32>,
+    /// A context whose submits fail.
+    failing: Option<u32>,
 }
 
 impl Inner {
@@ -45,7 +53,9 @@ impl Renderer for Mock {
     fn create_context(&mut self, _: u32) -> Result<(), i32> {
         Ok(())
     }
-    fn destroy_context(&mut self, _: u32) {}
+    fn destroy_context(&mut self, ctx: u32) {
+        self.0.lock().unwrap().destroyed.push(ctx);
+    }
     fn attach_shmem(&mut self, _: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32> {
         // SAFETY: maps the session's memfd shared.
         let p = unsafe { libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
@@ -56,21 +66,31 @@ impl Renderer for Mock {
     fn unref(&mut self, res_id: u32) {
         self.0.lock().unwrap().maps.remove(&res_id);
     }
-    fn submit(&mut self, _: u32, cs: &[u8]) -> Result<(), i32> {
+    fn submit(&mut self, ctx: u32, cs: &[u8]) -> Result<(), i32> {
         let mut g = self.0.lock().unwrap();
+        if g.failing == Some(ctx) {
+            return Err(-5);
+        }
         g.submits.push(cs.to_vec());
+        g.submit_ctx.push(ctx);
         if let Some(mut f) = g.on_submit.take() {
             f(&mut g);
             g.on_submit = Some(f);
         }
         Ok(())
     }
-    fn create_fence(&mut self, _: u32, ring_idx: u32, id: u64) -> Result<(), i32> {
-        self.0.lock().unwrap().fences.push((ring_idx, id));
+    fn create_fence(&mut self, ctx: u32, ring_idx: u32, id: u64) -> Result<(), i32> {
+        self.0.lock().unwrap().fences.push((ctx, ring_idx, id));
         Ok(())
     }
-    fn poll(&mut self, _: u32) -> Vec<(u32, u64)> {
-        std::mem::take(&mut self.0.lock().unwrap().fences)
+    fn poll(&mut self, ctx: u32) -> Vec<(u32, u64)> {
+        let mut g = self.0.lock().unwrap();
+        if g.held.contains(&ctx) {
+            return Vec::new();
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut g.fences).into_iter().partition(|f| f.0 == ctx);
+        g.fences = rest;
+        mine.into_iter().map(|f| (f.1, f.2)).collect()
     }
     fn poll_fd(&self, _: u32) -> RawFd {
         -1
@@ -120,11 +140,17 @@ impl Guest {
         self.send(kind, 1, arg, payload);
         loop {
             let (h, p) = self.recv(Duration::from_secs(5)).expect("reply");
-            if h.kind == kind | proto::REPLY {
+            if h.kind == (kind & proto::KIND_MASK) | proto::REPLY {
                 return (h, p);
             }
         }
     }
+}
+
+fn hello(g: &mut Guest, ctx: u32) {
+    let (h, p) = g.request(proto::tag(proto::HELLO, ctx), 0, &proto::VERSION.to_le_bytes());
+    assert_eq!(h.arg, 0);
+    assert_eq!(proto::u32_at(&p, 0), proto::VERSION);
 }
 
 fn start(mock: &Mock) -> (Guest, std::thread::JoinHandle<()>) {
@@ -135,15 +161,17 @@ fn start(mock: &Mock) -> (Guest, std::thread::JoinHandle<()>) {
         Session::new(&mut m, StreamChannel::new(b)).run().unwrap();
     });
     let mut g = Guest(a);
-    let (h, p) = g.request(proto::HELLO, 0, &proto::VERSION.to_le_bytes());
-    assert_eq!(h.arg, 0);
-    assert_eq!(proto::u32_at(&p, 0), proto::VERSION);
+    hello(&mut g, 1);
     (g, t)
 }
 
-fn create(g: &mut Guest, res: u32, size: u64) {
-    let (h, _) = g.request(proto::SHM_CREATE, res, &size.to_le_bytes());
+fn create_in(g: &mut Guest, ctx: u32, res: u32, size: u64) {
+    let (h, _) = g.request(proto::tag(proto::SHM_CREATE, ctx), res, &size.to_le_bytes());
     assert_eq!(h.arg, 0);
+}
+
+fn create(g: &mut Guest, res: u32, size: u64) {
+    create_in(g, 1, res, size);
 }
 
 #[test]
@@ -189,7 +217,7 @@ fn replies_arrive_before_the_head_and_before_the_signal() {
     sub.extend_from_slice(&0u32.to_le_bytes());
     sub.extend_from_slice(&1u64.to_le_bytes());
     sub.extend_from_slice(&[0; 8]);
-    g.send(proto::SUBMIT, 0, 0, &sub);
+    g.send(proto::tag(proto::SUBMIT, 1), 0, 0, &sub);
 
     let mut order = Vec::new();
     while let Some((h, p)) = g.recv(Duration::from_millis(300)) {
@@ -302,7 +330,7 @@ fn device_memory_goes_down_on_push_and_comes_back_when_a_fence_retires() {
     p.extend_from_slice(&1u32.to_le_bytes());
     p.extend_from_slice(&(batch.len() as u32).to_le_bytes());
     p.extend_from_slice(&batch);
-    let (h, _) = g.request(proto::BO_CREATE, 3, &p);
+    let (h, _) = g.request(proto::tag(proto::BO_CREATE, 1), 3, &p);
     assert_eq!(h.arg, 0);
     assert_eq!(mock.0.lock().unwrap().submits, vec![vec![9u8; 8]]);
 
@@ -318,7 +346,7 @@ fn device_memory_goes_down_on_push_and_comes_back_when_a_fence_retires() {
     mock.0.lock().unwrap().word(3, 64).store(0xBEEF, SeqCst);
     assert!(g.recv(Duration::from_millis(80)).is_none(), "device memory was scanned without a fence");
 
-    g.send(proto::SUBMIT, 0, 0, &submit_payload(1, &[(5, 1)], &[0; 8]));
+    g.send(proto::tag(proto::SUBMIT, 1), 0, 0, &submit_payload(1, &[(5, 1)], &[0; 8]));
     let mut pushes = Vec::new();
     loop {
         let (h, p) = g.recv(Duration::from_secs(2)).expect("push then signal");
@@ -332,6 +360,82 @@ fn device_memory_goes_down_on_push_and_comes_back_when_a_fence_retires() {
 
     let (h, _) = g.request(proto::SHM_DESTROY, 3, &[]);
     assert_eq!(h.arg, 0);
+    drop(g);
+    t.join().unwrap();
+}
+
+/// The sync points of the next SYNC_SIGNAL the host sends.
+fn next_signal(g: &mut Guest) -> Vec<(u32, u64)> {
+    loop {
+        let (h, p) = g.recv(Duration::from_secs(2)).expect("a signal");
+        if h.kind == proto::SYNC_SIGNAL {
+            let n = proto::u32_at(&p, 0) as usize;
+            return (0..n).map(|i| (proto::u32_at(&p, 8 + i * 16), proto::u64_at(&p, 16 + i * 16))).collect();
+        }
+    }
+}
+
+#[test]
+fn a_fence_of_one_context_never_retires_the_fence_of_another() {
+    let mock = Mock::default();
+    let (mut g, t) = start(&mock);
+    hello(&mut g, 2);
+    // Both fences are on ring 0 and the second has the larger id: a retire of it that ignored the
+    // context would take the first with it.
+    mock.0.lock().unwrap().held.push(1);
+    g.send(proto::tag(proto::SUBMIT, 1), 0, 0, &submit_payload(0, &[(7, 1)], &[0; 8]));
+    g.send(proto::tag(proto::SUBMIT, 2), 0, 0, &submit_payload(0, &[(8, 1)], &[0; 8]));
+    assert_eq!(next_signal(&mut g), vec![(8, 1)]);
+    mock.0.lock().unwrap().held.clear();
+    assert_eq!(next_signal(&mut g), vec![(7, 1)]);
+    drop(g);
+    t.join().unwrap();
+}
+
+#[test]
+fn destroying_a_context_releases_only_its_resources() {
+    let mock = Mock::default();
+    let (mut g, t) = start(&mock);
+    hello(&mut g, 2);
+    create_in(&mut g, 1, 1, 0x1000);
+    create_in(&mut g, 2, 2, 0x1000);
+    let (h, _) = g.request(proto::tag(proto::CTX_DESTROY, 2), 0, &[]);
+    assert_eq!(h.arg, 0);
+    {
+        let m = mock.0.lock().unwrap();
+        assert_eq!(m.destroyed, vec![2]);
+        assert!(m.maps.contains_key(&1) && !m.maps.contains_key(&2));
+    }
+    // The other context goes on; the destroyed one can neither create anything nor be destroyed again.
+    create_in(&mut g, 1, 3, 0x1000);
+    let (h, _) = g.request(proto::tag(proto::SHM_CREATE, 2), 4, &0x1000u64.to_le_bytes());
+    assert_ne!(h.arg, 0);
+    let (h, _) = g.request(proto::tag(proto::CTX_DESTROY, 2), 0, &[]);
+    assert_ne!(h.arg, 0);
+    drop(g);
+    t.join().unwrap();
+    // The end of the session destroys what is left.
+    assert_eq!(mock.0.lock().unwrap().destroyed, vec![2, 1]);
+}
+
+#[test]
+fn a_context_the_renderer_fails_is_lost_and_the_others_go_on() {
+    let mock = Mock::default();
+    let (mut g, t) = start(&mock);
+    hello(&mut g, 2);
+    mock.0.lock().unwrap().failing = Some(2);
+    g.send(proto::tag(proto::SUBMIT, 2), 0, 0, &submit_payload(0, &[], &[1; 8]));
+    let (h, _) = g.recv(Duration::from_secs(2)).expect("LOST");
+    assert_eq!((h.kind, h.arg), (proto::LOST, 2));
+    // Messages that were already on their way for it are dropped; context 1 still works.
+    g.send(proto::tag(proto::SUBMIT, 2), 0, 0, &submit_payload(0, &[], &[2; 8]));
+    g.send(proto::tag(proto::SUBMIT, 1), 0, 0, &submit_payload(0, &[], &[3; 8]));
+    create_in(&mut g, 1, 1, 0x1000); // a round trip: the submits are handled first
+    {
+        let m = mock.0.lock().unwrap();
+        assert_eq!((m.submits.clone(), m.submit_ctx.clone()), (vec![vec![3u8; 8]], vec![1]));
+        assert_eq!(m.destroyed, vec![2]);
+    }
     drop(g);
     t.join().unwrap();
 }

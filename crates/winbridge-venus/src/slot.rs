@@ -195,6 +195,8 @@ pub struct ShmChannel {
     beat_at: Instant,
     kicks_sent: u64,
     kicks_seen: u64,
+    /// Reused by `wait`: the wake-up socket first, then the caller's descriptors.
+    fds: Vec<libc::pollfd>,
 }
 
 impl ShmChannel {
@@ -204,7 +206,7 @@ impl ShmChannel {
         let tx = region.producer(LANE_H2G).map_err(|e| format!("host lane: {e}"))?;
         kick.set_nonblocking(true).map_err(|e| format!("wake-up socket: {e}"))?;
         let beat = block.heartbeat();
-        Ok(ShmChannel { rx, tx, block, kick, scratch: Vec::new(), beat, beat_at: Instant::now(), kicks_sent: 0, kicks_seen: 0 })
+        Ok(ShmChannel { rx, tx, block, kick, scratch: Vec::new(), beat, beat_at: Instant::now(), kicks_sent: 0, kicks_seen: 0, fds: Vec::new() })
     }
 
     /// Wake-up bytes sent to the guest and received from it.
@@ -313,16 +315,23 @@ impl Channel for ShmChannel {
         Ok(())
     }
 
-    fn wait(&mut self, extra_fd: RawFd, timeout: Duration) -> io::Result<()> {
-        let kick_fd = self.kick.as_raw_fd();
-        let mut fds = [
-            libc::pollfd { fd: kick_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: extra_fd, events: libc::POLLIN, revents: 0 },
-        ];
+    fn wait(&mut self, extra_fds: &[RawFd], timeout: Duration) -> io::Result<()> {
+        let mut fds = std::mem::take(&mut self.fds);
+        fds.clear();
+        fds.push(libc::pollfd { fd: self.kick.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        fds.extend(extra_fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
+        let result = self.wait_on(&mut fds, timeout);
+        self.fds = fds;
+        result
+    }
+}
+
+impl ShmChannel {
+    fn wait_on(&mut self, fds: &mut [libc::pollfd], timeout: Duration) -> io::Result<()> {
         if timeout <= SPIN_LIMIT {
             let deadline = Instant::now() + timeout;
             loop {
-                if self.rx_ready() || poll_fds(&mut fds, Duration::ZERO)? || Instant::now() >= deadline {
+                if self.rx_ready() || poll_fds(fds, Duration::ZERO)? || Instant::now() >= deadline {
                     return Ok(());
                 }
                 std::hint::spin_loop();
@@ -331,7 +340,7 @@ impl Channel for ShmChannel {
         // Sleep, and have the guest wake us for a message: flag, re-check, then wait.
         self.rx.set_sleeping(true);
         if !self.rx_ready() {
-            poll_fds(&mut fds, timeout)?;
+            poll_fds(fds, timeout)?;
         }
         self.rx.set_sleeping(false);
         Ok(())
