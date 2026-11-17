@@ -26,6 +26,8 @@ pub const RING_HEAD: u32 = 0;
 pub const RING_TAIL: u32 = 64;
 /// `VK_RING_STATUS_IDLE_BIT_MESA`.
 pub const RING_STATUS_IDLE: u32 = 1;
+/// `VK_RING_STATUS_FATAL_BIT_MESA`: the renderer stopped executing the ring after a bad command.
+pub const RING_STATUS_FATAL: u32 = 2;
 
 pub const HELLO: u32 = 1;
 pub const SHM_CREATE: u32 = 2;

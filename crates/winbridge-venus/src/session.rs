@@ -83,6 +83,8 @@ struct Shm {
     hot: usize,
     /// The context that owns the resource: its commands run there.
     ctx: u32,
+    /// The FATAL status of this ring was logged already.
+    fatal_reported: bool,
 }
 
 impl Shm {
@@ -92,7 +94,7 @@ impl Shm {
     /// sent. A shmem above `SCAN_MAX` is only written by the guest and keeps no snapshot. The
     /// mapping belongs to the renderer and is released through `unmap_blob`.
     fn from_blob(map: *mut u8, size: usize, ctx: u32, bo: bool) -> Shm {
-        let mut shm = Shm { map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo, ctx };
+        let mut shm = Shm { map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo, ctx, fatal_reported: false };
         if bo || size <= SCAN_MAX {
             let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
             shm.snap = Some(words);
@@ -693,6 +695,7 @@ impl<R: Renderer, C: Channel> Session<R, C> {
             }
         }
         self.stats.compared(compared);
+        self.report_fatal_rings();
         if !ring.is_empty() || !others.is_empty() {
             debug!("push: {} other range(s), then {} ring range(s)", others.len(), ring.len());
         }
@@ -708,6 +711,33 @@ impl<R: Renderer, C: Channel> Session<R, C> {
             self.stats.scan(out.0, out.1);
         }
         Ok(())
+    }
+
+    /// Logs, once per ring, the state of a ring the renderer marked FATAL: where it stopped and
+    /// the bytes it stopped at, which tells a corrupt or unwritten command stream from a bad call.
+    fn report_fatal_rings(&mut self) {
+        for (id, s) in self.shms.iter_mut().filter(|(_, s)| s.ring && !s.fatal_reported) {
+            let status = s.word32(proto::RING_STATUS as usize).load(Ordering::SeqCst);
+            if status & proto::RING_STATUS_FATAL == 0 {
+                continue;
+            }
+            s.fatal_reported = true;
+            let head = s.word32(proto::RING_HEAD as usize).load(Ordering::SeqCst);
+            let tail = s.word32(proto::RING_TAIL as usize).load(Ordering::SeqCst);
+            // The buffer follows the control words (192 bytes) and is followed by 4 bytes of extra.
+            let buf = s.size.saturating_sub(196).max(4);
+            let at = (192 + (head as usize % buf)) & !3;
+            let words: Vec<String> = (0..16)
+                .map(|i| at + i * 4)
+                .take_while(|&o| o + 4 <= s.size)
+                .map(|o| format!("{:08x}", s.word32(o).load(Ordering::Relaxed)))
+                .collect();
+            warn!(
+                "ring {id} of context {} is FATAL: head {head} tail {tail} status {status:#x}; 64 bytes at head: {}",
+                s.ctx,
+                words.join(" ")
+            );
+        }
     }
 
     /// Releases a resource: the mapping first, then the resource.
