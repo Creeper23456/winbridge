@@ -266,6 +266,13 @@ A drag that starts in Windows and ends on a Linux application. The host notices 
 - **Direction:** Host $\to$ Agent
 - **Fields:** `drag_id: u32`. The host drag finished (dropped or cancelled); the agent hides its probe window. The host releases the guest's left button itself over the display channel.
 
+### 2.9 3D activity
+
+#### `Gfx3dActive`
+- **Direction:** Agent $\to$ Host
+- **Description:** The programs that currently use the 3D acceleration, by file name. A program counts while it holds the agent's graphics pipe open (the Venus driver opens it when the process claims a slot); programs under the Windows directory and the agent's own folder are left out. Sent when the list changes (an empty list when the last program ends) and every 5 s while it is not empty. The viewer switches game mode on for a non-empty list and off for an empty one, and treats a list not repeated for 15 s as ended.
+- **Fields:** `apps: Vec<String>` (sorted, each name once).
+
 ---
 
 ## 3. Shared-memory transport (optional)

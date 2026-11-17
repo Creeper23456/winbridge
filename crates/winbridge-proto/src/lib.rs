@@ -292,6 +292,13 @@ pub enum Message {
         skipped: u32,
         listed: Vec<String>,
     },
+    /// Guest -> host: the programs that currently use the 3D acceleration (they hold the guest
+    /// agent's graphics pipe open), by file name. System programs are left out. The agent sends
+    /// the list when it changes (an empty list when the last one ends) and again every few
+    /// seconds while it is not empty, so a viewer that starts later learns the state.
+    Gfx3dActive {
+        apps: Vec<String>,
+    },
 }
 
 impl Message {
