@@ -3,7 +3,7 @@
 //! virglrenderer (Venus) loaded at run time, so the crate builds without it.
 //!
 //! The library is used the way vtest uses it: `NO_VIRGL | VENUS | RENDER_SERVER | THREAD_SYNC |
-//! USE_EXTERNAL_BLOB`, one context per guest Vulkan instance, shared memory imported from memfds we own. The library has
+//! USE_EXTERNAL_BLOB`, one context per guest Vulkan instance, shared memory made by the render server (blob id 0) and mapped here. The library has
 //! no locking, so every call comes from the one session thread, and the fence callback runs
 //! inline inside `context_poll` on that thread.
 
@@ -20,7 +20,6 @@ const FLAG_VENUS: c_int = 1 << 6;
 const FLAG_NO_VIRGL: c_int = 1 << 7;
 const FLAG_RENDER_SERVER: c_int = 1 << 9;
 const BLOB_MEM_HOST3D: u32 = 2;
-const BLOB_FD_TYPE_SHM: u32 = 3;
 const FENCE_FLAG_MERGEABLE: u32 = 1;
 const CAPSET_VENUS: u32 = 4;
 const BLOB_FLAG_MAPPABLE: u32 = 1;
@@ -36,15 +35,6 @@ struct Callbacks {
     write_context_fence: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u64)>,
     get_server_fd: Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>,
     get_egl_display: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
-}
-
-#[repr(C)]
-struct ImportBlobArgs {
-    res_handle: u32,
-    blob_mem: u32,
-    fd_type: u32,
-    fd: c_int,
-    size: u64,
 }
 
 #[repr(C)]
@@ -72,7 +62,6 @@ type GetCapSetFn = unsafe extern "C" fn(u32, *mut u32, *mut u32);
 type FillCapsFn = unsafe extern "C" fn(u32, u32, *mut c_void);
 type CtxCreateFn = unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_int;
 type CtxDestroyFn = unsafe extern "C" fn(u32);
-type ImportFn = unsafe extern "C" fn(*const ImportBlobArgs) -> c_int;
 type AttachFn = unsafe extern "C" fn(c_int, c_int);
 type UnrefFn = unsafe extern "C" fn(u32);
 type SubmitFn = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
@@ -92,7 +81,6 @@ pub struct Virgl {
     fill_caps: FillCapsFn,
     ctx_create: CtxCreateFn,
     ctx_destroy: CtxDestroyFn,
-    import: ImportFn,
     attach: AttachFn,
     unref: UnrefFn,
     submit: SubmitFn,
@@ -149,7 +137,6 @@ impl Virgl {
             fill_caps: sym!("virgl_renderer_fill_caps", FillCapsFn),
             ctx_create: sym!("virgl_renderer_context_create_with_flags", CtxCreateFn),
             ctx_destroy: sym!("virgl_renderer_context_destroy", CtxDestroyFn),
-            import: sym!("virgl_renderer_resource_import_blob", ImportFn),
             attach: sym!("virgl_renderer_ctx_attach_resource", AttachFn),
             unref: sym!("virgl_renderer_resource_unref", UnrefFn),
             submit: sym!("virgl_renderer_submit_cmd", SubmitFn),
@@ -199,26 +186,6 @@ impl Renderer for Virgl {
         // SAFETY: plain id.
         unsafe { (self.ctx_destroy)(ctx) };
         RETIRED.lock().unwrap().retain(|f| f.0 != ctx);
-    }
-
-    fn attach_shmem(&mut self, ctx: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32> {
-        // virglrenderer owns the fd it is given.
-        // SAFETY: `fd` is a valid descriptor of ours.
-        let dup = unsafe { libc::dup(fd) };
-        if dup < 0 {
-            return Err(-std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EMFILE));
-        }
-        let args = ImportBlobArgs { res_handle: res_id, blob_mem: BLOB_MEM_HOST3D, fd_type: BLOB_FD_TYPE_SHM, fd: dup, size };
-        // SAFETY: `args` is valid for the call.
-        let r = unsafe { (self.import)(&args) };
-        if r != 0 {
-            // SAFETY: on failure the library did not take the fd.
-            unsafe { libc::close(dup) };
-            return Err(r);
-        }
-        // SAFETY: plain ids.
-        unsafe { (self.attach)(ctx as c_int, res_id as c_int) };
-        Ok(())
     }
 
     fn unref(&mut self, res_id: u32) {

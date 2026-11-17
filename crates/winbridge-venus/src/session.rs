@@ -18,7 +18,7 @@ use crate::proto::{self, Hdr, PushBuilder, HDR_LEN};
 use crate::stats::Stats;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -51,9 +51,6 @@ pub trait Renderer {
     fn capset(&mut self) -> Result<Vec<u8>, String>;
     fn create_context(&mut self, ctx: u32) -> Result<(), i32>;
     fn destroy_context(&mut self, ctx: u32);
-    /// Imports a memfd as shmem resource `res_id` and attaches it to the context. The caller
-    /// keeps `fd`; the implementation duplicates it if it needs to keep one.
-    fn attach_shmem(&mut self, ctx: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32>;
     fn unref(&mut self, res_id: u32);
     fn submit(&mut self, ctx: u32, cs: &[u8]) -> Result<(), i32>;
     fn create_fence(&mut self, ctx: u32, ring_idx: u32, fence_id: u64) -> Result<(), i32>;
@@ -62,8 +59,9 @@ pub trait Renderer {
     fn poll(&mut self, ctx: u32) -> Vec<(u32, u64)>;
     /// A descriptor that becomes readable when `poll` has work, or a negative number.
     fn poll_fd(&self, ctx: u32) -> RawFd;
-    /// Creates a mappable host3d blob for the device memory with venus object id `blob_id`
-    /// as resource `res_id` and attaches it to the context.
+    /// Creates a mappable host3d blob as resource `res_id` and attaches it to the context: the
+    /// device memory with venus object id `blob_id`, or, for blob id 0, a shmem of `size` bytes
+    /// that the renderer makes in its own process, so the context knows it when this returns.
     fn create_blob(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> Result<(), i32>;
     /// Maps a blob. Returns the mapping and its size.
     fn map_blob(&mut self, res_id: u32) -> Result<(*mut u8, u64), i32>;
@@ -71,8 +69,6 @@ pub trait Renderer {
 }
 
 struct Shm {
-    /// The memfd behind a shmem; none for device memory the renderer mapped.
-    fd: Option<OwnedFd>,
     /// Device memory: the renderer's GPU writes show up here, so it is scanned when a fence
     /// retires instead of on every tick.
     bo: bool,
@@ -90,33 +86,17 @@ struct Shm {
 }
 
 impl Shm {
-    fn create(size: usize, ctx: u32) -> io::Result<Shm> {
-        // SAFETY: plain syscalls; the name is NUL-terminated.
-        unsafe {
-            let fd = libc::memfd_create(c"winbridge-venus".as_ptr(), libc::MFD_CLOEXEC);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let fd = OwnedFd::from_raw_fd(fd);
-            if libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let map = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0);
-            if map == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            let snap = (size <= SCAN_MAX).then(|| vec![0u64; size / 8]);
-            Ok(Shm { fd: Some(fd), map: map.cast(), size, snap, ring: false, ring_id: 0, hot: 0, bo: false, ctx })
+    /// Wraps memory the renderer created and mapped for us: device memory (`bo`) or a shmem.
+    /// `size` is what the guest can see, a multiple of 8 no larger than the mapping. The guest's
+    /// copy starts out as it is on the host, so memory the application has not written is not
+    /// sent. A shmem above `SCAN_MAX` is only written by the guest and keeps no snapshot. The
+    /// mapping belongs to the renderer and is released through `unmap_blob`.
+    fn from_blob(map: *mut u8, size: usize, ctx: u32, bo: bool) -> Shm {
+        let mut shm = Shm { map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo, ctx };
+        if bo || size <= SCAN_MAX {
+            let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
+            shm.snap = Some(words);
         }
-    }
-
-    /// Wraps device memory the renderer mapped for us. `size` is what the guest can see, a
-    /// multiple of 8 no larger than the mapping. The guest's copy starts out as it is on the
-    /// host, so memory the application has not written is not sent.
-    fn from_blob(map: *mut u8, size: usize, ctx: u32) -> Shm {
-        let mut shm = Shm { fd: None, map, size, snap: None, ring: false, ring_id: 0, hot: 0, bo: true, ctx };
-        let words = (0..size / 8).map(|i| shm.word(i * 8).load(Ordering::Relaxed)).collect();
-        shm.snap = Some(words);
         shm
     }
 
@@ -197,16 +177,6 @@ impl Shm {
                 s[at / 8] = v;
             }
             self.word(at).store(v, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for Shm {
-    fn drop(&mut self) {
-        // A blob's mapping belongs to the renderer and is released through `unmap_blob`.
-        if self.fd.is_some() {
-            // SAFETY: the mapping was created in `create` and is unmapped once.
-            unsafe { libc::munmap(self.map.cast(), self.size) };
         }
     }
 }
@@ -475,23 +445,11 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         let res_id = hdr.arg;
         let size = if p.len() >= 8 { proto::u64_at(p, 0) } else { 0 };
         let status = if !self.ctxs.contains(&ctx) || res_id == 0 || size == 0 || size % 8 != 0 || size > (1 << 30) || self.shms.contains_key(&res_id) {
-            libc::EINVAL
+            libc::EINVAL as u32
         } else {
-            match Shm::create(size as usize, ctx) {
-                Err(e) => e.raw_os_error().unwrap_or(libc::EIO),
-                Ok(shm) => match self.r.attach_shmem(ctx, res_id, shm.fd.as_ref().map_or(-1, AsRawFd::as_raw_fd), size) {
-                    Ok(()) => {
-                        self.shms.insert(res_id, shm);
-                        0
-                    }
-                    Err(e) => {
-                        warn!("cannot attach shmem {res_id} ({size} bytes): {e}");
-                        e.abs().max(1)
-                    }
-                },
-            }
+            self.create_resource(ctx, res_id, 0, size, false)
         };
-        self.send(hdr.kind | proto::REPLY, hdr.req, status as u32, &[])
+        self.send(hdr.kind | proto::REPLY, hdr.req, status, &[])
     }
 
     fn on_push(&mut self, p: &[u8]) {
@@ -625,27 +583,31 @@ impl<R: Renderer, C: Channel> Session<R, C> {
                 return Ok(true);
             }
         }
-        let status = self.create_bo(ctx, res_id, blob_id, size);
+        let status = self.create_resource(ctx, res_id, blob_id, size, true);
         self.send(hdr.kind | proto::REPLY, hdr.req, status, &[])?;
         Ok(true)
     }
 
-    /// Creates the blob for a VkDeviceMemory and maps it. Returns the reply status.
-    fn create_bo(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> u32 {
+    /// Has the renderer create resource `res_id` for `ctx`, and maps it. `blob_id` names the
+    /// VkDeviceMemory of a bo; 0 asks for a shmem. The renderer makes a shmem in its own process:
+    /// an imported memfd reaches that process by a message of its own, and the ring thread there can
+    /// run a command that names the shmem before the message is handled (a stream of the
+    /// application's first commands failed with "invalid stream" that way). Returns the reply status.
+    fn create_resource(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64, bo: bool) -> u32 {
         if let Err(e) = self.r.create_blob(ctx, res_id, blob_id, size) {
-            warn!("cannot create the blob for memory {blob_id} ({size} bytes): {e}");
+            warn!("cannot create resource {res_id} (blob {blob_id}, {size} bytes): {e}");
             return e.unsigned_abs().max(1);
         }
         match self.r.map_blob(res_id) {
             Err(e) => {
-                warn!("cannot map the blob for memory {blob_id}: {e}");
+                warn!("cannot map resource {res_id} (blob {blob_id}): {e}");
                 self.r.unref(res_id);
                 e.unsigned_abs().max(1)
             }
             Ok((map, host_size)) => {
-                // The guest's copy is rounded up to whole pages.
-                let guest_size = (size + 4095) & !4095;
-                self.shms.insert(res_id, Shm::from_blob(map, (guest_size.min(host_size) & !7) as usize, ctx));
+                // A bo's copy in the guest is rounded up to whole pages.
+                let guest_size = if bo { (size + 4095) & !4095 } else { size };
+                self.shms.insert(res_id, Shm::from_blob(map, (guest_size.min(host_size) & !7) as usize, ctx, bo));
                 0
             }
         }
@@ -748,14 +710,11 @@ impl<R: Renderer, C: Channel> Session<R, C> {
         Ok(())
     }
 
-    /// Releases a resource: the mapping first if the renderer made it, then the resource.
+    /// Releases a resource: the mapping first, then the resource.
     fn release(&mut self, id: u32) {
-        if let Some(s) = self.shms.remove(&id) {
-            if s.bo {
-                self.r.unmap_blob(id);
-            }
+        if self.shms.remove(&id).is_some() {
+            self.r.unmap_blob(id);
             self.r.unref(id);
-            drop(s);
         }
     }
 
@@ -788,9 +747,6 @@ impl<T: Renderer + ?Sized> Renderer for &mut T {
     fn destroy_context(&mut self, ctx: u32) {
         (**self).destroy_context(ctx)
     }
-    fn attach_shmem(&mut self, ctx: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32> {
-        (**self).attach_shmem(ctx, res_id, fd, size)
-    }
     fn unref(&mut self, res_id: u32) {
         (**self).unref(res_id)
     }
@@ -821,6 +777,13 @@ impl<T: Renderer + ?Sized> Renderer for &mut T {
 mod tests {
     use super::*;
 
+    fn shm_of(size: usize) -> Shm {
+        // SAFETY: an anonymous mapping of our own; the test keeps it.
+        let map = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(map, libc::MAP_FAILED);
+        Shm::from_blob(map.cast(), size, 1, false)
+    }
+
     fn write(shm: &Shm, off: usize, v: u64) {
         shm.word(off).store(v, Ordering::Relaxed);
     }
@@ -833,7 +796,7 @@ mod tests {
 
     #[test]
     fn a_light_scan_stays_near_the_last_change_and_a_full_scan_finds_the_rest() {
-        let mut shm = Shm::create(1 << 20, 1).unwrap();
+        let mut shm = shm_of(1 << 20);
         // Nothing has changed yet: a light scan looks only at the first slack.
         assert_eq!(scanned(&mut shm, false), (HOT_SLACK_WORDS * 8, 0));
 

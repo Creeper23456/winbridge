@@ -74,7 +74,8 @@ enum wbvn_kind {
    WBVN_HELLO = 1,
    /* arg: res_id chosen by the guest (nonzero, unique across the slot). The kind word names the
     * context. payload: u64 size. reply arg: 0 = ok.
-    * The host creates a memfd of that size, imports it as a venus shmem and attaches it. */
+    * The host has the renderer create a shmem of that size (blob id 0), maps it, and attaches it;
+    * the renderer knows it when the reply arrives, so the guest may name it in a command at once. */
    WBVN_SHM_CREATE = 2,
    /* arg: res_id. reply arg: 0 = ok. */
    WBVN_SHM_DESTROY = 3,

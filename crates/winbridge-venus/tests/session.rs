@@ -30,6 +30,8 @@ struct Inner {
     destroyed: Vec<u32>,
     /// Contexts whose fences do not retire.
     held: Vec<u32>,
+    /// What the session asked the renderer to create: (ctx, res_id, blob_id).
+    created: Vec<(u32, u32, u64)>,
     /// A context whose submits fail.
     failing: Option<u32>,
 }
@@ -55,13 +57,6 @@ impl Renderer for Mock {
     }
     fn destroy_context(&mut self, ctx: u32) {
         self.0.lock().unwrap().destroyed.push(ctx);
-    }
-    fn attach_shmem(&mut self, _: u32, res_id: u32, fd: RawFd, size: u64) -> Result<(), i32> {
-        // SAFETY: maps the session's memfd shared.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
-        assert_ne!(p, libc::MAP_FAILED);
-        self.0.lock().unwrap().maps.insert(res_id, Map(p.cast(), size as usize));
-        Ok(())
     }
     fn unref(&mut self, res_id: u32) {
         self.0.lock().unwrap().maps.remove(&res_id);
@@ -95,13 +90,15 @@ impl Renderer for Mock {
     fn poll_fd(&self, _: u32) -> RawFd {
         -1
     }
-    fn create_blob(&mut self, _: u32, res_id: u32, _blob_id: u64, size: u64) -> Result<(), i32> {
+    fn create_blob(&mut self, ctx: u32, res_id: u32, blob_id: u64, size: u64) -> Result<(), i32> {
         let size = ((size + 4095) & !4095) as usize;
         // SAFETY: an anonymous shared mapping of our own.
         let p = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0) };
         assert_ne!(p, libc::MAP_FAILED);
         let mut g = self.0.lock().unwrap();
-        let fill = g.blob_fill;
+        g.created.push((ctx, res_id, blob_id));
+        // A shmem (blob id 0) starts out zero; device memory with whatever it holds.
+        let fill = if blob_id == 0 { 0 } else { g.blob_fill };
         for i in 0..size / 8 {
             // SAFETY: in bounds and aligned.
             unsafe { p.cast::<u64>().add(i).write(fill) };
@@ -436,6 +433,20 @@ fn a_context_the_renderer_fails_is_lost_and_the_others_go_on() {
         assert_eq!((m.submits.clone(), m.submit_ctx.clone()), (vec![vec![3u8; 8]], vec![1]));
         assert_eq!(m.destroyed, vec![2]);
     }
+    drop(g);
+    t.join().unwrap();
+}
+
+#[test]
+fn a_shmem_is_made_by_the_renderer_so_the_context_knows_it_before_the_guest_uses_it() {
+    // An imported memfd reaches the render server's context by a message of its own, and a ring
+    // thread there can run a command that names the shmem first. The renderer makes it itself.
+    let mock = Mock::default();
+    let (mut g, t) = start(&mock);
+    hello(&mut g, 2);
+    create_in(&mut g, 1, 3, 0x2000);
+    create_in(&mut g, 2, 4, 0x1000);
+    assert_eq!(mock.0.lock().unwrap().created, vec![(1, 3, 0), (2, 4, 0)]);
     drop(g);
     t.join().unwrap();
 }
