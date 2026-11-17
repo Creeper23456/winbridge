@@ -33,7 +33,7 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面，提供了比virt
 - 是一个现代的Windows版本，我只测试了Windows 11 LTSC 中文版，24H2。
 - 安装了VirtIO的所有驱动，包括那个没有3D加速效果的VirtIO显示驱动。
 - 安装了QemuGA，Guest Agent。
-- 安装了ivshmem驱动。
+- 安装了ivshmem驱动。它是 Red Hat 的 IVSHMEM 驱动，从 Looking Glass 的 Windows 主机安装包(`looking-glass-host-setup.exe`,B6 起内含该驱动,见 [Looking Glass 文档](https://looking-glass.io/docs/B7/install_host/))里取出 `ivshmem.inf`、`ivshmem.cat`、`ivshmem.sys`,放进同一个文件夹,然后在管理员权限的命令行里运行 `winbridge-agent.exe --install-ivshmem <文件夹>`。这条命令会先校验签名,重复运行是安全的,`--uninstall-ivshmem` 可以卸载(见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md))。
 - 按照本仓库的虚拟机参数配置了ivshmem设备和serial设备
 
 来宾机内安装本项目编译的Agent，即可启用用户态的Vulkan转发和渲染。

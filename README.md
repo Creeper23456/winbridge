@@ -33,7 +33,7 @@ This project does not modify QEMU on the host, and it does not need unsigned dri
 - A modern Windows version. I have only tested Windows 11 LTSC 24H2, Chinese edition.
 - All the VirtIO drivers installed, including the VirtIO display driver that has no 3D acceleration.
 - QemuGA, the QEMU Guest Agent, installed.
-- The ivshmem driver installed.
+- The ivshmem driver installed. It is Red Hat's IVSHMEM driver. Take `ivshmem.inf`, `ivshmem.cat` and `ivshmem.sys` from the Looking Glass Windows host installer (`looking-glass-host-setup.exe`, since B6 it bundles the driver, see the [Looking Glass documentation](https://looking-glass.io/docs/B7/install_host/)), put them in one folder and run `winbridge-agent.exe --install-ivshmem <folder>` from an elevated prompt. The command checks the signatures first, is safe to run twice, and `--uninstall-ivshmem` removes it again (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - The ivshmem device and the serial device configured with the VM parameters from this repository.
 
 Install the Agent built from this project in the guest, and user-mode Vulkan forwarding and rendering are enabled.
