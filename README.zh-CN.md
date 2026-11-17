@@ -34,7 +34,7 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持
 
 客户机里的程序可以使用主机 GPU。WinBridge 把 Mesa 的 **Venus**(一个 Vulkan 序列化层)移植到了 Windows:客户机驱动 `vulkan_virtio.dll` 把每个 Vulkan 调用编码成命令流,命令流经共享内存送到主机,`winbridge-venus` 再用 virglrenderer 的 Venus 渲染器在主机 GPU 上执行。设计、被否决的备选方案和全部实测数据见 [ADR 0001](docs/adr/0001-venus-as-serialization-layer.md);构建、安装和运行见 [`venus/README.md`](venus/README.md)(均为英文)。
 
-- **能运行什么**:Vulkan 程序;通过 DXVK 运行的 Direct3D 9、10、11;通过 Zink 运行的 OpenGL 4.6(把 Mesa 的 `opengl32.dll` 和 `libgallium_wgl.dll` 放在程序旁边);用同一批 DLL 的 x86 版本运行的 32 位程序;FurMark 2 的 Vulkan 模式。
+- **能运行什么**:Vulkan 程序;通过 DXVK 运行的 Direct3D 9、10、11;通过 Zink 运行的 OpenGL 4.6;用同一批 DLL 的 x86 版本运行的 32 位程序;FurMark 2 的 Vulkan 模式和 OpenGL 模式。Vulkan 不需要为每个程序做任何事。OpenGL 和 Direct3D 需要把它们的 DLL 加载进程序:放在程序旁边,或者安装**全局 hook**(`scripts/install-gfx-hook.ps1`,一个 AppInit_DLLs 模块),它把这些 DLL 交给每一个不属于 Windows 的程序(黑名单除外),不改动程序自己的文件夹。已测试:OpenGL 和 Direct3D 测试程序(x64 和 x86)和 FurMark 2 的一份拷贝(OpenGL 4.6,约 230 fps)。够不到的:有沙盒的程序,所以浏览器需要 `--use-angle=vulkan`(Edge 用这个参数跑过),以及开启 Secure Boot 时的全部程序。每个创建 DXGI 工厂的程序在运行期间都会占用一个 Venus 槽位;槽位少的时候安装前请看 [`venus/README.md`](venus/README.md) 和 ADR 3.11。
 - **实测**(Windows 11 LTSC 客户机,4 vCPU,RTX 3060 Ti 主机,普通用户令牌):D3D11 三角形每帧 1.9 ms,茶壶场景在 1280x720 下每帧 2.0 ms(约每秒 500 帧);运行 16 分钟没有泄漏,主机端也没有警告;FurMark 的 Vulkan 模式约 100 FPS。Direct3D 10(2.35 ms)、Direct3D 9 以及 32 位版本(三角形和茶壶 2.5 到 3.2 ms)也都跑通了。
 - **没有中转进程**:每个 Vulkan 进程独占一个*槽位*,即一个 64 MiB 的 `ivshmem-plain` 设备加一个 virtio-serial 唤醒端口,由一个 `winbridge-venus` 进程为它服务。示例启动脚本用 `WINBRIDGE_VENUS=N` 启动这些槽位。
 - **主机需要**:带有 `venus/patches/virglrenderer` 补丁的 virglrenderer(NVIDIA 550 上其中两个是必需的)及其 render server。

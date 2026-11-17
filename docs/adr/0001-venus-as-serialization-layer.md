@@ -185,6 +185,41 @@ Not verified: other OpenGL applications, extension coverage and conformance (no 
 
 Not verified: the registry registration of the 32-bit driver (`install-venus-icd.ps1 -SourceDll32`, `HKLM\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers`; the runs above set `VK_DRIVER_FILES`), a real 32-bit application (FurMark 1.39 and GPU-Z were not run), whether another Vulkan 1.1 application is affected by raising the renderer version (no Vulkan 1.0/1.1 program other than FurMark was run), why FurMark's `--demo` exits with code 1 after a complete run, and a `MESA-VIRTIO: debug: ivshmem mapping ... error 548` line that the demo prints once (the driver went on to the next slot).
 
+### 3.11 Global injection for every non-system program (measured 2026-11-17, LTSC VM, normal user token)
+
+The aim: every program that is not part of Windows gets Mesa's OpenGL and DXVK without touching its folder, with a deny list (a per-image IFEO key cannot say "all but these"). Measured with test DLLs first, then with the hook that came of it (`venus/guest/wbhook.c`, `scripts/install-gfx-hook.ps1`).
+
+| Mechanism | Result |
+|---|---|
+| AppInit_DLLs module that only preloads our DLLs by full path | Works for programs that load `opengl32.dll`, `d3d11.dll` or `dxgi.dll` with `LoadLibrary` (also with `LOAD_LIBRARY_SEARCH_SYSTEM32`: the loader looks at the module list by base name first; a full `C:\Windows\System32\...` path loads the system copy again). Fails for programs that import them statically (`gltri`, `tri11`, FurMark's `gxc_x64.dll`): the loader binds the imports before user32 runs the AppInit modules, so they keep `GDI Generic` 1.1 and `Microsoft Basic Render Driver`. |
+| IFEO `VerifierDlls` | The value takes bare names from System32; a full path made the program die with `0xC0000142` (`STATUS_DLL_INIT_FAILED`). One key per image name anyway. |
+| `<exe>.local` folder | Ignored by the program that has an application manifest (`gltri.exe`). One folder per program anyway. |
+| AppInit module that also rewrites the import tables of the modules already loaded (the hook) | Works for static imports. |
+
+Two things the rewrite had to cover. A program that imported the System32 `opengl32.dll` before the hook ran gets that copy whenever something asks for `OPENGL32` by name, and gdi32's `SwapBuffers` does exactly that (`LoadLibraryA("OPENGL32")`, then `wglSwapBuffers`), so with import rewriting alone `gltri` created a Zink context and then failed with `SwapBuffers: 0`; the hook points a program's import of gdi32's `SwapBuffers` at Mesa's `wglSwapBuffers`. And DXVK's `d3d11.dll` imports `dxgi.dll` by name while the System32 `dxgi.dll` is already loaded, so the rewrite runs over our own modules too.
+
+With the hook installed (x64 and x86 DLLs in `C:\ProgramData\WinBridge\Hook`, `AppInit_DLLs` in both registry views, `LoadAppInit_DLLs=1`, `RequireSignedAppInit_DLLs=0`; Secure Boot is off in this guest, with it on Windows ignores AppInit):
+
+| Program, nothing next to it | Result |
+|---|---|
+| `tri11`, `tri9`, `teapot11` x64 | adapter `Virtio-GPU Venus (NVIDIA GeForce RTX 3060 Ti)` (without the hook: Microsoft Basic Render Driver) |
+| `gltri` x64 and x86, `--legacy` and the 3.3 core context | `zink Vulkan 1.3(Virtio-GPU Venus ...)`, 4.6, `RESULT: PASS` (the core context failed on `GDI Generic` before; before the `SwapBuffers` redirect: `FAIL: SwapBuffers: 0`) |
+| FurMark 2 (a copy, `GL_RENDERER`) | `zink Vulkan 1.3(...)`, OpenGL 4.6, 205 / 230 / 253 fps, score 1033 (it said "OpenGL 1.1 detected" and exited without the hook) |
+| `tri9` x86 | Venus adapter |
+| `notepad`, `cmd`, `explorer`; any program under `C:\Windows` | not touched (`skip: system program` in the `WBHOOK_LOG` file; no Mesa or DXVK module) |
+| `gltri` with Mesa's two DLLs next to it | keeps them (module path of `opengl32.dll` is its own folder), passes |
+| `Deny` containing `gltri.exe` | back to `GDI Generic` |
+| `Components` 1 (OpenGL) and 2 (Direct3D) | each one alone takes effect |
+| Uninstall, then install again | the registry values return to what they were (`LoadAppInit_DLLs` 0, no `RequireSignedAppInit_DLLs`); the files are removed |
+
+Edge (Chromium): its GPU and other child processes ignore AppInit modules (presumably the sandbox's extension-point policy; not checked), so with the hook it still ran on System32's `dxgi.dll` and `d3d11.dll` and took no Venus slot. With `--use-angle=vulkan` the GPU process loads `vulkan_virtio.dll` (one slot), no hook needed. Browsers therefore need that flag (or the ANGLE backend in `chrome://flags`).
+
+Slots. A third accelerated process while two hold the slots failed after about 1.1 s with `E_FAIL` (`D3D11CreateDevice: Failed to create a DXGI factory`, DXVK creates its Vulkan instance there), not after the 30 s wait. FurMark's GUI with the hook took one slot while it was open. A program that loads both the GL and the D3D side may take two (one per Vulkan instance); this was seen as both slots busy, not measured per process. Injecting Direct3D into every program means every program that creates a DXGI factory takes a slot for as long as it runs: with two slots that starves the programs the user wants accelerated; `WINBRIDGE_VENUS=8` (8 x 64 MiB of shared memory and eight `winbridge-venus` processes) is the way to keep it usable, and `Components` 1 limits the hook to OpenGL.
+
+Start cost: 20 launches of a small program took 20.8 ms each with the hook and 63.4 ms without (run-to-run noise dominates; an earlier AppInit module that only preloaded six DLLs added about 14 ms per process).
+
+Not verified: programs that call `GetProcAddress` on the System32 `opengl32.dll`, `d3d11.dll` or `dxgi.dll` handle themselves or load a system DLL by name after the hook ran while another copy is loaded (Direct2D, DirectComposition and WPF share objects with the program's device; whether a mix of the System32 and the DXVK `dxgi.dll` in one process breaks them was not tried); anti-cheat software and antivirus on a module that every process loads; Store and other AppContainer programs (AppInit is ignored there); a 32-bit program on a 64-bit-only Hook folder; a reboot with the hook installed. A 32-bit `tri11` aborted (`0xC0000409`, the CRT's `abort` in the 32-bit `vulkan_virtio.dll`, symbolized with its PDB; that it is Mesa's `vn_relax` giving up on a silent ring is an inference) in 7 of 12 back-to-back runs once, right after the driver update, on slot 0, and in none of 30 later runs on slot 1 (with and without `VN_DEBUG=result,init`); the cause was not found, and whether it needs the hook was not tried.
+
 ## 4. Options considered
 
 | Option | Effect | Cost / risk |

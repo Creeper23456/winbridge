@@ -186,9 +186,9 @@ The viewer's lifetime is the VM's lifetime. How the VM starts is the user's busi
 
 ## 6. GPU path
 
-3D acceleration is the Venus Vulkan layer (`docs/adr/0001-venus-as-serialization-layer.md`, `venus/README.md`). The guest driver `vulkan_virtio.dll` is registered once as a global Vulkan driver (`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`), and DXVK's DLLs sit next to the Direct3D programs. Nothing is injected into applications: the agent writes no Image File Execution Options entries and starts no target process. Each Vulkan process claims one shared-memory slot (section 7 and `docs/IVSHMEM-TRANSPORT.md`) served by one `winbridge-venus` process on the host.
+3D acceleration is the Venus Vulkan layer (`docs/adr/0001-venus-as-serialization-layer.md`, `venus/README.md`). The guest driver `vulkan_virtio.dll` is registered once as a global Vulkan driver (`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`). OpenGL (Mesa Zink) and Direct3D 9/10/11 (DXVK) are separate DLLs that a program has to load: either they sit next to it, or the **global hook** gives them to every program that is not part of Windows (`venus/guest/wbhook.c`, installed by `scripts/install-gfx-hook.ps1`; the measurements, what it cannot reach and the slot cost are ADR 3.11). Each Vulkan process claims one shared-memory slot (section 7 and `docs/IVSHMEM-TRANSPORT.md`) served by one `winbridge-venus` process on the host, and tells the agent through `\\.\pipe\winbridge-gfx` (see Game mode).
 
-The earlier IFEO injector (`gfx_inject.rs`, an allow-list of executables, a debugger-style launch redirect) was written for the hand-written ICD, never ran on a guest and was removed with it. A per-application mechanism, if one is wanted later, needs a new design: IFEO has one key per image name, so it cannot express "every program except these".
+The hook is an AppInit_DLLs module, not something the agent injects: the agent writes no Image File Execution Options entries and starts no target process. The earlier IFEO injector (`gfx_inject.rs`, an allow-list of executables, a debugger-style launch redirect) was written for the hand-written ICD, never ran on a guest and was removed with it; IFEO has one key per image name, so it cannot express "every program except these", which is why the deny list lives in the hook (`HKLM\SOFTWARE\WinBridge\Hook`, value `Deny`).
 
 
 ## 7. Shared memory (guest side)
