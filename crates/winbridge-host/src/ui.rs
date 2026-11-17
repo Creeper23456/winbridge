@@ -140,8 +140,6 @@ pub struct ViewerWindow {
     refresh_sent: Cell<Option<u32>>,
     /// Re-sends the canvas resolution and DPI to the guest (through the resize debounce).
     resync: RefCell<Option<Rc<dyn Fn()>>>,
-    /// `Mouse.IsAbsolute` as read from QEMU when game mode was last switched on.
-    is_absolute: Cell<Option<bool>>,
     /// The agent does not answer the keepalive (or the channel is down): the header says how to
     /// release the mouse.
     agent_unresponsive: Cell<bool>,
@@ -282,7 +280,6 @@ impl ViewerWindow {
             agent_heard: Cell::new(true),
             refresh_sent: Cell::new(None),
             resync: RefCell::new(None),
-            is_absolute: Cell::new(None),
             agent_unresponsive: Cell::new(false),
             ping_seq: Cell::new(0),
             shutting_down: Cell::new(false),
@@ -1186,30 +1183,53 @@ impl ViewerWindow {
         }
     }
 
-    /// Switches game mode (relative mouse). It confines the pointer only while it is over the
-    /// canvas, like every capture; Ctrl+Alt+G and Right Ctrl release it by hand.
+    /// Switches game mode (relative mouse). QEMU delivers pointer input to one device, so the
+    /// relative one is chosen first (`mousedev`) and the absolute tablet again afterwards. The
+    /// capture confines the pointer only while it is over the canvas, like every capture;
+    /// Ctrl+Alt+G and Right Ctrl release it by hand.
     fn set_game_mode(self: &Rc<Self>, on: bool) {
         if self.game_on.replace(on) == on {
             return;
         }
         self.clear_notice();
-        self.input.set_relative_enabled(on);
-        if on {
-            // Informational: QEMU refuses RelMotion while its active pointing device is absolute.
-            let mouse = self.dbus_conn.lock().unwrap().as_ref().map(|c| c.mouse.clone());
-            if let Some(mouse) = mouse {
-                let reply = tokio::spawn(async move { mouse.is_absolute().await });
-                let viewer = self.clone();
-                glib::spawn_future_local(async move {
-                    match reply.await {
-                        Ok(Ok(absolute)) => {
-                            info!("QEMU Mouse.IsAbsolute = {} (game mode needs false)", absolute);
-                            viewer.is_absolute.set(Some(absolute));
-                        }
-                        Ok(Err(e)) => warn!("Reading QEMU Mouse.IsAbsolute failed: {}", e),
-                        Err(e) => warn!("Reading QEMU Mouse.IsAbsolute failed: {}", e),
-                    }
-                });
+        if !on {
+            self.input.set_relative_enabled(false);
+        }
+        let qmp = self.qmp.clone();
+        let reply = tokio::spawn(async move { crate::mousedev::select(&qmp, !on).await });
+        let viewer = self.clone();
+        glib::spawn_future_local(async move {
+            let result = reply.await.unwrap_or_else(|e| Err(e.to_string()));
+            viewer.on_pointing_device(on, result);
+        });
+        self.refresh_status();
+    }
+
+    /// QEMU answered the choice of the pointing device: the relative one for game mode (`game`),
+    /// the absolute one for the desktop.
+    fn on_pointing_device(self: &Rc<Self>, game: bool, result: Result<String, String>) {
+        if !game {
+            match result {
+                Ok(done) => info!("Pointing device: {}", done),
+                Err(why) => warn!("Pointing device: {}", why),
+            }
+            return;
+        }
+        if !self.game_on.get() {
+            // Game mode ended while QEMU was answering.
+            return;
+        }
+        match result {
+            Ok(done) => {
+                info!("Game mode: {}", done);
+                self.input.set_relative_enabled(true);
+            }
+            Err(why) => {
+                warn!("Game mode cannot start: {}", why);
+                self.game_refused.set(true);
+                // Switching off clears the notice, so set it afterwards.
+                self.set_game_mode(false);
+                self.set_notice(format!("Game mode off: {}", why));
             }
         }
         self.refresh_status();
@@ -1254,15 +1274,11 @@ impl ViewerWindow {
         if !rejected || !self.game_on.get() {
             return;
         }
-        let absolute = self.is_absolute.get().map_or("unknown".to_string(), |a| a.to_string());
-        warn!("QEMU refused RelMotion (IsAbsolute = {}): switching game mode off", absolute);
+        warn!("QEMU refused RelMotion: switching game mode off");
         self.game_refused.set(true);
         // Switching off clears the notice, so set it afterwards.
         self.set_game_mode(false);
-        self.set_notice(format!(
-            "Game mode off: QEMU refused relative motion (IsAbsolute = {}); the guest needs a relative pointing device such as -device usb-mouse",
-            absolute
-        ));
+        self.set_notice("Game mode off: QEMU refused relative motion".to_string());
         self.refresh_status();
     }
 

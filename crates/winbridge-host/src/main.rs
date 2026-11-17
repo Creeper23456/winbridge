@@ -17,6 +17,7 @@ mod kbgrab;
 mod keyfilter;
 mod keymap;
 mod launch;
+mod mousedev;
 mod pointer;
 mod qmp;
 mod refresh;
@@ -327,6 +328,18 @@ fn main() -> glib::ExitCode {
             *cell.borrow_mut() = Some(viewer);
         });
         tray::start();
+
+        // QEMU may have left a relative device as the current pointer (a viewer closed in game
+        // mode, or the guest polled its PS/2 mouse last): absolute pointing needs the tablet.
+        {
+            let qmp = qmp::QmpClient::new(config.qmp_socket.clone());
+            tokio::spawn(async move {
+                match mousedev::select(&qmp, true).await {
+                    Ok(done) => info!("Pointing device: {}", done),
+                    Err(why) => warn!("Pointing device: {}", why),
+                }
+            });
+        }
 
         // Launch mode: the viewer runs the configured script once, as its child.
         if let Some(spec) = &config.launch {
