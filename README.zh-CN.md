@@ -18,7 +18,7 @@
 
 ## 简介
 
-WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持同步。它提供了类似于VMWare Workstation或PD的Windows虚拟化体验，实现了以下功能：
+WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面，提供了比virt-manager更好的交互体验。它提供了类似于VMWare Workstation或PD的Windows虚拟化体验，实现了以下功能：
 
 - 剪切板双向复制
 - 快捷USB设备透传
@@ -26,11 +26,14 @@ WinBridge 在 GTK4 窗口中显示 Windows 11 客户机桌面,并让两端保持
 - 拖拽传输文件
 - 鼠标绝对坐标与相对坐标
 
-本项目不修改QEMU宿主机，也不需要在Windows安装特殊的驱动。对于宿主机，你只需要安装来自发行版的QEMU包。对于来宾机，我建议：
+它是轻量化的，在宿主机，你只需要安装QEMU即可，不需要安装沉重的virt-manager。在来宾机，你也只需要按照要求准备好即可，它非常轻便。
+
+本项目不修改QEMU宿主机，也不需要在Windows安装未签名的驱动。这使得项目基本上开箱即用。对于宿主机，你只需要安装来自发行版的QEMU包。对于来宾机，我建议：
 
 - 是一个现代的Windows版本，我只测试了Windows 11 LTSC 中文版，24H2。
 - 安装了VirtIO的所有驱动，包括那个没有3D加速效果的VirtIO显示驱动。
 - 安装了QemuGA，Guest Agent。
+- 安装了ivshmem驱动。
 - 按照本仓库的虚拟机参数配置了ivshmem设备和serial设备
 
 来宾机内安装本项目编译的Agent，即可启用用户态的Vulkan转发和渲染。

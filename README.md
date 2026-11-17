@@ -18,7 +18,7 @@ I had no choice but to use a Windows virtual machine. A Windows VM has no 3D gra
 
 ## Introduction
 
-WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two sides in sync. It offers a Windows virtualization experience similar to VMware Workstation or Parallels Desktop, with these features:
+WinBridge shows a Windows 11 guest desktop in a GTK4 window and offers a better interactive experience than virt-manager. It offers a Windows virtualization experience similar to VMware Workstation or Parallels Desktop, with these features:
 
 - Two-way clipboard copy
 - Quick USB device passthrough
@@ -26,11 +26,14 @@ WinBridge shows a Windows 11 guest desktop in a GTK4 window and keeps the two si
 - File transfer by drag and drop
 - Absolute and relative mouse coordinates
 
-This project does not modify QEMU on the host, and it does not need special drivers installed in Windows. On the host, you only need the QEMU package from your distribution. For the guest, I recommend:
+It is lightweight: on the host you only need QEMU, not the heavy virt-manager. On the guest, you only need to prepare it as required, and it stays very light.
+
+This project does not modify QEMU on the host, and it does not need unsigned drivers installed in Windows. This makes it basically work out of the box. On the host, you only need the QEMU package from your distribution. For the guest, I recommend:
 
 - A modern Windows version. I have only tested Windows 11 LTSC 24H2, Chinese edition.
 - All the VirtIO drivers installed, including the VirtIO display driver that has no 3D acceleration.
 - QemuGA, the QEMU Guest Agent, installed.
+- The ivshmem driver installed.
 - The ivshmem device and the serial device configured with the VM parameters from this repository.
 
 Install the Agent built from this project in the guest, and user-mode Vulkan forwarding and rendering are enabled.
