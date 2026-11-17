@@ -48,7 +48,7 @@ thread_local! {
     static ACTIVE_VIEWER: RefCell<Option<Rc<ViewerWindow>>> = const { RefCell::new(None) };
 }
 
-fn with_viewer<F: FnOnce(&ViewerWindow)>(f: F) {
+fn with_viewer<F: FnOnce(&Rc<ViewerWindow>)>(f: F) {
     ACTIVE_VIEWER.with(|cell| {
         if let Some(viewer) = cell.borrow().as_ref() {
             f(viewer);
@@ -239,6 +239,11 @@ fn main() -> glib::ExitCode {
                 } else {
                     warn!("Guest did not take the refresh rate {} mHz: {:?}", millihertz, error);
                 }
+            }
+            Message::Gfx3dActive { apps } => {
+                glib::idle_add_once(move || {
+                    with_viewer(|v| v.on_gfx_apps(apps));
+                });
             }
             msg @ (Message::ClipboardOffer { .. }
             | Message::ClipboardItem { .. }

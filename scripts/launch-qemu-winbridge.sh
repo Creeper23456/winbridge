@@ -9,7 +9,7 @@
 # Environment, set by winbridge-host from config.toml when it runs this script:
 #   WINBRIDGE_SOCK, WINBRIDGE_QMP_SOCK, WINBRIDGE_DBUS_ADDR (unix:path=PATH)
 # Optional: WINBRIDGE_REL_MOUSE=1 adds a relative USB mouse next to the absolute tablet, which the
-# viewer's "Game mode" (relative mouse) needs. Without it, game mode is refused by QEMU.
+# viewer's game mode (relative mouse, on while a program uses 3D) needs. Without it, QEMU refuses it.
 # Optional: WINBRIDGE_SHM=1 adds the ivshmem shared-memory device for the optional shared-memory
 # transport (see below); WINBRIDGE_SHM_FILE changes its backing file (default /dev/shm/winbridge-ctl).
 # Optional: WINBRIDGE_VENUS=N adds N Venus slots for 3D acceleration and starts one winbridge-venus

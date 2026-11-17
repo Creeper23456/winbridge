@@ -11,7 +11,6 @@ use crate::transfer::{self, Direction, Transfer};
 use crate::config::{launch_log_path, Config};
 use crate::launch::LaunchOutcome;
 use crate::qmp::QmpClient;
-use crate::pointer;
 use gtk4::cairo::{Context, Format, ImageSurface};
 use gtk4::gdk::{self, DragAction};
 use gtk4::gio;
@@ -19,7 +18,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropTarget, EventControllerKey,
-    EventControllerMotion, GestureClick, HeaderBar, Label, Orientation, Overlay, ProgressBar, ToggleButton,
+    EventControllerMotion, GestureClick, HeaderBar, Label, Orientation, Overlay, ProgressBar,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -115,8 +114,21 @@ pub struct ViewerWindow {
     launch_running: Cell<bool>,
     /// Routes pointer and keyboard events to the guest and owns the capture state.
     input: Rc<InputRouter>,
-    /// Header toggle for relative (game) mouse mode.
-    relative_button: ToggleButton,
+    /// Game mode has no button: it is on while a program uses the 3D acceleration. The programs
+    /// the agent last reported (`Gfx3dActive`).
+    game_apps: RefCell<Vec<String>>,
+    /// Game mode is on because of `game_apps`.
+    game_on: Cell<bool>,
+    /// QEMU refused relative motion while `game_apps` lasts: not tried again until they end.
+    game_refused: Cell<bool>,
+    /// Lets `game_apps` lapse when the agent stops repeating it.
+    game_lapse: RefCell<Option<glib::SourceId>>,
+    /// The small badge over the canvas that says the pointer went into game mode.
+    game_badge: GtkBox,
+    /// Hides [`Self::game_badge`] after a moment.
+    game_badge_timer: RefCell<Option<glib::SourceId>>,
+    /// The capture mode at the last change, to see the pointer *enter* game mode.
+    last_capture: Cell<Capture>,
     /// A one-off header message, e.g. why game mode switched itself off.
     notice: RefCell<Option<String>>,
     /// Clears [`Self::notice`] after a few seconds.
@@ -189,8 +201,6 @@ impl ViewerWindow {
         status_label.set_single_line_mode(true);
         header.set_title_widget(Some(&status_label));
         header.pack_end(&crate::devices::devices_button(&window, config.qmp_socket.clone(), config.usb_bus.clone()));
-        let relative_button = ToggleButton::with_label("Game mode");
-        header.pack_end(&relative_button);
         window.set_titlebar(Some(&header));
 
         let drawing_area = DrawingArea::builder()
@@ -225,9 +235,24 @@ impl ViewerWindow {
         transfer_bar.append(&transfer_label);
         transfer_bar.append(&transfer_progress);
         transfer_bar.append(&cancel_button);
+        // Tells that the pointer went into game mode; shown for a moment, never takes events.
+        let game_badge = GtkBox::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Start)
+            .margin_top(12)
+            .margin_end(12)
+            .css_classes(["osd"])
+            .can_target(false)
+            .visible(false)
+            .build();
+        game_badge.append(&gtk4::Image::from_icon_name("input-mouse-symbolic"));
+        game_badge.append(&Label::new(Some("Game mode")));
         let overlay = Overlay::builder().hexpand(true).vexpand(true).build();
         overlay.set_child(Some(&drawing_area));
         overlay.add_overlay(&transfer_bar);
+        overlay.add_overlay(&game_badge);
         window.set_child(Some(&overlay));
 
         let track = Rc::new(DragTrack::default());
@@ -245,7 +270,13 @@ impl ViewerWindow {
             qmp: QmpClient::new(config.qmp_socket.clone()),
             launch_running: Cell::new(config.launch.is_some()),
             input: input.clone(),
-            relative_button: relative_button.clone(),
+            game_apps: RefCell::new(Vec::new()),
+            game_on: Cell::new(false),
+            game_refused: Cell::new(false),
+            game_lapse: RefCell::new(None),
+            game_badge: game_badge.clone(),
+            game_badge_timer: RefCell::new(None),
+            last_capture: Cell::new(Capture::Off),
             notice: RefCell::new(None),
             notice_timer: RefCell::new(None),
             agent_heard: Cell::new(true),
@@ -277,7 +308,7 @@ impl ViewerWindow {
             let weak = Rc::downgrade(&viewer);
             input.set_on_change(Rc::new(move || {
                 if let Some(viewer) = weak.upgrade() {
-                    viewer.refresh_status();
+                    viewer.on_capture_change();
                 }
             }));
         }
@@ -416,22 +447,6 @@ impl ViewerWindow {
         {
             let input = input.clone();
             window.connect_is_active_notify(move |w| input.set_active(w.is_active()));
-        }
-
-        // Game mode (relative mouse): off by default, and only where the pointer can be warped.
-        if input.relative_supported() {
-            relative_button.set_tooltip_text(Some(
-                "Game mode: relative mouse for games. Needs a relative pointing device in the guest (for example -device usb-mouse). Release with Ctrl+Alt+G or Right Ctrl.",
-            ));
-            let weak = Rc::downgrade(&viewer);
-            relative_button.connect_toggled(move |button| {
-                if let Some(viewer) = weak.upgrade() {
-                    viewer.on_relative_toggled(button.is_active());
-                }
-            });
-        } else {
-            relative_button.set_sensitive(false);
-            relative_button.set_tooltip_text(Some(pointer::UNSUPPORTED_REASON));
         }
 
         // Guest sync (size + DPI). Window size and scale changes are debounced into one request.
@@ -1136,8 +1151,47 @@ impl ViewerWindow {
         }
     }
 
-    /// Game mode toggled in the header.
-    fn on_relative_toggled(self: &Rc<Self>, on: bool) {
+    /// The agent's list of programs that use the 3D acceleration (`Gfx3dActive`). Game mode is on
+    /// while the list is not empty. The agent repeats a non-empty list every few seconds, so a
+    /// list that stays unrepeated for three repeats lapses (the agent or the channel is gone).
+    pub fn on_gfx_apps(self: &Rc<Self>, apps: Vec<String>) {
+        if let Some(id) = self.game_lapse.borrow_mut().take() {
+            id.remove();
+        }
+        if apps.is_empty() {
+            self.game_apps.borrow_mut().clear();
+            self.game_refused.set(false);
+            self.set_game_mode(false);
+            return;
+        }
+        if *self.game_apps.borrow() != apps {
+            info!("3D acceleration in use by {}", apps.join(", "));
+            *self.game_apps.borrow_mut() = apps;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(Duration::from_secs(15), move || {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.game_lapse.borrow_mut().take();
+                viewer.on_gfx_apps(Vec::new());
+            }
+        });
+        *self.game_lapse.borrow_mut() = Some(id);
+        if !self.game_refused.get() {
+            if self.input.relative_supported() {
+                self.set_game_mode(true);
+            } else {
+                self.game_refused.set(true);
+                self.set_notice(format!("Game mode off: {}", crate::pointer::UNSUPPORTED_REASON));
+            }
+        }
+    }
+
+    /// Switches game mode (relative mouse). It confines the pointer only while it is over the
+    /// canvas, like every capture; Ctrl+Alt+G and Right Ctrl release it by hand.
+    fn set_game_mode(self: &Rc<Self>, on: bool) {
+        if self.game_on.replace(on) == on {
+            return;
+        }
         self.clear_notice();
         self.input.set_relative_enabled(on);
         if on {
@@ -1161,8 +1215,35 @@ impl ViewerWindow {
         self.refresh_status();
     }
 
+    /// The capture mode changed: the header follows, and the badge shows when the pointer goes
+    /// into game mode.
+    fn on_capture_change(self: &Rc<Self>) {
+        let mode = self.input.mode();
+        if mode == Capture::Relative && self.last_capture.get() != Capture::Relative {
+            self.show_game_badge();
+        }
+        self.last_capture.set(mode);
+        self.refresh_status();
+    }
+
+    fn show_game_badge(self: &Rc<Self>) {
+        if let Some(id) = self.game_badge_timer.borrow_mut().take() {
+            id.remove();
+        }
+        self.game_badge.set_visible(true);
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.game_badge_timer.borrow_mut().take();
+                viewer.game_badge.set_visible(false);
+            }
+        });
+        *self.game_badge_timer.borrow_mut() = Some(id);
+    }
+
     /// QEMU refused relative motion: the guest has no relative pointing device (or its active
-    /// pointer is the absolute tablet). Game mode switches itself off and says why.
+    /// pointer is the absolute tablet). Game mode switches itself off, stays off until the
+    /// programs end, and says why.
     fn check_relative_rejected(self: &Rc<Self>) {
         let rejected = self
             .dbus_conn
@@ -1170,13 +1251,14 @@ impl ViewerWindow {
             .unwrap()
             .as_ref()
             .is_some_and(|c| c.input.take_rel_rejected());
-        if !rejected || !self.relative_button.is_active() {
+        if !rejected || !self.game_on.get() {
             return;
         }
         let absolute = self.is_absolute.get().map_or("unknown".to_string(), |a| a.to_string());
         warn!("QEMU refused RelMotion (IsAbsolute = {}): switching game mode off", absolute);
-        // Toggling clears the notice, so set it afterwards.
-        self.relative_button.set_active(false);
+        self.game_refused.set(true);
+        // Switching off clears the notice, so set it afterwards.
+        self.set_game_mode(false);
         self.set_notice(format!(
             "Game mode off: QEMU refused relative motion (IsAbsolute = {}); the guest needs a relative pointing device such as -device usb-mouse",
             absolute
