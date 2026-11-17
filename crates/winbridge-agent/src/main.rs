@@ -15,6 +15,7 @@ mod dnd;
 mod dragipc;
 mod dragout;
 mod dragprobe;
+mod gfxwatch;
 #[cfg(windows)]
 mod ivshmem;
 mod hostfiles;
@@ -192,6 +193,10 @@ fn main() {
 
     let out_for_drag = out.clone();
     let dragout = DragOut::start(Arc::new(move |msg| out_for_drag.send(msg)));
+
+    // Programs that use the 3D acceleration, for the viewer's game mode.
+    let out_for_gfx = out.clone();
+    let _gfx = gfxwatch::start(Arc::new(move |msg| out_for_gfx.send(msg)));
     let mut clips = Assembler::new(clip_staging.clone());
     let mut dnd = DndManager::new();
 
