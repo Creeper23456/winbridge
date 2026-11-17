@@ -108,7 +108,7 @@ cargo build --release -p winbridge-agent
 2. 启动查看器:`winbridge-host --socket /tmp/winbridge.sock --dbus-addr unix:path=/tmp/qemu-dbus.sock --qmp-socket /tmp/winbridge-qmp.sock`(或者见下面的"启动脚本与生命周期")。标题栏右上角的 **设备(Devices)** 菜单可以插入/弹出 CD/DVD 镜像,并把主机的 USB 设备直通给 Windows。USB 两个方向都支持热插拔,已勾选的设备在重新连接后会自动重新挂载。直通期间,设备会从 Linux 主机驱动上分离。**键盘和鼠标永远不会被列出,也没有覆盖选项**(任何带键盘或鼠标 HID 接口的设备都会被过滤,包括复合设备),避免把你锁在主机之外。运行查看器的用户需要访问 `/dev/bus/usb/*`:运行 `scripts/install-host-udev.sh`(`--dry-run` 可预览)来授权。
 3. 在客户机里用管理员权限的 PowerShell 安装代理:`scripts\install-agent.ps1 -SourceBinary .\winbridge-agent.exe`。
 
-代理**必须运行在已登录用户的会话中,并具有管理员权限**(安装脚本会注册一个登录时触发、最高权限的计划任务)。打开 `\\.\Global\org.winbridge.0` 需要管理员权限;受限令牌的进程会无提示地一直重试。查看器和代理可以各自独立重启。
+代理**以 SYSTEM 身份运行**。安装脚本注册服务 `WinBridgeAgent`(开机自启,LocalSystem),由它在控制台会话里、用已登录用户的环境变量启动代理,登录界面就已经启动;代理结束或换了用户登录时服务会再次启动它。打开 `\\.\Global\org.winbridge.0` 需要管理员权限;受限令牌的进程会无提示地一直重试。处理用户文件的代码以用户身份运行(相应线程会模拟已登录用户),所以拖入和粘贴的文件属于用户,落在用户自己的目录里。服务日志在 `%ProgramData%\WinBridge\service.log`,代理日志在已登录用户的 `%LOCALAPPDATA%\WinBridge\agent.log`。查看器和代理可以各自独立重启。
 
 客户机需要 virtio-win 驱动(`viogpudo`、`vioser`)。用 `RUST_LOG=info` 运行代理可以看到它的行为。
 

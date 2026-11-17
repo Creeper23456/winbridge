@@ -29,7 +29,7 @@ From Linux you can type-check it with `cargo check --target x86_64-pc-windows-ms
 (`rustup target add x86_64-pc-windows-msvc` first). It is linked with the static CRT (`.cargo/config.toml`).
 
 ## Things that bit us
-- The agent needs administrator rights and the user's session: `\\.\Global\org.winbridge.0` cannot be opened by a limited token, and the agent then retries silently.
+- The agent runs as SYSTEM, started by the service `WinBridgeAgent` in the console session (`service.rs`): `\\.\Global\org.winbridge.0` cannot be opened by a limited token, and the agent then retries silently. A SYSTEM process has SYSTEM's profile, not the user's: known folders need the user's token, files it creates belong to SYSTEM, and `HKEY_CURRENT_USER` is not the user's hive. Whatever touches the user's data runs on a thread that impersonates the logged-on user (`identity::impersonate`, `identity::spawn`).
 - The serial handle must stay overlapped (`FILE_FLAG_OVERLAPPED`); a synchronous handle blocks writes while a read is pending.
 - Never write registry DPI values after a CCD DPI change; read the effective DPI back instead.
 - zbus maps `set_ui_info` to `SetUiInfo`; QEMU's method is `SetUIInfo` (`#[zbus(name = "SetUIInfo")]`).
